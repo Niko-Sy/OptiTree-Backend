@@ -1,0 +1,33 @@
+-- 删除所有非唯一索引（唯一索引随表 DROP 自动删除）
+
+DROP INDEX IF EXISTS idx_al_action;
+DROP INDEX IF EXISTS idx_al_project_id;
+DROP INDEX IF EXISTS idx_al_user_id;
+DROP INDEX IF EXISTS idx_notif_user_read;
+DROP INDEX IF EXISTS idx_ll_user_created_at;
+DROP INDEX IF EXISTS idx_rt_expires_revoked;
+DROP INDEX IF EXISTS idx_rt_user_id;
+DROP INDEX IF EXISTS idx_acm_conversation_created_at;
+DROP INDEX IF EXISTS idx_aconv_project_user;
+DROP INDEX IF EXISTS idx_ait_status_created_at;
+DROP INDEX IF EXISTS idx_ait_project_id;
+DROP INDEX IF EXISTS idx_ait_created_by_status;
+DROP INDEX IF EXISTS idx_inv_project_status;
+DROP INDEX IF EXISTS idx_inv_email_status;
+DROP INDEX IF EXISTS idx_pm_project_id;
+DROP INDEX IF EXISTS idx_pm_user_id;
+DROP INDEX IF EXISTS idx_vs_created_by;
+DROP INDEX IF EXISTS idx_vs_project_created_at;
+DROP INDEX IF EXISTS idx_kge_project_id;
+DROP INDEX IF EXISTS idx_kgn_entity_type;
+DROP INDEX IF EXISTS idx_kgn_project_id;
+DROP INDEX IF EXISTS idx_fte_project_id;
+DROP INDEX IF EXISTS idx_ftn_project_id;
+DROP INDEX IF EXISTS idx_documents_status;
+DROP INDEX IF EXISTS idx_documents_project_id;
+DROP INDEX IF EXISTS idx_documents_uploaded_by;
+DROP INDEX IF EXISTS idx_projects_name;
+DROP INDEX IF EXISTS idx_projects_type;
+DROP INDEX IF EXISTS idx_projects_created_by_updated_at;
+DROP INDEX IF EXISTS idx_users_created_at;
+DROP INDEX IF EXISTS idx_users_status;

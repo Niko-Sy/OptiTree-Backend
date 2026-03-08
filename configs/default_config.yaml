@@ -1,0 +1,52 @@
+server:
+  port: 8080
+  mode: debug  # debug | release
+  read_timeout: 30s
+  write_timeout: 30s
+
+database:
+  host: localhost
+  port: 5432
+  user: postgres
+  password: postgres
+  dbname: optitree
+  sslmode: disable
+  max_open_conns: 100
+  max_idle_conns: 10
+  conn_max_lifetime: 30m
+
+redis:
+  addr: localhost:6379
+  password: ""
+  db: 0
+  max_retries: 3
+  pool_size: 20
+  min_idle_conns: 10
+
+jwt:
+  secret: "change-this-to-a-very-long-random-secret-key-in-production"
+  access_expire: 2h
+  refresh_expire: 168h      # 7 days
+  refresh_expire_long: 720h # 30 days (remember me)
+
+storage:
+  local_path: "./storage"
+  base_url: "http://localhost:8080/static"
+  max_file_size: 52428800   # 50MB
+  allowed_image_types:
+    - "image/jpeg"
+    - "image/png"
+    - "image/webp"
+    - "image/gif"
+  allowed_doc_types:
+    - "application/pdf"
+    - "application/msword"
+    - "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    - "application/vnd.ms-excel"
+    - "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    - "text/plain"
+
+rate_limit:
+  enabled: true
+  requests_per_second: 100
+  burst: 200

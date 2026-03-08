@@ -1,0 +1,1865 @@
+openapi: 3.0.3
+info:
+  title: OptiTree Backend API (Current Implemented Stage)
+  version: 0.1.0
+  description: |
+    This OpenAPI file is generated from the current Go implementation.
+    It is intended for direct import into Apifox for debugging.
+
+    Notes:
+    - Most business errors are returned with HTTP 200 and `code != 0`.
+    - Missing/invalid bearer token may return HTTP 401 from auth middleware.
+    - All success envelopes follow: { code, message, data, requestId, timestamp }.
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Health
+  - name: Auth
+  - name: Users
+  - name: Dashboard
+  - name: Projects
+  - name: Members
+  - name: Fault Trees
+  - name: Knowledge Graphs
+  - name: Versions
+  - name: Documents
+  - name: AI Tasks
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+        '503':
+          description: Dependency unhealthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  error:
+                    type: string
+
+  /api/v1/auth/register:
+    post:
+      tags: [Auth]
+      summary: Register user
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            example:
+              username: demo_user
+              email: demo@example.com
+              password: pass12345
+              agree: true
+      responses:
+        '200':
+          description: Register result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          user:
+                            $ref: '#/components/schemas/User'
+              examples:
+                success:
+                  value:
+                    code: 0
+                    message: ok
+                    data:
+                      user:
+                        id: user_1741332000000_abcd1234
+                        username: demo_user
+                        displayName: demo_user
+                        email: demo@example.com
+                        avatar: null
+                        role: user
+                        status: active
+                        createdAt: '2026-03-08T08:00:00Z'
+                        updatedAt: '2026-03-08T08:00:00Z'
+                        lastLoginAt: null
+                    requestId: e4d8bc8f-3d15-4cb8-8ff4-50bdfcb8d9b1
+                    timestamp: '2026-03-08T08:00:00Z'
+                invalid:
+                  value:
+                    code: 40001
+                    message: invalid parameter
+                    errors: required field missing
+                    requestId: e4d8bc8f-3d15-4cb8-8ff4-50bdfcb8d9b1
+                    timestamp: '2026-03-08T08:00:00Z'
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Login with username or email
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              username: demo_user
+              password: pass12345
+              remember: true
+      responses:
+        '200':
+          description: Login result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/LoginData'
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Refresh token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken:
+                  type: string
+      responses:
+        '200':
+          description: Refresh result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          accessToken:
+                            type: string
+                          refreshToken:
+                            type: string
+                          tokenType:
+                            type: string
+                            example: Bearer
+                          expiresIn:
+                            type: integer
+                            format: int64
+
+  /api/v1/auth/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Forgot password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+      responses:
+        '200':
+          description: Forgot password result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          message:
+                            type: string
+
+  /api/v1/auth/reset-password:
+    post:
+      tags: [Auth]
+      summary: Reset password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, newPassword]
+              properties:
+                token:
+                  type: string
+                newPassword:
+                  type: string
+                  minLength: 8
+      responses:
+        '200':
+          description: Reset password result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiEnvelope'
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken:
+                  type: string
+      responses:
+        '200':
+          description: Logout result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedHttp'
+
+  /api/v1/auth/change-password:
+    post:
+      tags: [Auth]
+      summary: Change password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [oldPassword, newPassword]
+              properties:
+                oldPassword:
+                  type: string
+                newPassword:
+                  type: string
+                  minLength: 8
+      responses:
+        '200':
+          description: Change password result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiEnvelope'
+        '401':
+          $ref: '#/components/responses/UnauthorizedHttp'
+
+  /api/v1/users/me:
+    get:
+      tags: [Users]
+      summary: Get current user profile
+      responses:
+        '200':
+          description: Current user profile
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          user:
+                            $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/UnauthorizedHttp'
+
+  /api/v1/users/me/update:
+    post:
+      tags: [Users]
+      summary: Update current user profile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                displayName:
+                  type: string
+                  maxLength: 50
+                email:
+                  type: string
+                  format: email
+            example:
+              displayName: Demo User
+              email: demo@example.com
+      responses:
+        '200':
+          description: Updated profile
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          user:
+                            $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/UnauthorizedHttp'
+
+  /api/v1/users/me/avatar:
+    post:
+      tags: [Users]
+      summary: Upload avatar
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [avatar]
+              properties:
+                avatar:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Upload avatar result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          avatarUrl:
+                            type: string
+                            format: uri
+        '401':
+          $ref: '#/components/responses/UnauthorizedHttp'
+
+  /api/v1/users/me/login-logs:
+    get:
+      tags: [Users]
+      summary: Get login logs
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Login logs
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/LoginLogPageData'
+        '401':
+          $ref: '#/components/responses/UnauthorizedHttp'
+
+  /api/v1/dashboard/summary:
+    get:
+      tags: [Dashboard]
+      summary: Get dashboard summary
+      responses:
+        '200':
+          description: Dashboard summary
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/DashboardSummary'
+
+  /api/v1/projects:
+    get:
+      tags: [Projects]
+      summary: List projects
+      parameters:
+        - in: query
+          name: type
+          schema:
+            type: string
+            enum: [ft, kg]
+        - in: query
+          name: keyword
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - in: query
+          name: sortBy
+          schema:
+            type: string
+            enum: [created_at, updated_at, name]
+            default: created_at
+        - in: query
+          name: sortOrder
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+      responses:
+        '200':
+          description: Project list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ProjectPageData'
+    post:
+      tags: [Projects]
+      summary: Create project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProjectRequest'
+            example:
+              name: Hydraulic analysis
+              type: ft
+              description: Demo project
+              tags: [ai, test]
+      responses:
+        '200':
+          description: Created project
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          project:
+                            $ref: '#/components/schemas/Project'
+
+  /api/v1/projects/{projectId}:
+    get:
+      tags: [Projects]
+      summary: Get project by ID
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Project detail
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          project:
+                            $ref: '#/components/schemas/Project'
+
+  /api/v1/projects/{projectId}/update:
+    post:
+      tags: [Projects]
+      summary: Update project
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  maxLength: 100
+                description:
+                  type: string
+                  nullable: true
+                tags:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Updated project
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          project:
+                            $ref: '#/components/schemas/Project'
+
+  /api/v1/projects/{projectId}/delete:
+    post:
+      tags: [Projects]
+      summary: Delete project (admin role required)
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Delete result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiEnvelope'
+
+  /api/v1/projects/{projectId}/members:
+    get:
+      tags: [Members]
+      summary: List project members
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Members list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          members:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/ProjectMember'
+
+  /api/v1/projects/{projectId}/members/invite:
+    post:
+      tags: [Members]
+      summary: Invite project member (admin role required)
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, role]
+              properties:
+                email:
+                  type: string
+                  format: email
+                role:
+                  type: string
+                  enum: [viewer, editor, admin]
+      responses:
+        '200':
+          description: Invitation result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          invitation:
+                            $ref: '#/components/schemas/Invitation'
+
+  /api/v1/projects/{projectId}/members/{memberId}/update-role:
+    post:
+      tags: [Members]
+      summary: Update member role (admin role required)
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/MemberId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role:
+                  type: string
+                  enum: [viewer, editor, admin]
+      responses:
+        '200':
+          description: Updated member
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          member:
+                            $ref: '#/components/schemas/ProjectMember'
+
+  /api/v1/projects/{projectId}/members/{memberId}/remove:
+    post:
+      tags: [Members]
+      summary: Remove member (admin role required)
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/MemberId'
+      responses:
+        '200':
+          description: Remove result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiEnvelope'
+
+  /api/v1/projects/{projectId}/versions:
+    get:
+      tags: [Versions]
+      summary: List project versions
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Version list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/VersionPageData'
+    post:
+      tags: [Versions]
+      summary: Create version snapshot
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                snapshot:
+                  type: object
+                  additionalProperties: true
+            example:
+              label: version 2026/3/8 15:00:00
+              snapshot:
+                nodes: []
+                edges: []
+      responses:
+        '200':
+          description: Created version
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          version:
+                            $ref: '#/components/schemas/VersionSnapshot'
+
+  /api/v1/projects/{projectId}/versions/{versionId}:
+    get:
+      tags: [Versions]
+      summary: Get version detail
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/VersionId'
+      responses:
+        '200':
+          description: Version detail
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          version:
+                            $ref: '#/components/schemas/VersionSnapshot'
+
+  /api/v1/projects/{projectId}/versions/{versionId}/rollback:
+    post:
+      tags: [Versions]
+      summary: Rollback to version (editor+ required)
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/VersionId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                saveCurrent:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: Rollback result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiEnvelope'
+
+  /api/v1/projects/{projectId}/versions/{versionId}/delete:
+    post:
+      tags: [Versions]
+      summary: Delete version (admin role required)
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/VersionId'
+      responses:
+        '200':
+          description: Delete version result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiEnvelope'
+
+  /api/v1/fault-trees/{projectId}/graph:
+    get:
+      tags: [Fault Trees]
+      summary: Get fault tree graph
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Fault tree graph
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          nodes:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/FaultTreeNode'
+                          edges:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/FaultTreeEdge'
+                          revision:
+                            type: integer
+
+  /api/v1/fault-trees/{projectId}/graph/save:
+    post:
+      tags: [Fault Trees]
+      summary: Save fault tree graph (editor+ required)
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                nodes:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/FaultTreeNode'
+                edges:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/FaultTreeEdge'
+                revision:
+                  type: integer
+            example:
+              nodes: []
+              edges: []
+              revision: 0
+      responses:
+        '200':
+          description: Save result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/SaveGraphResult'
+
+  /api/v1/fault-trees/{projectId}/validate:
+    post:
+      tags: [Fault Trees]
+      summary: Validate fault tree graph
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                nodes:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/FaultTreeNode'
+                edges:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/FaultTreeEdge'
+      responses:
+        '200':
+          description: Validation result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          valid:
+                            type: boolean
+                          issues:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/ValidationIssue'
+
+  /api/v1/fault-trees/{projectId}/export:
+    get:
+      tags: [Fault Trees]
+      summary: Export fault tree graph
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Graph payload as downloadable JSON
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: attachment; filename=fault_tree_export.json
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FaultTreeNode'
+                  edges:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FaultTreeEdge'
+
+  /api/v1/fault-trees/import:
+    post:
+      tags: [Fault Trees]
+      summary: Import fault tree graph
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [projectId]
+              properties:
+                projectId:
+                  type: string
+                nodes:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/FaultTreeNode'
+                edges:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/FaultTreeEdge'
+                revision:
+                  type: integer
+      responses:
+        '200':
+          description: Import result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/SaveGraphResult'
+
+  /api/v1/knowledge-graphs/{projectId}/graph:
+    get:
+      tags: [Knowledge Graphs]
+      summary: Get knowledge graph
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Knowledge graph payload
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          rfNodes:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/KnowledgeGraphNode'
+                          rfEdges:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/KnowledgeGraphEdge'
+                          revision:
+                            type: integer
+
+  /api/v1/knowledge-graphs/{projectId}/graph/save:
+    post:
+      tags: [Knowledge Graphs]
+      summary: Save knowledge graph (editor+ required)
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rfNodes:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/KnowledgeGraphNode'
+                rfEdges:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/KnowledgeGraphEdge'
+                revision:
+                  type: integer
+      responses:
+        '200':
+          description: Save result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/SaveGraphResult'
+
+  /api/v1/knowledge-graphs/{projectId}/validate:
+    post:
+      tags: [Knowledge Graphs]
+      summary: Validate knowledge graph
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rfNodes:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/KnowledgeGraphNode'
+                rfEdges:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/KnowledgeGraphEdge'
+      responses:
+        '200':
+          description: Validation result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          valid:
+                            type: boolean
+                          issues:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/ValidationIssue'
+
+  /api/v1/knowledge-graphs/{projectId}/export:
+    get:
+      tags: [Knowledge Graphs]
+      summary: Export knowledge graph
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: Graph payload as downloadable JSON
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: attachment; filename=knowledge_graph_export.json
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rfNodes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/KnowledgeGraphNode'
+                  rfEdges:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/KnowledgeGraphEdge'
+
+  /api/v1/knowledge-graphs/import:
+    post:
+      tags: [Knowledge Graphs]
+      summary: Import knowledge graph
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [projectId]
+              properties:
+                projectId:
+                  type: string
+                rfNodes:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/KnowledgeGraphNode'
+                rfEdges:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/KnowledgeGraphEdge'
+                revision:
+                  type: integer
+      responses:
+        '200':
+          description: Import result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/SaveGraphResult'
+
+  /api/v1/documents/upload:
+    post:
+      tags: [Documents]
+      summary: Upload one or more documents
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [files]
+              properties:
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+                projectId:
+                  type: string
+                  nullable: true
+      responses:
+        '200':
+          description: Upload result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          documents:
+                            type: array
+                            items:
+                              $ref: '#/components/schemas/Document'
+
+  /api/v1/documents/{docId}:
+    get:
+      tags: [Documents]
+      summary: Get document by ID
+      parameters:
+        - in: path
+          name: docId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Document detail
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          document:
+                            $ref: '#/components/schemas/Document'
+
+  /api/v1/ai/tasks/{taskId}:
+    get:
+      tags: [AI Tasks]
+      summary: Get AI task status by ID
+      parameters:
+        - in: path
+          name: taskId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: AI task
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          task:
+                            $ref: '#/components/schemas/AITask'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    UnauthorizedHttp:
+      description: Unauthorized (HTTP 401)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+
+  parameters:
+    ProjectId:
+      in: path
+      name: projectId
+      required: true
+      schema:
+        type: string
+    MemberId:
+      in: path
+      name: memberId
+      required: true
+      schema:
+        type: string
+    VersionId:
+      in: path
+      name: versionId
+      required: true
+      schema:
+        type: string
+    Page:
+      in: query
+      name: page
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSize:
+      in: query
+      name: pageSize
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+  schemas:
+    ApiEnvelope:
+      type: object
+      required: [code, message, requestId, timestamp]
+      properties:
+        code:
+          type: integer
+          example: 0
+        message:
+          type: string
+          example: ok
+        data:
+          type: object
+          nullable: true
+          additionalProperties: true
+        requestId:
+          type: string
+          example: e4d8bc8f-3d15-4cb8-8ff4-50bdfcb8d9b1
+        timestamp:
+          type: string
+          format: date-time
+
+    ErrorEnvelope:
+      type: object
+      required: [code, message, requestId, timestamp]
+      properties:
+        code:
+          type: integer
+          example: 40001
+        message:
+          type: string
+          example: invalid parameter
+        errors:
+          nullable: true
+          oneOf:
+            - type: string
+            - type: object
+              additionalProperties: true
+            - type: array
+              items:
+                type: object
+                additionalProperties: true
+        requestId:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+
+    RegisterRequest:
+      type: object
+      required: [username, email, password, agree]
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 20
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+        agree:
+          type: boolean
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          description: Username or email
+        password:
+          type: string
+        remember:
+          type: boolean
+          default: false
+
+    LoginData:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+        tokenType:
+          type: string
+          example: Bearer
+        expiresIn:
+          type: integer
+          format: int64
+          example: 7200
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        displayName:
+          type: string
+        email:
+          type: string
+          format: email
+        avatar:
+          type: string
+          nullable: true
+        role:
+          type: string
+          enum: [user, admin]
+        status:
+          type: string
+          enum: [active, inactive, banned]
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        lastLoginAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    LoginLog:
+      type: object
+      properties:
+        id:
+          type: string
+        userId:
+          type: string
+        success:
+          type: boolean
+        ipAddress:
+          type: string
+          nullable: true
+        region:
+          type: string
+        deviceInfo:
+          type: string
+        failReason:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    DashboardSummary:
+      type: object
+      properties:
+        faultTreeProjectCount:
+          type: integer
+          format: int64
+        knowledgeProjectCount:
+          type: integer
+          format: int64
+        faultTreeNodeCount:
+          type: integer
+          format: int64
+        knowledgeEntityCount:
+          type: integer
+          format: int64
+
+    Project:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+          enum: [ft, kg]
+        description:
+          type: string
+          nullable: true
+        tags:
+          type: array
+          items:
+            type: string
+        nodeCount:
+          type: integer
+        edgeCount:
+          type: integer
+        entityCount:
+          type: integer
+        relationCount:
+          type: integer
+        graphRevision:
+          type: integer
+        latestVersionId:
+          type: string
+          nullable: true
+        memberCount:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        createdBy:
+          type: string
+
+    CreateProjectRequest:
+      type: object
+      required: [name, type]
+      properties:
+        name:
+          type: string
+          maxLength: 100
+        type:
+          type: string
+          enum: [ft, kg]
+        description:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+
+    ProjectMember:
+      type: object
+      properties:
+        id:
+          type: string
+        projectId:
+          type: string
+        userId:
+          type: string
+        role:
+          type: string
+          enum: [admin, editor, viewer]
+        status:
+          type: string
+        joinedAt:
+          type: string
+          format: date-time
+        user:
+          $ref: '#/components/schemas/User'
+
+    Invitation:
+      type: object
+      properties:
+        id:
+          type: string
+        projectId:
+          type: string
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum: [admin, editor, viewer]
+        status:
+          type: string
+        token:
+          type: string
+        invitedBy:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+
+    FaultTreeNode:
+      type: object
+      properties:
+        id:
+          type: string
+        projectId:
+          type: string
+        type:
+          type: string
+        name:
+          type: string
+        x:
+          type: number
+        y:
+          type: number
+        width:
+          type: number
+        height:
+          type: number
+        probability:
+          type: number
+          nullable: true
+        gateType:
+          type: string
+          nullable: true
+        eventId:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+        errorLevel:
+          type: string
+          nullable: true
+        priority:
+          type: integer
+        showProbability:
+          type: boolean
+        rules:
+          nullable: true
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: array
+              items:
+                type: object
+                additionalProperties: true
+        documents:
+          type: array
+          items:
+            type: string
+        investigateMethod:
+          type: string
+          nullable: true
+        transfer:
+          type: string
+          nullable: true
+
+    FaultTreeEdge:
+      type: object
+      properties:
+        id:
+          type: string
+        projectId:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+
+    KnowledgeGraphNode:
+      type: object
+      properties:
+        id:
+          type: string
+        projectId:
+          type: string
+        type:
+          type: string
+        positionX:
+          type: number
+        positionY:
+          type: number
+        label:
+          type: string
+        entityType:
+          type: string
+        description:
+          type: string
+          nullable: true
+        sourceDoc:
+          type: string
+          nullable: true
+        style:
+          type: object
+          nullable: true
+          additionalProperties: true
+        dataExt:
+          type: object
+          nullable: true
+          additionalProperties: true
+
+    KnowledgeGraphEdge:
+      type: object
+      properties:
+        id:
+          type: string
+        projectId:
+          type: string
+        source:
+          type: string
+        target:
+          type: string
+        label:
+          type: string
+          nullable: true
+        type:
+          type: string
+        animated:
+          type: boolean
+        style:
+          type: object
+          nullable: true
+          additionalProperties: true
+        labelStyle:
+          type: object
+          nullable: true
+          additionalProperties: true
+        labelBgStyle:
+          type: object
+          nullable: true
+          additionalProperties: true
+
+    SaveGraphResult:
+      type: object
+      properties:
+        revision:
+          type: integer
+        nodeCount:
+          type: integer
+        edgeCount:
+          type: integer
+        updatedAt:
+          type: string
+          format: date-time
+
+    ValidationIssue:
+      type: object
+      properties:
+        nodeId:
+          type: string
+        level:
+          type: string
+          enum: [error, warning, info]
+        message:
+          type: string
+        code:
+          type: string
+
+    VersionSnapshot:
+      type: object
+      properties:
+        id:
+          type: string
+        projectId:
+          type: string
+        projectType:
+          type: string
+          enum: [ft, kg]
+        label:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        createdBy:
+          type: string
+        snapshot:
+          type: object
+          nullable: true
+          additionalProperties: true
+
+    Document:
+      type: object
+      properties:
+        id:
+          type: string
+        fileName:
+          type: string
+        fileType:
+          type: string
+        mimeType:
+          type: string
+        size:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [pending, parsing, parsed, failed]
+        summary:
+          type: string
+          nullable: true
+        sourceUrl:
+          type: string
+          format: uri
+        textExtractUrl:
+          type: string
+          nullable: true
+        uploadedAt:
+          type: string
+          format: date-time
+        uploadedBy:
+          type: string
+        projectId:
+          type: string
+          nullable: true
+
+    AITask:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [generateFaultTree, generateKnowledgeGraph, parseDocument, validateGraph]
+        status:
+          type: string
+          enum: [pending, parsing, generating, completed, failed, cancelled]
+        progress:
+          type: integer
+        stage:
+          type: string
+        stageLabel:
+          type: string
+        result:
+          type: object
+          nullable: true
+          additionalProperties: true
+        errorMessage:
+          type: string
+          nullable: true
+        model:
+          type: string
+        createdBy:
+          type: string
+        projectId:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    ProjectPageData:
+      type: object
+      properties:
+        list:
+          type: array
+          items:
+            $ref: '#/components/schemas/Project'
+        total:
+          type: integer
+          format: int64
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        hasMore:
+          type: boolean
+
+    LoginLogPageData:
+      type: object
+      properties:
+        list:
+          type: array
+          items:
+            $ref: '#/components/schemas/LoginLog'
+        total:
+          type: integer
+          format: int64
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        hasMore:
+          type: boolean
+
+    VersionPageData:
+      type: object
+      properties:
+        list:
+          type: array
+          items:
+            $ref: '#/components/schemas/VersionSnapshot'
+        total:
+          type: integer
+          format: int64
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        hasMore:
+          type: boolean
