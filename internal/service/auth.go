@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"net"
 	"time"
 
 	"optitree-backend/internal/constant"
@@ -132,10 +133,10 @@ func (s *AuthService) Login(ctx context.Context, usernameOrEmail, password strin
 	now := time.Now()
 	_ = s.userRepo.UpdateFields(user.ID, map[string]interface{}{"last_login_at": now})
 
-	return s.generateTokens(ctx, user, remember)
+	return s.generateTokens(ctx, user, remember, ip, userAgent)
 }
 
-func (s *AuthService) generateTokens(ctx context.Context, user *model.User, remember bool) (*LoginResult, error) {
+func (s *AuthService) generateTokens(ctx context.Context, user *model.User, remember bool, ip, userAgent string) (*LoginResult, error) {
 	accessToken, jti, err := s.jwtManager.GenerateAccessToken(user.ID, user.Role)
 	if err != nil {
 		return nil, err
@@ -161,6 +162,8 @@ func (s *AuthService) generateTokens(ctx context.Context, user *model.User, reme
 		UserID:    user.ID,
 		TokenHash: util.HashToken(refreshTokenStr),
 		ExpiresAt: expiresAt,
+		UserAgent: userAgent,
+		IPAddress: net.ParseIP(ip),
 	}
 	if err := s.authRepo.SaveRefreshToken(rt); err != nil {
 		return nil, err
@@ -191,7 +194,7 @@ func (s *AuthService) RefreshToken(ctx context.Context, refreshTokenStr string) 
 		return nil, ErrUserNotFound
 	}
 
-	return s.generateTokens(ctx, user, false)
+	return s.generateTokens(ctx, user, false, "", "")
 }
 
 // Logout 退出登录

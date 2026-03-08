@@ -1,0 +1,91 @@
+version: "3.9"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OptiTree Backend — 一键部署
+#
+# 使用方式：
+#   1. 复制 .env.example 为 .env，按需修改密码等敏感配置
+#   2. docker compose up -d --build
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: optitree-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-optitree_redis}
+      --save 60 1
+      --loglevel warning
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"      # 可按需关闭暴露给宿主机
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-optitree_redis}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - optitree-net
+
+  # ── App ─────────────────────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: optitree-backend:latest
+    container_name: optitree-app
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    volumes:
+      - storage_data:/app/storage
+    environment:
+      # ── 数据库（外部分布式服务器） ──
+      OPTITREE_DATABASE_HOST:             ${DB_HOST}
+      OPTITREE_DATABASE_PORT:             ${DB_PORT}
+      OPTITREE_DATABASE_USER:             ${DB_USER}
+      OPTITREE_DATABASE_PASSWORD:         ${DB_PASSWORD}
+      OPTITREE_DATABASE_DBNAME:           ${DB_NAME}
+      OPTITREE_DATABASE_SSLMODE:          disable
+      OPTITREE_DATABASE_MAX_OPEN_CONNS:   100
+      OPTITREE_DATABASE_MAX_IDLE_CONNS:   10
+      OPTITREE_DATABASE_CONN_MAX_LIFETIME: 30m
+      # ── Redis ──
+      OPTITREE_REDIS_ADDR:                redis:6379
+      OPTITREE_REDIS_PASSWORD:            ${REDIS_PASSWORD:-optitree_redis}
+      OPTITREE_REDIS_DB:                  0
+      # ── JWT（生产环境请务必修改 secret） ──
+      OPTITREE_JWT_SECRET:                ${JWT_SECRET:-change-this-secret-in-production}
+      OPTITREE_JWT_ACCESS_EXPIRE:         2h
+      OPTITREE_JWT_REFRESH_EXPIRE:        168h
+      OPTITREE_JWT_REFRESH_EXPIRE_LONG:   720h
+      # ── 服务 ──
+      OPTITREE_SERVER_MODE:               ${APP_MODE:-release}
+      OPTITREE_SERVER_PORT:               8080
+      # ── 存储 ──
+      OPTITREE_STORAGE_LOCAL_PATH:        ./storage
+      OPTITREE_STORAGE_BASE_URL:          ${STORAGE_BASE_URL:-http://localhost:8080/static}
+      OPTITREE_STORAGE_MAX_FILE_SIZE:     52428800
+      TZ: Asia/Shanghai
+    networks:
+      - optitree-net
+
+# ── 持久化卷 ──────────────────────────────────────────────────────────────────
+volumes:
+  redis_data:
+    driver: local
+  storage_data:
+    driver: local
+
+# ── 网络 ─────────────────────────────────────────────────────────────────────
+networks:
+  optitree-net:
+    driver: bridge

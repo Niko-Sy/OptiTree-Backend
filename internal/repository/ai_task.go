@@ -5,6 +5,7 @@ import (
 
 	"optitree-backend/internal/model"
 
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -38,6 +39,27 @@ func (r *AITaskRepository) UpdateStatus(id, status string, progress int, stage, 
 	}).Error
 }
 
+// SetCompleted marks a task as completed and stores its result JSON.
+func (r *AITaskRepository) SetCompleted(id string, resultJSON []byte) error {
+	return r.db.Model(&model.AITask{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"status":      "completed",
+		"progress":    100,
+		"stage":       "completed",
+		"stage_label": "生成完成",
+		"result_json": datatypes.JSON(resultJSON),
+	}).Error
+}
+
+// SetFailed marks a task as failed with an error message.
+func (r *AITaskRepository) SetFailed(id, errMsg string) error {
+	return r.db.Model(&model.AITask{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"status":        "failed",
+		"stage":         "failed",
+		"stage_label":   "任务失败",
+		"error_message": errMsg,
+	}).Error
+}
+
 // DocumentRepository 文档仓库
 type DocumentRepository struct {
 	db *gorm.DB
@@ -58,6 +80,13 @@ func (r *DocumentRepository) FindByID(id string) (*model.Document, error) {
 		return nil, nil
 	}
 	return &doc, err
+}
+
+// FindByIDs retrieves multiple documents by their IDs in a single query.
+func (r *DocumentRepository) FindByIDs(ids []string) ([]model.Document, error) {
+	var docs []model.Document
+	err := r.db.Where("id IN ?", ids).Find(&docs).Error
+	return docs, err
 }
 
 func (r *DocumentRepository) DeleteByProject(tx *gorm.DB, projectID string) error {

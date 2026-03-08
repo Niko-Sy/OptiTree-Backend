@@ -14,6 +14,14 @@ type Config struct {
 	JWT       JWTConfig       `mapstructure:"jwt"`
 	Storage   StorageConfig   `mapstructure:"storage"`
 	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
+	AI        AIConfig        `mapstructure:"ai"`
+}
+
+type AIConfig struct {
+	Endpoint     string        `mapstructure:"endpoint"`
+	APIKey       string        `mapstructure:"api_key"`
+	DefaultModel string        `mapstructure:"default_model"`
+	Timeout      time.Duration `mapstructure:"timeout"`
 }
 
 type ServerConfig struct {

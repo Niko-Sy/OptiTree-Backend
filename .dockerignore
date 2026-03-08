@@ -1,0 +1,42 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# 文档
+*.md
+docs/
+
+# 测试
+*_test.go
+testdata/
+
+# 本地存储（运行时生成，通过 volume 挂载）
+storage/
+
+# 编译产物
+*.exe
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+tmp/
+
+# 环境变量（含敏感信息，不进镜像）
+.env
+.env.*
+!.env.example
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go 工具链缓存
+vendor/

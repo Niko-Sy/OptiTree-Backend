@@ -50,3 +50,10 @@ rate_limit:
   enabled: true
   requests_per_second: 100
   burst: 200
+
+ai:
+  # Default: local Ollama instance (no API key required)
+  endpoint: "http://localhost:11434/v1"
+  api_key: ""
+  default_model: "llama3.2"
+  timeout: 120s

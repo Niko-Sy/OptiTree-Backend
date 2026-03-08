@@ -89,6 +89,14 @@ func (h *FaultTreeHandler) Validate(c *gin.Context) {
 }
 
 func (h *FaultTreeHandler) ExportGraph(c *gin.Context) {
+	format := c.DefaultQuery("format", "json")
+	if format == "png" || format == "svg" {
+		c.JSON(501, gin.H{
+			"code":    501,
+			"message": format + " export is not yet supported server-side; use the frontend canvas export instead",
+		})
+		return
+	}
 	projectID := c.Param("projectId")
 	data, err := h.ftService.ExportGraph(c.Request.Context(), projectID)
 	if err != nil {

@@ -65,6 +65,17 @@ func (s *StorageService) SaveDocument(file multipart.File, header *multipart.Fil
 	return s.save(file, header, "documents")
 }
 
+// LocalPath converts a storage URL back to its absolute file system path.
+// Returns an empty string if the URL does not match this storage's base URL.
+func (s *StorageService) LocalPath(url string) string {
+	prefix := s.baseURL + "/"
+	if !strings.HasPrefix(url, prefix) {
+		return ""
+	}
+	rel := strings.TrimPrefix(url, prefix)
+	return filepath.Join(s.localPath, filepath.FromSlash(rel))
+}
+
 func (s *StorageService) save(file multipart.File, header *multipart.FileHeader, subDir string) (string, error) {
 	defer file.Close()
 

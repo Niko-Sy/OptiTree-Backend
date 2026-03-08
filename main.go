@@ -17,6 +17,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"optitree-backend/internal/ai"
 	"optitree-backend/internal/config"
 	"optitree-backend/internal/handler"
 	"optitree-backend/internal/middleware"
@@ -95,15 +96,17 @@ func main() {
 		cfg.Storage.AllowedImageTypes,
 		cfg.Storage.AllowedDocTypes,
 	)
+	aiClient := ai.NewClient(cfg.AI.Endpoint, cfg.AI.APIKey, cfg.AI.DefaultModel, cfg.AI.Timeout)
 	authSvc := service.NewAuthService(userRepo, authRepo, jwtManager, rdb)
 	userSvc := service.NewUserService(userRepo, storageSvc)
 	projectSvc := service.NewProjectService(db, projectRepo, memberRepo, graphRepo, versionRepo, docRepo)
 	ftSvc := service.NewFaultTreeService(db, projectRepo, graphRepo, rdb)
 	kgSvc := service.NewKnowledgeGraphService(db, projectRepo, graphRepo, rdb)
 	versionSvc := service.NewVersionService(versionRepo, projectRepo, graphRepo, ftSvc, kgSvc)
-	aiTaskSvc := service.NewAITaskService(aiTaskRepo, rdb)
+	aiTaskSvc := service.NewAITaskService(aiTaskRepo, docRepo, storageSvc, aiClient, rdb)
 	docSvc := service.NewDocumentService(docRepo, storageSvc)
 	memberSvc := service.NewMemberService(memberRepo, projectRepo, userRepo)
+	teamSvc := service.NewTeamService(db)
 
 	// ---- 处理器 ----
 	authH := handler.NewAuthHandler(authSvc)
@@ -116,6 +119,7 @@ func main() {
 	docH := handler.NewDocumentHandler(docSvc)
 	aiTaskH := handler.NewAITaskHandler(aiTaskSvc)
 	memberH := handler.NewMemberHandler(memberSvc)
+	teamH := handler.NewTeamHandler(teamSvc)
 
 	// ---- 路由 ----
 	router := gin.New()
@@ -193,7 +197,7 @@ func main() {
 			// 成员管理
 			projects.GET("/:projectId/members", memberH.ListMembers)
 			projects.POST("/:projectId/members/invite", withAdminRole(memberRepo, memberH.InviteMember))
-			projects.POST("/:projectId/members/:memberId/update-role", withAdminRole(memberRepo, memberH.UpdateRole))
+			projects.POST("/:projectId/members/:memberId/update", withAdminRole(memberRepo, memberH.UpdateRole))
 			projects.POST("/:projectId/members/:memberId/remove", withAdminRole(memberRepo, memberH.RemoveMember))
 		}
 
@@ -228,6 +232,17 @@ func main() {
 		ai := authed.Group("/ai")
 		{
 			ai.GET("/tasks/:taskId", aiTaskH.GetTask)
+			ai.POST("/fault-trees/generate", aiTaskH.GenerateFaultTree)
+			ai.POST("/knowledge-graphs/generate", aiTaskH.GenerateKnowledgeGraph)
+			ai.POST("/chat", aiTaskH.Chat)
+		}
+
+		// 团队总览
+		team := authed.Group("/team")
+		{
+			team.GET("/overview", teamH.GetOverview)
+			team.GET("/projects", teamH.ListProjects)
+			team.GET("/activities", teamH.ListActivities)
 		}
 	}
 

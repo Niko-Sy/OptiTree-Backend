@@ -1,4 +1,8 @@
 configs/config.yaml
 
+.idea/
 APIREQUIRE.md
 数据库初版设计方案.md
+
+.env
+storage/

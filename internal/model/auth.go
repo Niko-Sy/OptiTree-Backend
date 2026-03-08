@@ -12,7 +12,7 @@ type RefreshToken struct {
 	TokenHash string    `gorm:"column:token_hash;uniqueIndex;not null" json:"tokenHash"`
 	IsRevoked bool      `gorm:"column:is_revoked;default:false" json:"isRevoked"`
 	UserAgent string    `gorm:"column:user_agent;size:500" json:"userAgent"`
-	IPAddress string    `gorm:"column:ip_address;size:45" json:"ipAddress"`
+	IPAddress net.IP    `gorm:"column:ip_address;type:inet" json:"ipAddress"`
 	ExpiresAt time.Time `gorm:"column:expires_at;not null" json:"expiresAt"`
 	CreatedAt time.Time `gorm:"column:created_at;not null;autoCreateTime" json:"createdAt"`
 }
