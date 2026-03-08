@@ -97,6 +97,28 @@ func (r *ProjectRepository) UpdateRevision(id string, oldRev, newRev int) (int64
 	return result.RowsAffected, result.Error
 }
 
+// UpdateGraphMetaCAS 在单条 SQL 中完成 revision 与统计字段的 CAS 更新。
+func (r *ProjectRepository) UpdateGraphMetaCAS(
+	tx *gorm.DB,
+	id string,
+	oldRev, newRev int,
+	nodeCount, edgeCount, entityCount, relationCount int,
+) (int64, error) {
+	if tx == nil {
+		tx = r.db
+	}
+	result := tx.Model(&model.Project{}).
+		Where("id = ? AND graph_revision = ?", id, oldRev).
+		Updates(map[string]interface{}{
+			"graph_revision": newRev,
+			"node_count":     nodeCount,
+			"edge_count":     edgeCount,
+			"entity_count":   entityCount,
+			"relation_count": relationCount,
+		})
+	return result.RowsAffected, result.Error
+}
+
 // UpdateCounts 更新项目的统计计数
 func (r *ProjectRepository) UpdateCounts(id string, nodeCount, edgeCount, entityCount, relationCount int) error {
 	return r.db.Model(&model.Project{}).Where("id = ?", id).Updates(map[string]interface{}{

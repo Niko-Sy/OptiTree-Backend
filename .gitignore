@@ -6,3 +6,4 @@ APIREQUIRE.md
 
 .env
 storage/
+*.exe

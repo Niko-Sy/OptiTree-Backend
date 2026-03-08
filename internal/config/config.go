@@ -25,6 +25,7 @@ type AIConfig struct {
 }
 
 type ServerConfig struct {
+	Host         string        `mapstructure:"host"`
 	Port         int           `mapstructure:"port"`
 	Mode         string        `mapstructure:"mode"`
 	ReadTimeout  time.Duration `mapstructure:"read_timeout"`

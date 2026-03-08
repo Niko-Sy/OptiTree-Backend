@@ -2,8 +2,11 @@ package service
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"optitree-backend/internal/constant"
@@ -75,8 +78,119 @@ type SaveKnowledgeGraphInput struct {
 	Revision int
 }
 
+const knowledgeGraphIDMaxLen = 32
+
+func normalizeKGNodeType(raw string) string {
+	v := strings.TrimSpace(raw)
+	switch v {
+	case "entityNode", "eventNode", "causeNode":
+		return v
+	case "componentNode":
+		// Frontend compatibility: componentNode is persisted as entityNode.
+		return "entityNode"
+	default:
+		return "entityNode"
+	}
+}
+
+func normalizeKGEntityType(raw string) string {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "component", "event", "cause", "other":
+		return v
+	case "componentnode", "entitynode":
+		return "component"
+	case "eventnode":
+		return "event"
+	case "causenode":
+		return "cause"
+	case "effect", "system", "process":
+		// Keep compatibility with AI-generated extended categories.
+		return "other"
+	default:
+		return "other"
+	}
+}
+
+func normalizeKnowledgeGraphNodes(nodes []model.KnowledgeGraphNode) {
+	for i := range nodes {
+		nodes[i].Type = normalizeKGNodeType(nodes[i].Type)
+		nodes[i].EntityType = normalizeKGEntityType(nodes[i].EntityType)
+
+		if nodes[i].EntityType == "other" {
+			switch nodes[i].Type {
+			case "eventNode":
+				nodes[i].EntityType = "event"
+			case "causeNode":
+				nodes[i].EntityType = "cause"
+			default:
+				nodes[i].EntityType = "component"
+			}
+		}
+	}
+}
+
+func normalizeKGBoundedID(raw, prefix string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		v = prefix
+	}
+	if len(v) <= knowledgeGraphIDMaxLen {
+		return v
+	}
+
+	sum := sha1.Sum([]byte(v))
+	hash := hex.EncodeToString(sum[:])
+	maxHashLen := knowledgeGraphIDMaxLen - len(prefix) - 1
+	if maxHashLen < 8 {
+		maxHashLen = 8
+	}
+	if maxHashLen > len(hash) {
+		maxHashLen = len(hash)
+	}
+	return prefix + "_" + hash[:maxHashLen]
+}
+
+func normalizeKnowledgeGraphIDs(nodes []model.KnowledgeGraphNode, edges []model.KnowledgeGraphEdge) {
+	nodeIDMap := make(map[string]string, len(nodes))
+	for i := range nodes {
+		oldID := strings.TrimSpace(nodes[i].ID)
+		if oldID == "" {
+			oldID = fmt.Sprintf("node_%d", i+1)
+		}
+		newID := normalizeKGBoundedID(oldID, "n")
+		nodes[i].ID = newID
+		nodeIDMap[oldID] = newID
+	}
+
+	for i := range edges {
+		edgeID := strings.TrimSpace(edges[i].ID)
+		if edgeID == "" {
+			edgeID = fmt.Sprintf("edge_%d_%s_%s", i+1, edges[i].SourceNodeID, edges[i].TargetNodeID)
+		}
+		edges[i].ID = normalizeKGBoundedID(edgeID, "e")
+
+		sourceID := strings.TrimSpace(edges[i].SourceNodeID)
+		if mapped, ok := nodeIDMap[sourceID]; ok {
+			edges[i].SourceNodeID = mapped
+		} else {
+			edges[i].SourceNodeID = normalizeKGBoundedID(sourceID, "n")
+		}
+
+		targetID := strings.TrimSpace(edges[i].TargetNodeID)
+		if mapped, ok := nodeIDMap[targetID]; ok {
+			edges[i].TargetNodeID = mapped
+		} else {
+			edges[i].TargetNodeID = normalizeKGBoundedID(targetID, "n")
+		}
+	}
+}
+
 func (s *KnowledgeGraphService) SaveGraph(ctx context.Context, projectID string, input SaveKnowledgeGraphInput) (*SaveGraphResult, error) {
 	var result SaveGraphResult
+
+	normalizeKnowledgeGraphNodes(input.Nodes)
+	normalizeKnowledgeGraphIDs(input.Nodes, input.Edges)
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for i := range input.Nodes {
@@ -91,16 +205,21 @@ func (s *KnowledgeGraphService) SaveGraph(ctx context.Context, projectID string,
 		}
 
 		newRevision := input.Revision + 1
-		affected, err := s.projectRepo.UpdateRevision(projectID, input.Revision, newRevision)
+		affected, err := s.projectRepo.UpdateGraphMetaCAS(
+			tx,
+			projectID,
+			input.Revision,
+			newRevision,
+			0,
+			0,
+			len(input.Nodes),
+			len(input.Edges),
+		)
 		if err != nil {
 			return err
 		}
 		if affected == 0 {
 			return ErrVersionConflict
-		}
-
-		if err := s.projectRepo.UpdateCounts(projectID, 0, 0, len(input.Nodes), len(input.Edges)); err != nil {
-			return err
 		}
 
 		result.Revision = newRevision

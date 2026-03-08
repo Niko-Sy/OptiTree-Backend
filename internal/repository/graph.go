@@ -3,6 +3,7 @@ package repository
 import (
 	"optitree-backend/internal/model"
 
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 )
 
@@ -31,6 +32,14 @@ func (r *GraphRepository) GetFaultTreeGraph(projectID string) ([]model.FaultTree
 func (r *GraphRepository) BatchReplaceFaultTree(tx *gorm.DB, projectID string, nodes []model.FaultTreeNode, edges []model.FaultTreeEdge) error {
 	if tx == nil {
 		tx = r.db
+	}
+	for i := range nodes {
+		if len(nodes[i].Rules) == 0 {
+			nodes[i].Rules = []byte("[]")
+		}
+		if nodes[i].Documents == nil {
+			nodes[i].Documents = pq.StringArray{}
+		}
 	}
 	// 清空旧数据
 	if err := tx.Where("project_id = ?", projectID).Delete(&model.FaultTreeNode{}).Error; err != nil {
@@ -70,6 +79,25 @@ func (r *GraphRepository) GetKnowledgeGraphGraph(projectID string) ([]model.Know
 func (r *GraphRepository) BatchReplaceKnowledgeGraph(tx *gorm.DB, projectID string, nodes []model.KnowledgeGraphNode, edges []model.KnowledgeGraphEdge) error {
 	if tx == nil {
 		tx = r.db
+	}
+	for i := range nodes {
+		if len(nodes[i].StyleJson) == 0 {
+			nodes[i].StyleJson = []byte("{}")
+		}
+		if len(nodes[i].DataExtJson) == 0 {
+			nodes[i].DataExtJson = []byte("{}")
+		}
+	}
+	for i := range edges {
+		if len(edges[i].StyleJson) == 0 {
+			edges[i].StyleJson = []byte("{}")
+		}
+		if len(edges[i].LabelStyleJson) == 0 {
+			edges[i].LabelStyleJson = []byte("{}")
+		}
+		if len(edges[i].LabelBgStyleJson) == 0 {
+			edges[i].LabelBgStyleJson = []byte("{}")
+		}
 	}
 	if err := tx.Where("project_id = ?", projectID).Delete(&model.KnowledgeGraphNode{}).Error; err != nil {
 		return err

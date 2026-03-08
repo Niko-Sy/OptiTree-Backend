@@ -109,17 +109,21 @@ func (s *FaultTreeService) SaveGraph(ctx context.Context, projectID string, inpu
 
 		// 乐观锁 CAS
 		newRevision := input.Revision + 1
-		affected, err := s.projectRepo.UpdateRevision(projectID, input.Revision, newRevision)
+		affected, err := s.projectRepo.UpdateGraphMetaCAS(
+			tx,
+			projectID,
+			input.Revision,
+			newRevision,
+			len(input.Nodes),
+			len(input.Edges),
+			0,
+			0,
+		)
 		if err != nil {
 			return err
 		}
 		if affected == 0 {
 			return ErrVersionConflict
-		}
-
-		// 更新统计数
-		if err := s.projectRepo.UpdateCounts(projectID, len(input.Nodes), len(input.Edges), 0, 0); err != nil {
-			return err
 		}
 
 		result.Revision = newRevision

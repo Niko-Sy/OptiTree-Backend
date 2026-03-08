@@ -127,6 +127,7 @@ func main() {
 		middleware.RequestID(),
 		middleware.Logger(),
 		middleware.Recovery(),
+		middleware.CORSLocalhost(),
 	)
 
 	// 静态文件（本地存储）
@@ -248,14 +249,14 @@ func main() {
 
 	// ---- 启动服务 ----
 	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
+		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
 		Handler:      router,
 		ReadTimeout:  cfg.Server.ReadTimeout,
 		WriteTimeout: cfg.Server.WriteTimeout,
 	}
 
 	go func() {
-		log.Info().Msgf("服务启动，监听端口 :%d", cfg.Server.Port)
+		log.Info().Msgf("服务启动，监听端口 %s:%d", cfg.Server.Host, cfg.Server.Port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatal().Err(err).Msg("服务启动失败")
 		}
