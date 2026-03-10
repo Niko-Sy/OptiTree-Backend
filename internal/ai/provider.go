@@ -9,6 +9,9 @@ type AIProvider interface {
 	GenerateFaultTree(ctx context.Context, req GenerateFaultTreeRequest) (*FaultTreeResult, error)
 	GenerateKnowledgeGraph(ctx context.Context, req GenerateKnowledgeGraphRequest) (*KnowledgeGraphResult, error)
 	Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error)
+	// ChatStream streams the AI reply token by token via onChunk callbacks.
+	// Returns the total tokens consumed and the actual model name used.
+	ChatStream(ctx context.Context, req ChatRequest, onChunk func(chunk string)) (tokensUsed int, modelUsed string, err error)
 }
 
 // GenerateConfig holds per-request LLM parameters.

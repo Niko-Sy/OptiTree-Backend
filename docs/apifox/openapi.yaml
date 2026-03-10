@@ -28,6 +28,7 @@ tags:
   - name: Knowledge Graphs
   - name: Versions
   - name: Documents
+  - name: AI
   - name: AI Tasks
 
 paths:
@@ -1213,6 +1214,130 @@ paths:
                           document:
                             $ref: '#/components/schemas/Document'
 
+  /api/v1/ai/chat:
+    post:
+      tags: [AI]
+      summary: Single-turn AI chat about current graph context
+      description: |
+        Synchronous AI chat interface.
+
+        Implementation notes:
+        - Request body uses `type` as the graph type field, matching the current backend handler.
+        - Backend converts graph JSON into a natural-language summary before calling the LLM.
+        - Response is returned in the standard API envelope.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AIChatRequest'
+            examples:
+              faultTree:
+                value:
+                  context:
+                    projectId: proj_abc123
+                    nodes: []
+                    edges: []
+                  type: faultTree
+                  message: 分析当前故障树的结构，找出潜在的逻辑缺陷或不完整路径
+              knowledgeGraph:
+                value:
+                  context:
+                    projectId: proj_kg_001
+                    rfNodes: []
+                    rfEdges: []
+                  type: knowledgeGraph
+                  message: 这个知识图谱里有哪些孤立实体和缺失关系
+      responses:
+        '200':
+          description: AI chat result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AIChatResponseData'
+              examples:
+                success:
+                  value:
+                    code: 0
+                    message: ok
+                    data:
+                      reply: 当前故障树包含 12 个节点、9 条边，建议优先检查孤立逻辑门以及没有下游基本事件的中间事件。
+                      suggestions:
+                        - 检查孤立节点
+                        - 补充基本事件概率
+                    requestId: e4d8bc8f-3d15-4cb8-8ff4-50bdfcb8d9b1
+                    timestamp: '2026-03-10T08:00:00Z'
+                failed:
+                  value:
+                    code: 42200
+                    message: AI 请求失败: upstream timeout
+                    requestId: e4d8bc8f-3d15-4cb8-8ff4-50bdfcb8d9b1
+                    timestamp: '2026-03-10T08:00:00Z'
+        '401':
+          $ref: '#/components/responses/UnauthorizedHttp'
+
+  /api/v1/ai/chat/stream:
+    post:
+      tags: [AI]
+      summary: Stream AI chat output with SSE
+      description: |
+        Streaming AI chat interface using Server-Sent Events (SSE).
+
+        Implementation notes:
+        - Request body uses `contextType`, matching the current backend handler.
+        - Response content type is `text/event-stream`, not the standard JSON envelope.
+        - The backend forwards incremental content chunks as SSE `data:` frames.
+        - Final event contains `tokensUsed` and `modelId`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AIChatStreamRequest'
+            examples:
+              faultTree:
+                value:
+                  context:
+                    projectId: proj_abc123
+                    nodes: []
+                    edges: []
+                  contextType: faultTree
+                  message: 分析当前故障树的结构，找出潜在的逻辑缺陷或不完整路径
+              knowledgeGraph:
+                value:
+                  context:
+                    projectId: proj_kg_001
+                    rfNodes: []
+                    rfEdges: []
+                  contextType: knowledgeGraph
+                  message: 这个知识图谱里有哪些孤立实体和缺失关系
+      responses:
+        '200':
+          description: SSE stream of content / done / error events
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE frames encoded as `data: <json>\n\n`.
+              examples:
+                stream:
+                  value: |
+                    data: {"type":"content","content":"当前故障树包含 12 个节点"}
+
+                    data: {"type":"content","content":"，其中 gate_3 处于孤立状态。"}
+
+                    data: {"type":"done","tokensUsed":312,"modelId":"qwen3"}
+                error:
+                  value: |
+                    data: {"type":"error","code":50300,"message":"upstream service unavailable"}
+        '401':
+          $ref: '#/components/responses/UnauthorizedHttp'
+
   /api/v1/ai/tasks/{taskId}:
     get:
       tags: [AI Tasks]
@@ -1774,6 +1899,77 @@ components:
         projectId:
           type: string
           nullable: true
+
+    AIChatContext:
+      type: object
+      description: Flexible graph snapshot passed to AI. Fault trees usually use `nodes`/`edges`; knowledge graphs may use `rfNodes`/`rfEdges`.
+      additionalProperties: true
+      properties:
+        projectId:
+          type: string
+          nullable: true
+        nodes:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        edges:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        rfNodes:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        rfEdges:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    AIChatRequest:
+      type: object
+      required: [context, type, message]
+      properties:
+        context:
+          $ref: '#/components/schemas/AIChatContext'
+        type:
+          type: string
+          description: Graph type field used by the current synchronous handler.
+          enum: [faultTree, knowledgeGraph]
+        message:
+          type: string
+          maxLength: 2000
+        model:
+          type: string
+          nullable: true
+          description: Optional per-request model override.
+
+    AIChatResponseData:
+      type: object
+      properties:
+        reply:
+          type: string
+        suggestions:
+          type: array
+          items:
+            type: string
+
+    AIChatStreamRequest:
+      type: object
+      required: [context, contextType, message]
+      properties:
+        context:
+          $ref: '#/components/schemas/AIChatContext'
+        contextType:
+          type: string
+          description: Graph type field used by the current streaming handler.
+          enum: [faultTree, knowledgeGraph]
+        message:
+          type: string
+          maxLength: 2000
 
     AITask:
       type: object

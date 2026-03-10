@@ -1,6 +1,10 @@
 package handler
 
 import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+
 	"optitree-backend/internal/ai"
 	"optitree-backend/internal/constant"
 	"optitree-backend/internal/middleware"
@@ -129,4 +133,70 @@ func (h *AITaskHandler) Chat(c *gin.Context) {
 		return
 	}
 	util.Success(c, resp)
+}
+
+// chatStreamRequest is the body for POST /ai/chat/stream.
+type chatStreamRequest struct {
+	Context     interface{} `json:"context"`
+	ContextType string      `json:"contextType" binding:"required,oneof=faultTree knowledgeGraph"`
+	Message     string      `json:"message"     binding:"required,max=2000"`
+}
+
+// ChatStream handles POST /ai/chat/stream.
+// The response is a Server-Sent Events (SSE) stream. Each event is a JSON object on a
+// "data:" line followed by two newlines.
+//
+// Content events:  data: {"type":"content","content":"<token>"}
+// Done event:      data: {"type":"done","tokensUsed":512,"modelId":"qwen3"}
+// Error event:     data: {"type":"error","code":50300,"message":"..."}
+func (h *AITaskHandler) ChatStream(c *gin.Context) {
+	var req chatStreamRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		util.FailWithErrors(c, constant.CodeInvalidParam, constant.MsgInvalidParam, err.Error())
+		return
+	}
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		util.Fail(c, constant.CodeServerError, "streaming not supported by the server")
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Header("Transfer-Encoding", "chunked")
+
+	// writeEvent serialises payload as JSON and flushes a single SSE data frame.
+	writeEvent := func(payload map[string]interface{}) {
+		b, _ := json.Marshal(payload)
+		fmt.Fprintf(c.Writer, "data: %s\n\n", b)
+		flusher.Flush()
+	}
+
+	tokensUsed, modelUsed, err := h.aiTaskService.ChatStream(
+		c.Request.Context(),
+		service.ChatStreamInput{
+			ContextData: req.Context,
+			ContextType: req.ContextType,
+			Message:     req.Message,
+		},
+		func(chunk string) {
+			writeEvent(map[string]interface{}{"type": "content", "content": chunk})
+		},
+	)
+	if err != nil {
+		writeEvent(map[string]interface{}{
+			"type":    "error",
+			"code":    constant.CodeAIUnavailable,
+			"message": err.Error(),
+		})
+		return
+	}
+	writeEvent(map[string]interface{}{
+		"type":       "done",
+		"tokensUsed": tokensUsed,
+		"modelId":    modelUsed,
+	})
 }

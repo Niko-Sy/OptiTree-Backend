@@ -20,10 +20,13 @@ type Config struct {
 }
 
 type AIConfig struct {
-	Endpoint     string        `mapstructure:"endpoint"`
-	APIKey       string        `mapstructure:"api_key"`
-	DefaultModel string        `mapstructure:"default_model"`
-	Timeout      time.Duration `mapstructure:"timeout"`
+	Endpoint     string `mapstructure:"endpoint"`
+	APIKey       string `mapstructure:"api_key"`
+	DefaultModel string `mapstructure:"default_model"`
+	// ChatModel is the model used exclusively for AI chat (POST /ai/chat and /ai/chat/stream).
+	// Defaults to DefaultModel when empty.
+	ChatModel string        `mapstructure:"chat_model"`
+	Timeout   time.Duration `mapstructure:"timeout"`
 }
 
 // OCRConfig holds settings for the PaddleOCR layout-parsing service.

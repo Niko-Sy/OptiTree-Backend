@@ -97,7 +97,7 @@ func main() {
 		cfg.Storage.AllowedImageTypes,
 		cfg.Storage.AllowedDocTypes,
 	)
-	aiClient := ai.NewClient(cfg.AI.Endpoint, cfg.AI.APIKey, cfg.AI.DefaultModel, cfg.AI.Timeout)
+	aiClient := ai.NewClient(cfg.AI.Endpoint, cfg.AI.APIKey, cfg.AI.DefaultModel, cfg.AI.ChatModel, cfg.AI.Timeout)
 	ocrClient := ocr.NewClient(cfg.OCR.URL, cfg.OCR.Token, cfg.OCR.Timeout)
 	llmSrvClient := ai.NewLLMServerClient(cfg.LLMServer.BaseURL, cfg.LLMServer.Timeout)
 	authSvc := service.NewAuthService(userRepo, authRepo, jwtManager, rdb)
@@ -239,6 +239,7 @@ func main() {
 			ai.POST("/fault-trees/generate", aiTaskH.GenerateFaultTree)
 			ai.POST("/knowledge-graphs/generate", aiTaskH.GenerateKnowledgeGraph)
 			ai.POST("/chat", aiTaskH.Chat)
+			ai.POST("/chat/stream", aiTaskH.ChatStream)
 		}
 
 		// 团队总览

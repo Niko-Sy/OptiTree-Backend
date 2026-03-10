@@ -362,3 +362,20 @@ func (s *AITaskService) Chat(ctx context.Context, input ChatInput) (*ai.ChatResp
 		Model:       input.Model,
 	})
 }
+
+// ChatStreamInput is the service-layer input for streaming AI chat.
+type ChatStreamInput struct {
+	ContextData interface{}
+	ContextType string // "faultTree" | "knowledgeGraph"
+	Message     string
+}
+
+// ChatStream streams AI replies token by token via onChunk.
+// Returns the total tokens consumed and the model name actually used.
+func (s *AITaskService) ChatStream(ctx context.Context, input ChatStreamInput, onChunk func(chunk string)) (tokensUsed int, modelUsed string, err error) {
+	return s.provider.ChatStream(ctx, ai.ChatRequest{
+		ContextData: input.ContextData,
+		GraphType:   input.ContextType,
+		Message:     input.Message,
+	}, onChunk)
+}
