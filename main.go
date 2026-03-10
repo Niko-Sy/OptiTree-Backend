@@ -100,13 +100,28 @@ func main() {
 	aiClient := ai.NewClient(cfg.AI.Endpoint, cfg.AI.APIKey, cfg.AI.DefaultModel, cfg.AI.ChatModel, cfg.AI.Timeout)
 	ocrClient := ocr.NewClient(cfg.OCR.URL, cfg.OCR.Token, cfg.OCR.Timeout)
 	llmSrvClient := ai.NewLLMServerClient(cfg.LLMServer.BaseURL, cfg.LLMServer.Timeout)
+	taskProgressHub := service.NewTaskProgressHub()
 	authSvc := service.NewAuthService(userRepo, authRepo, jwtManager, rdb)
 	userSvc := service.NewUserService(userRepo, storageSvc)
 	projectSvc := service.NewProjectService(db, projectRepo, memberRepo, graphRepo, versionRepo, docRepo)
 	ftSvc := service.NewFaultTreeService(db, projectRepo, graphRepo, rdb)
 	kgSvc := service.NewKnowledgeGraphService(db, projectRepo, graphRepo, rdb)
 	versionSvc := service.NewVersionService(versionRepo, projectRepo, graphRepo, ftSvc, kgSvc)
-	aiTaskSvc := service.NewAITaskService(aiTaskRepo, docRepo, storageSvc, aiClient, ocrClient, llmSrvClient, rdb)
+	aiTaskSvc := service.NewAITaskService(
+		aiTaskRepo,
+		docRepo,
+		projectRepo,
+		memberRepo,
+		storageSvc,
+		projectSvc,
+		ftSvc,
+		kgSvc,
+		aiClient,
+		ocrClient,
+		llmSrvClient,
+		taskProgressHub,
+		rdb,
+	)
 	docSvc := service.NewDocumentService(docRepo, storageSvc)
 	memberSvc := service.NewMemberService(memberRepo, projectRepo, userRepo)
 	teamSvc := service.NewTeamService(db)
@@ -121,6 +136,7 @@ func main() {
 	versionH := handler.NewVersionHandler(versionSvc)
 	docH := handler.NewDocumentHandler(docSvc)
 	aiTaskH := handler.NewAITaskHandler(aiTaskSvc)
+	aiTaskWSH := handler.NewAITaskWSHandler(taskProgressHub, jwtManager, rdb, memberRepo)
 	memberH := handler.NewMemberHandler(memberSvc)
 	teamH := handler.NewTeamHandler(teamSvc)
 
@@ -149,6 +165,9 @@ func main() {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
+
+	// AI 任务实时进度推送（WebSocket）
+	router.GET("/api/v1/ws/tasks/:projectId", aiTaskWSH.StreamTaskProgress)
 
 	v1 := router.Group("/api/v1")
 
@@ -185,6 +204,8 @@ func main() {
 		// 项目
 		projects := authed.Group("/projects")
 		{
+			// Backward-compatible summary endpoint for clients still calling /projects/summary.
+			projects.GET("/summary", dashboardH.GetSummary)
 			projects.GET("", projectH.List)
 			projects.POST("", projectH.Create)
 			projects.GET("/:projectId", projectH.GetByID)

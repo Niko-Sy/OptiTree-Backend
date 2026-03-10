@@ -134,6 +134,11 @@ func (r *ProjectRepository) UpdateLatestVersion(id string, versionID *string) er
 		Update("latest_version_id", versionID).Error
 }
 
+func (r *ProjectRepository) UpdateGenerationStatus(id string, status *string) error {
+	return r.db.Model(&model.Project{}).Where("id = ?", id).
+		Update("generation_status", status).Error
+}
+
 func (r *ProjectRepository) Delete(tx *gorm.DB, id string) error {
 	if tx == nil {
 		tx = r.db

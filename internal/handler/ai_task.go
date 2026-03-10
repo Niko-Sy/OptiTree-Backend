@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -48,9 +49,10 @@ func (h *AITaskHandler) GetTask(c *gin.Context) {
 
 // generateFaultTreeRequest is the body for POST /ai/fault-trees/generate.
 type generateFaultTreeRequest struct {
-	DocIDs   []string `json:"docIds" binding:"required,min=1"`
-	TopEvent string   `json:"topEvent" binding:"required,max=60"`
-	Config   struct {
+	DocIDs    []string `json:"docIds" binding:"required,min=1"`
+	TopEvent  string   `json:"topEvent" binding:"required,max=60"`
+	ProjectID *string  `json:"projectId"`
+	Config    struct {
 		Quality  string `json:"quality"`
 		Model    string `json:"model"`
 		Depth    int    `json:"depth"`
@@ -69,8 +71,9 @@ func (h *AITaskHandler) GenerateFaultTree(c *gin.Context) {
 	}
 	userID := middleware.GetUserID(c)
 	out, err := h.aiTaskService.GenerateFaultTree(c.Request.Context(), service.GenerateFaultTreeInput{
-		DocIDs:   req.DocIDs,
-		TopEvent: req.TopEvent,
+		DocIDs:    req.DocIDs,
+		TopEvent:  req.TopEvent,
+		ProjectID: req.ProjectID,
 		Config: ai.GenerateConfig{
 			Quality:  req.Config.Quality,
 			Model:    req.Config.Model,
@@ -80,7 +83,16 @@ func (h *AITaskHandler) GenerateFaultTree(c *gin.Context) {
 		UserID: userID,
 	})
 	if err != nil {
-		util.FailServerError(c)
+		switch {
+		case errors.Is(err, service.ErrProjectNotFound):
+			util.FailNotFound(c)
+		case errors.Is(err, service.ErrProjectTypeMismatch):
+			util.Fail(c, constant.CodeInvalidParam, "projectId 类型与接口不匹配")
+		case errors.Is(err, service.ErrProjectPermissionDenied):
+			util.FailForbidden(c)
+		default:
+			util.FailServerError(c)
+		}
 		return
 	}
 	util.Success(c, out)
@@ -88,8 +100,9 @@ func (h *AITaskHandler) GenerateFaultTree(c *gin.Context) {
 
 // generateKGRequest is the body for POST /ai/knowledge-graphs/generate.
 type generateKGRequest struct {
-	DocIDs []string `json:"docIds" binding:"required,min=1"`
-	Config struct {
+	DocIDs    []string `json:"docIds" binding:"required,min=1"`
+	ProjectID *string  `json:"projectId"`
+	Config    struct {
 		Quality     string   `json:"quality"`
 		Model       string   `json:"model"`
 		EntityTypes []string `json:"entityTypes"`
@@ -106,7 +119,8 @@ func (h *AITaskHandler) GenerateKnowledgeGraph(c *gin.Context) {
 	}
 	userID := middleware.GetUserID(c)
 	out, err := h.aiTaskService.GenerateKnowledgeGraph(c.Request.Context(), service.GenerateKnowledgeGraphInput{
-		DocIDs: req.DocIDs,
+		DocIDs:    req.DocIDs,
+		ProjectID: req.ProjectID,
 		Config: ai.GenerateConfig{
 			Quality: req.Config.Quality,
 			Model:   req.Config.Model,
@@ -114,7 +128,16 @@ func (h *AITaskHandler) GenerateKnowledgeGraph(c *gin.Context) {
 		UserID: userID,
 	})
 	if err != nil {
-		util.FailServerError(c)
+		switch {
+		case errors.Is(err, service.ErrProjectNotFound):
+			util.FailNotFound(c)
+		case errors.Is(err, service.ErrProjectTypeMismatch):
+			util.Fail(c, constant.CodeInvalidParam, "projectId 类型与接口不匹配")
+		case errors.Is(err, service.ErrProjectPermissionDenied):
+			util.FailForbidden(c)
+		default:
+			util.FailServerError(c)
+		}
 		return
 	}
 	util.Success(c, out)

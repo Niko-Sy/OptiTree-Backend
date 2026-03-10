@@ -69,6 +69,9 @@ CREATE TABLE IF NOT EXISTS projects (
     -- 最新版本快照ID（无外键约束，避免与 version_snapshots 循环依赖）
     latest_version_id VARCHAR(32),
     member_count      INT          NOT NULL DEFAULT 0,
+    -- AI 生成状态（仅 AI 生成流程使用）
+    generation_status VARCHAR(32)
+                                  CHECK (generation_status IN ('pending_generating', 'generating', 'completed', 'failed')),
 
     created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
@@ -90,6 +93,7 @@ COMMENT ON COLUMN projects.edge_count        IS '故障树边数（ft项目）';
 COMMENT ON COLUMN projects.entity_count      IS '知识图谱实体数（kg项目）';
 COMMENT ON COLUMN projects.relation_count    IS '知识图谱关系数（kg项目）';
 COMMENT ON COLUMN projects.member_count      IS '协作成员数（含创建者）';
+COMMENT ON COLUMN projects.generation_status IS 'AI 生成状态：pending_generating / generating / completed / failed';
 
 
 -- ============================================================

@@ -22,32 +22,50 @@ import (
 )
 
 type AITaskService struct {
-	taskRepo     *repository.AITaskRepository
-	docRepo      *repository.DocumentRepository
-	storage      *StorageService
-	provider     ai.AIProvider       // used for Chat only
-	ocrClient    *ocr.Client         // PaddleOCR layout-parsing
-	llmSrvClient *ai.LLMServerClient // FastAPI LLM generation service
-	rdb          *redis.Client
+	taskRepo       *repository.AITaskRepository
+	docRepo        *repository.DocumentRepository
+	projectRepo    *repository.ProjectRepository
+	memberRepo     *repository.MemberRepository
+	storage        *StorageService
+	projectService *ProjectService
+	ftService      *FaultTreeService
+	kgService      *KnowledgeGraphService
+	provider       ai.AIProvider       // used for Chat only
+	ocrClient      *ocr.Client         // PaddleOCR layout-parsing
+	llmSrvClient   *ai.LLMServerClient // FastAPI LLM generation service
+	progressHub    *TaskProgressHub
+	rdb            *redis.Client
 }
 
 func NewAITaskService(
 	taskRepo *repository.AITaskRepository,
 	docRepo *repository.DocumentRepository,
+	projectRepo *repository.ProjectRepository,
+	memberRepo *repository.MemberRepository,
 	storage *StorageService,
+	projectService *ProjectService,
+	ftService *FaultTreeService,
+	kgService *KnowledgeGraphService,
 	provider ai.AIProvider,
 	ocrClient *ocr.Client,
 	llmSrvClient *ai.LLMServerClient,
+	progressHub *TaskProgressHub,
 	rdb *redis.Client,
 ) *AITaskService {
 	return &AITaskService{
-		taskRepo:     taskRepo,
-		docRepo:      docRepo,
-		storage:      storage,
-		provider:     provider,
-		ocrClient:    ocrClient,
-		llmSrvClient: llmSrvClient,
-		rdb:          rdb,
+		taskRepo:       taskRepo,
+		docRepo:        docRepo,
+		projectRepo:    projectRepo,
+		memberRepo:     memberRepo,
+		storage:        storage,
+		projectService: projectService,
+		ftService:      ftService,
+		kgService:      kgService,
+		provider:       provider,
+		ocrClient:      ocrClient,
+		llmSrvClient:   llmSrvClient,
+		progressHub:    progressHub,
+		rdb:            rdb,
 	}
 }
 
@@ -191,39 +209,76 @@ func readTextFile(path string, maxBytes int64) (string, error) {
 
 // GenerateFaultTreeInput is the service-layer input for fault tree generation.
 type GenerateFaultTreeInput struct {
-	DocIDs   []string
-	TopEvent string
-	Config   ai.GenerateConfig
-	UserID   string
+	DocIDs    []string
+	TopEvent  string
+	Config    ai.GenerateConfig
+	ProjectID *string
+	UserID    string
 }
 
 // GenerateFaultTreeOutput is the immediate API response — a task reference for polling.
 type GenerateFaultTreeOutput struct {
-	TaskID string `json:"taskId"`
-	Status string `json:"status"`
+	TaskID    string `json:"taskId"`
+	Status    string `json:"status"`
+	ProjectID string `json:"projectId"`
 }
 
 // GenerateFaultTree creates an async task and launches generation in a goroutine.
 // The caller polls GET /ai/tasks/:taskId for progress and the final result.
 func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFaultTreeInput) (*GenerateFaultTreeOutput, error) {
+	project, err := s.resolveOrCreateProject(ctx, input.ProjectID, input.UserID, constant.ProjectTypeFT, input.TopEvent)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.setProjectGenerationStatus(project.ID, constant.ProjectGenerationPending); err != nil {
+		return nil, err
+	}
+
 	modelName := input.Config.Model
 	if modelName == "" {
 		modelName = "default"
 	}
-	task, err := s.createTask(ctx, constant.AITaskTypeGenerateFaultTree, modelName, input.UserID, nil)
+	projectID := project.ID
+	task, err := s.createTask(ctx, constant.AITaskTypeGenerateFaultTree, modelName, input.UserID, &projectID)
 	if err != nil {
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
 		return nil, err
 	}
-	go s.runGenerateFaultTree(task.ID, input)
-	return &GenerateFaultTreeOutput{TaskID: task.ID, Status: task.Status}, nil
+
+	s.publishTaskEvent(TaskProgressEvent{
+		Event:         "task.pending",
+		ProjectID:     projectID,
+		TaskID:        task.ID,
+		Status:        task.Status,
+		ProjectStatus: constant.ProjectGenerationPending,
+		Progress:      0,
+		Stage:         task.Stage,
+		StageLabel:    task.StageLabel,
+	})
+
+	go s.runGenerateFaultTree(task.ID, projectID, input)
+	return &GenerateFaultTreeOutput{TaskID: task.ID, Status: task.Status, ProjectID: projectID}, nil
 }
 
-func (s *AITaskService) runGenerateFaultTree(taskID string, input GenerateFaultTreeInput) {
+func (s *AITaskService) runGenerateFaultTree(taskID, projectID string, input GenerateFaultTreeInput) {
 	bg := context.Background()
+	if err := s.setProjectGenerationStatus(projectID, constant.ProjectGenerationRunning); err != nil {
+		log.Error().Err(err).Str("projectId", projectID).Msg("更新项目生成状态失败")
+	}
 
 	// ─ Stage 1: document parsing (10% → 40%) ───────────────────────────────
 	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 10, "parsing", "正在解析文档")
 	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 10, "parsing", "正在解析文档")
+	s.publishTaskEvent(TaskProgressEvent{
+		Event:         "task.progress",
+		ProjectID:     projectID,
+		TaskID:        taskID,
+		Status:        constant.AITaskStatusGenerating,
+		ProjectStatus: constant.ProjectGenerationRunning,
+		Progress:      10,
+		Stage:         "parsing",
+		StageLabel:    "正在解析文档",
+	})
 
 	contents := s.extractDocumentTexts(input.DocIDs, func(done, total int) {
 		// Map per-document completion to 10-40% range.
@@ -231,18 +286,49 @@ func (s *AITaskService) runGenerateFaultTree(taskID string, input GenerateFaultT
 		label := fmt.Sprintf("正在解析文档 (%d/%d)", done, total)
 		// Only update Redis during this phase to avoid hammering the DB.
 		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, pct, "parsing", label)
+		s.publishTaskEvent(TaskProgressEvent{
+			Event:         "task.progress",
+			ProjectID:     projectID,
+			TaskID:        taskID,
+			Status:        constant.AITaskStatusGenerating,
+			ProjectStatus: constant.ProjectGenerationRunning,
+			Progress:      pct,
+			Stage:         "parsing",
+			StageLabel:    label,
+		})
 	})
 	if len(contents) == 0 {
 		errMsg := "没有可用于 AI 生成的文档内容"
 		log.Warn().Str("taskId", taskID).Strs("docIds", input.DocIDs).Msg(errMsg)
 		_ = s.taskRepo.SetFailed(taskID, errMsg)
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
 		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		s.publishTaskEvent(TaskProgressEvent{
+			Event:         "task.failed",
+			ProjectID:     projectID,
+			TaskID:        taskID,
+			Status:        constant.AITaskStatusFailed,
+			ProjectStatus: constant.ProjectGenerationFailed,
+			ErrorMessage:  errMsg,
+			Stage:         "failed",
+			StageLabel:    "生成失败",
+		})
 		return
 	}
 
 	// ─ Stage 2: LLM generation (40% → 90%) ──────────────────────────────
 	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
 	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
+	s.publishTaskEvent(TaskProgressEvent{
+		Event:         "task.progress",
+		ProjectID:     projectID,
+		TaskID:        taskID,
+		Status:        constant.AITaskStatusGenerating,
+		ProjectStatus: constant.ProjectGenerationRunning,
+		Progress:      40,
+		Stage:         "generating",
+		StageLabel:    "AI 生成中",
+	})
 
 	ctx, cancel := context.WithTimeout(bg, 5*time.Minute)
 	defer cancel()
@@ -258,13 +344,52 @@ func (s *AITaskService) runGenerateFaultTree(taskID string, input GenerateFaultT
 			mapped = 40
 		}
 		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, mapped, stage, "AI 生成中")
+		s.publishTaskEvent(TaskProgressEvent{
+			Event:         "task.progress",
+			ProjectID:     projectID,
+			TaskID:        taskID,
+			Status:        constant.AITaskStatusGenerating,
+			ProjectStatus: constant.ProjectGenerationRunning,
+			Progress:      mapped,
+			Stage:         stage,
+			StageLabel:    "AI 生成中",
+		})
 	}
 
 	result, err := s.llmSrvClient.GenerateFaultTree(ctx, contents, input.TopEvent, input.Config, onProgress)
 	if err != nil {
 		log.Error().Err(err).Str("taskId", taskID).Msg("AI 故障树生成失败")
 		_ = s.taskRepo.SetFailed(taskID, err.Error())
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
 		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		s.publishTaskEvent(TaskProgressEvent{
+			Event:         "task.failed",
+			ProjectID:     projectID,
+			TaskID:        taskID,
+			Status:        constant.AITaskStatusFailed,
+			ProjectStatus: constant.ProjectGenerationFailed,
+			ErrorMessage:  err.Error(),
+			Stage:         "failed",
+			StageLabel:    "生成失败",
+		})
+		return
+	}
+
+	if err := s.saveGeneratedFaultTreeToProject(ctx, projectID, result); err != nil {
+		log.Error().Err(err).Str("taskId", taskID).Str("projectId", projectID).Msg("保存故障树图数据失败")
+		_ = s.taskRepo.SetFailed(taskID, "保存项目图数据失败: "+err.Error())
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
+		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		s.publishTaskEvent(TaskProgressEvent{
+			Event:         "task.failed",
+			ProjectID:     projectID,
+			TaskID:        taskID,
+			Status:        constant.AITaskStatusFailed,
+			ProjectStatus: constant.ProjectGenerationFailed,
+			ErrorMessage:  "保存项目图数据失败: " + err.Error(),
+			Stage:         "failed",
+			StageLabel:    "生成失败",
+		})
 		return
 	}
 
@@ -274,61 +399,144 @@ func (s *AITaskService) runGenerateFaultTree(taskID string, input GenerateFaultT
 	if err := s.taskRepo.SetCompleted(taskID, resultJSON); err != nil {
 		log.Error().Err(err).Str("taskId", taskID).Msg("保存 AI 任务结果失败")
 	}
+	_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationCompleted)
 	s.cacheStatus(bg, taskID, constant.AITaskStatusCompleted, 100, "completed", "生成完成")
+	s.publishTaskEvent(TaskProgressEvent{
+		Event:         "task.completed",
+		ProjectID:     projectID,
+		TaskID:        taskID,
+		Status:        constant.AITaskStatusCompleted,
+		ProjectStatus: constant.ProjectGenerationCompleted,
+		Progress:      100,
+		Stage:         "completed",
+		StageLabel:    "生成完成",
+		Result: map[string]interface{}{
+			"summary":  result.Summary,
+			"accuracy": result.Accuracy,
+		},
+	})
 }
 
 // ─── Generate Knowledge Graph ─────────────────────────────────────────────────
 
 // GenerateKnowledgeGraphInput is the service-layer input for knowledge graph generation.
 type GenerateKnowledgeGraphInput struct {
-	DocIDs []string
-	Config ai.GenerateConfig
-	UserID string
+	DocIDs    []string
+	Config    ai.GenerateConfig
+	ProjectID *string
+	UserID    string
 }
 
 // GenerateKnowledgeGraphOutput is the immediate API response — a task reference for polling.
 type GenerateKnowledgeGraphOutput struct {
-	TaskID string `json:"taskId"`
-	Status string `json:"status"`
+	TaskID    string `json:"taskId"`
+	Status    string `json:"status"`
+	ProjectID string `json:"projectId"`
 }
 
 // GenerateKnowledgeGraph creates an async task and launches generation in a goroutine.
 func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input GenerateKnowledgeGraphInput) (*GenerateKnowledgeGraphOutput, error) {
+	project, err := s.resolveOrCreateProject(ctx, input.ProjectID, input.UserID, constant.ProjectTypeKG, "")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.setProjectGenerationStatus(project.ID, constant.ProjectGenerationPending); err != nil {
+		return nil, err
+	}
+
 	modelName := input.Config.Model
 	if modelName == "" {
 		modelName = "default"
 	}
-	task, err := s.createTask(ctx, constant.AITaskTypeGenerateKnowledgeGraph, modelName, input.UserID, nil)
+	projectID := project.ID
+	task, err := s.createTask(ctx, constant.AITaskTypeGenerateKnowledgeGraph, modelName, input.UserID, &projectID)
 	if err != nil {
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
 		return nil, err
 	}
-	go s.runGenerateKnowledgeGraph(task.ID, input)
-	return &GenerateKnowledgeGraphOutput{TaskID: task.ID, Status: task.Status}, nil
+
+	s.publishTaskEvent(TaskProgressEvent{
+		Event:         "task.pending",
+		ProjectID:     projectID,
+		TaskID:        task.ID,
+		Status:        task.Status,
+		ProjectStatus: constant.ProjectGenerationPending,
+		Progress:      0,
+		Stage:         task.Stage,
+		StageLabel:    task.StageLabel,
+	})
+
+	go s.runGenerateKnowledgeGraph(task.ID, projectID, input)
+	return &GenerateKnowledgeGraphOutput{TaskID: task.ID, Status: task.Status, ProjectID: projectID}, nil
 }
 
-func (s *AITaskService) runGenerateKnowledgeGraph(taskID string, input GenerateKnowledgeGraphInput) {
+func (s *AITaskService) runGenerateKnowledgeGraph(taskID, projectID string, input GenerateKnowledgeGraphInput) {
 	bg := context.Background()
+	if err := s.setProjectGenerationStatus(projectID, constant.ProjectGenerationRunning); err != nil {
+		log.Error().Err(err).Str("projectId", projectID).Msg("更新项目生成状态失败")
+	}
 
 	// ─ Stage 1: document parsing (10% → 40%) ───────────────────────────────
 	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 10, "parsing", "正在解析文档")
 	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 10, "parsing", "正在解析文档")
+	s.publishTaskEvent(TaskProgressEvent{
+		Event:         "task.progress",
+		ProjectID:     projectID,
+		TaskID:        taskID,
+		Status:        constant.AITaskStatusGenerating,
+		ProjectStatus: constant.ProjectGenerationRunning,
+		Progress:      10,
+		Stage:         "parsing",
+		StageLabel:    "正在解析文档",
+	})
 
 	contents := s.extractDocumentTexts(input.DocIDs, func(done, total int) {
 		pct := 10 + int(float64(done)/float64(total)*30)
 		label := fmt.Sprintf("正在解析文档 (%d/%d)", done, total)
 		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, pct, "parsing", label)
+		s.publishTaskEvent(TaskProgressEvent{
+			Event:         "task.progress",
+			ProjectID:     projectID,
+			TaskID:        taskID,
+			Status:        constant.AITaskStatusGenerating,
+			ProjectStatus: constant.ProjectGenerationRunning,
+			Progress:      pct,
+			Stage:         "parsing",
+			StageLabel:    label,
+		})
 	})
 	if len(contents) == 0 {
 		errMsg := "没有可用于 AI 生成的文档内容"
 		log.Warn().Str("taskId", taskID).Strs("docIds", input.DocIDs).Msg(errMsg)
 		_ = s.taskRepo.SetFailed(taskID, errMsg)
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
 		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		s.publishTaskEvent(TaskProgressEvent{
+			Event:         "task.failed",
+			ProjectID:     projectID,
+			TaskID:        taskID,
+			Status:        constant.AITaskStatusFailed,
+			ProjectStatus: constant.ProjectGenerationFailed,
+			ErrorMessage:  errMsg,
+			Stage:         "failed",
+			StageLabel:    "生成失败",
+		})
 		return
 	}
 
 	// ─ Stage 2: LLM generation (40% → 90%) ──────────────────────────────
 	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
 	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
+	s.publishTaskEvent(TaskProgressEvent{
+		Event:         "task.progress",
+		ProjectID:     projectID,
+		TaskID:        taskID,
+		Status:        constant.AITaskStatusGenerating,
+		ProjectStatus: constant.ProjectGenerationRunning,
+		Progress:      40,
+		Stage:         "generating",
+		StageLabel:    "AI 生成中",
+	})
 
 	ctx, cancel := context.WithTimeout(bg, 5*time.Minute)
 	defer cancel()
@@ -342,13 +550,52 @@ func (s *AITaskService) runGenerateKnowledgeGraph(taskID string, input GenerateK
 			mapped = 40
 		}
 		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, mapped, stage, "AI 生成中")
+		s.publishTaskEvent(TaskProgressEvent{
+			Event:         "task.progress",
+			ProjectID:     projectID,
+			TaskID:        taskID,
+			Status:        constant.AITaskStatusGenerating,
+			ProjectStatus: constant.ProjectGenerationRunning,
+			Progress:      mapped,
+			Stage:         stage,
+			StageLabel:    "AI 生成中",
+		})
 	}
 
 	result, err := s.llmSrvClient.GenerateKnowledgeGraph(ctx, contents, input.Config, onProgress)
 	if err != nil {
 		log.Error().Err(err).Str("taskId", taskID).Msg("AI 知识图谱生成失败")
 		_ = s.taskRepo.SetFailed(taskID, err.Error())
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
 		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		s.publishTaskEvent(TaskProgressEvent{
+			Event:         "task.failed",
+			ProjectID:     projectID,
+			TaskID:        taskID,
+			Status:        constant.AITaskStatusFailed,
+			ProjectStatus: constant.ProjectGenerationFailed,
+			ErrorMessage:  err.Error(),
+			Stage:         "failed",
+			StageLabel:    "生成失败",
+		})
+		return
+	}
+
+	if err := s.saveGeneratedKnowledgeGraphToProject(ctx, projectID, result); err != nil {
+		log.Error().Err(err).Str("taskId", taskID).Str("projectId", projectID).Msg("保存知识图谱图数据失败")
+		_ = s.taskRepo.SetFailed(taskID, "保存项目图数据失败: "+err.Error())
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
+		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		s.publishTaskEvent(TaskProgressEvent{
+			Event:         "task.failed",
+			ProjectID:     projectID,
+			TaskID:        taskID,
+			Status:        constant.AITaskStatusFailed,
+			ProjectStatus: constant.ProjectGenerationFailed,
+			ErrorMessage:  "保存项目图数据失败: " + err.Error(),
+			Stage:         "failed",
+			StageLabel:    "生成失败",
+		})
 		return
 	}
 
@@ -358,7 +605,23 @@ func (s *AITaskService) runGenerateKnowledgeGraph(taskID string, input GenerateK
 	if err := s.taskRepo.SetCompleted(taskID, resultJSON); err != nil {
 		log.Error().Err(err).Str("taskId", taskID).Msg("保存 AI 任务结果失败")
 	}
+	_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationCompleted)
 	s.cacheStatus(bg, taskID, constant.AITaskStatusCompleted, 100, "completed", "生成完成")
+	s.publishTaskEvent(TaskProgressEvent{
+		Event:         "task.completed",
+		ProjectID:     projectID,
+		TaskID:        taskID,
+		Status:        constant.AITaskStatusCompleted,
+		ProjectStatus: constant.ProjectGenerationCompleted,
+		Progress:      100,
+		Stage:         "completed",
+		StageLabel:    "生成完成",
+		Result: map[string]interface{}{
+			"summary":       result.Summary,
+			"entityCount":   result.EntityCount,
+			"relationCount": result.RelationCount,
+		},
+	})
 }
 
 // ─── Chat ─────────────────────────────────────────────────────────────────────

@@ -26,6 +26,14 @@ const (
 	ProjectTypeKG = "kg" // 知识图谱
 )
 
+// 项目 AI 生成状态
+const (
+	ProjectGenerationPending   = "pending_generating"
+	ProjectGenerationRunning   = "generating"
+	ProjectGenerationCompleted = "completed"
+	ProjectGenerationFailed    = "failed"
+)
+
 // 版本快照最大保留数
 const MaxVersionCount = 30
 
