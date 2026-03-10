@@ -235,6 +235,7 @@ func main() {
 		// AI 任务
 		ai := authed.Group("/ai")
 		{
+			ai.GET("/models", aiTaskH.GetModels)
 			ai.GET("/tasks/:taskId", aiTaskH.GetTask)
 			ai.POST("/fault-trees/generate", aiTaskH.GenerateFaultTree)
 			ai.POST("/knowledge-graphs/generate", aiTaskH.GenerateKnowledgeGraph)

@@ -1154,19 +1154,42 @@ paths:
     post:
       tags: [Documents]
       summary: Upload one or more documents
+      description: |
+        Upload one or more files and return lightweight parsed document entries.
+
+        Implementation notes:
+        - Backend accepts both `files` and `files[]` for frontend compatibility.
+        - At least one of `files` or `files[]` must be provided.
+        - `quality` / `model` / `projectType` currently affect summary text in response.
       requestBody:
         required: true
         content:
           multipart/form-data:
             schema:
               type: object
-              required: [files]
               properties:
                 files:
                   type: array
                   items:
                     type: string
                     format: binary
+                  description: Preferred frontend field for multi-file upload.
+                files[]:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+                  description: Compatible frontend field name; backend accepts it.
+                quality:
+                  type: string
+                  enum: [fast, balanced, precise]
+                  default: balanced
+                model:
+                  type: string
+                  default: qwen3.5-flash
+                projectType:
+                  type: string
+                  enum: [ft, kg]
                 projectId:
                   type: string
                   nullable: true
@@ -1181,12 +1204,7 @@ paths:
                   - type: object
                     properties:
                       data:
-                        type: object
-                        properties:
-                          documents:
-                            type: array
-                            items:
-                              $ref: '#/components/schemas/Document'
+                        $ref: '#/components/schemas/DocumentUploadResponseData'
 
   /api/v1/documents/{docId}:
     get:
@@ -1214,6 +1232,98 @@ paths:
                           document:
                             $ref: '#/components/schemas/Document'
 
+  /api/v1/ai/models:
+    get:
+      tags: [AI]
+      summary: Get available model options
+      description: Returns frontend-selectable model options for AI generation and parsing flows.
+      responses:
+        '200':
+          description: Model list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AIModelListData'
+
+  /api/v1/ai/fault-trees/generate:
+    post:
+      tags: [AI]
+      summary: Create async fault-tree generation task
+      description: |
+        Starts an asynchronous fault-tree generation job.
+        Poll `GET /api/v1/ai/tasks/{taskId}` for progress and final result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AIFaultTreeGenerateRequest'
+            examples:
+              default:
+                value:
+                  docIds: [doc_1, doc_2]
+                  topEvent: 液压系统压力不足
+                  config:
+                    quality: balanced
+                    model: qwen-plus
+                    depth: 4
+                    maxNodes: 100
+      responses:
+        '200':
+          description: Task accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AIGenerateTaskAcceptedData'
+        '401':
+          $ref: '#/components/responses/UnauthorizedHttp'
+
+  /api/v1/ai/knowledge-graphs/generate:
+    post:
+      tags: [AI]
+      summary: Create async knowledge-graph generation task
+      description: |
+        Starts an asynchronous knowledge-graph generation job.
+        Poll `GET /api/v1/ai/tasks/{taskId}` for progress and final result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AIKnowledgeGraphGenerateRequest'
+            examples:
+              default:
+                value:
+                  docIds: [doc_1, doc_2]
+                  config:
+                    quality: balanced
+                    model: qwen-plus
+                    entityTypes: [component, event, cause]
+      responses:
+        '200':
+          description: Task accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AIGenerateTaskAcceptedData'
+        '401':
+          $ref: '#/components/responses/UnauthorizedHttp'
+
   /api/v1/ai/chat:
     post:
       tags: [AI]
@@ -1222,7 +1332,7 @@ paths:
         Synchronous AI chat interface.
 
         Implementation notes:
-        - Request body uses `type` as the graph type field, matching the current backend handler.
+        - Request body uses the field named type, matching the current backend handler.
         - Backend converts graph JSON into a natural-language summary before calling the LLM.
         - Response is returned in the standard API envelope.
       requestBody:
@@ -1239,7 +1349,7 @@ paths:
                     nodes: []
                     edges: []
                   type: faultTree
-                  message: 分析当前故障树的结构，找出潜在的逻辑缺陷或不完整路径
+                  message: '分析当前故障树的结构，找出潜在的逻辑缺陷或不完整路径'
               knowledgeGraph:
                 value:
                   context:
@@ -1247,7 +1357,7 @@ paths:
                     rfNodes: []
                     rfEdges: []
                   type: knowledgeGraph
-                  message: 这个知识图谱里有哪些孤立实体和缺失关系
+                  message: '这个知识图谱里有哪些孤立实体和缺失关系'
       responses:
         '200':
           description: AI chat result
@@ -1266,7 +1376,7 @@ paths:
                     code: 0
                     message: ok
                     data:
-                      reply: 当前故障树包含 12 个节点、9 条边，建议优先检查孤立逻辑门以及没有下游基本事件的中间事件。
+                      reply: '当前故障树包含 12 个节点、9 条边，建议优先检查孤立逻辑门以及没有下游基本事件的中间事件。'
                       suggestions:
                         - 检查孤立节点
                         - 补充基本事件概率
@@ -1275,7 +1385,7 @@ paths:
                 failed:
                   value:
                     code: 42200
-                    message: AI 请求失败: upstream timeout
+                    message: 'AI 请求失败: upstream timeout'
                     requestId: e4d8bc8f-3d15-4cb8-8ff4-50bdfcb8d9b1
                     timestamp: '2026-03-10T08:00:00Z'
         '401':
@@ -1289,10 +1399,10 @@ paths:
         Streaming AI chat interface using Server-Sent Events (SSE).
 
         Implementation notes:
-        - Request body uses `contextType`, matching the current backend handler.
-        - Response content type is `text/event-stream`, not the standard JSON envelope.
-        - The backend forwards incremental content chunks as SSE `data:` frames.
-        - Final event contains `tokensUsed` and `modelId`.
+        - Request body uses the field named contextType, matching the current backend handler.
+        - Response content type is text/event-stream, not the standard JSON envelope.
+        - The backend forwards incremental content chunks as SSE data frames.
+        - Final event contains tokensUsed and modelId.
       requestBody:
         required: true
         content:
@@ -1307,7 +1417,7 @@ paths:
                     nodes: []
                     edges: []
                   contextType: faultTree
-                  message: 分析当前故障树的结构，找出潜在的逻辑缺陷或不完整路径
+                  message: '分析当前故障树的结构，找出潜在的逻辑缺陷或不完整路径'
               knowledgeGraph:
                 value:
                   context:
@@ -1315,7 +1425,7 @@ paths:
                     rfNodes: []
                     rfEdges: []
                   contextType: knowledgeGraph
-                  message: 这个知识图谱里有哪些孤立实体和缺失关系
+                  message: '这个知识图谱里有哪些孤立实体和缺失关系'
       responses:
         '200':
           description: SSE stream of content / done / error events
@@ -1323,7 +1433,7 @@ paths:
             text/event-stream:
               schema:
                 type: string
-                description: SSE frames encoded as `data: <json>\n\n`.
+                description: 'SSE frames encoded as data: <json> followed by a blank line.'
               examples:
                 stream:
                   value: |
@@ -1900,9 +2010,110 @@ components:
           type: string
           nullable: true
 
+    DocumentUploadItem:
+      type: object
+      required: [id, fileName, status]
+      properties:
+        id:
+          type: string
+        fileName:
+          type: string
+        status:
+          type: string
+          enum: [pending, parsing, parsed, failed]
+
+    DocumentUploadResponseData:
+      type: object
+      required: [docIds, summary, documents]
+      properties:
+        docIds:
+          type: array
+          items:
+            type: string
+        summary:
+          type: string
+        documents:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentUploadItem'
+
+    AIModelOption:
+      type: object
+      required: [value, label]
+      properties:
+        value:
+          type: string
+        label:
+          type: string
+        recommended:
+          type: boolean
+          default: false
+
+    AIModelListData:
+      type: object
+      properties:
+        list:
+          type: array
+          items:
+            $ref: '#/components/schemas/AIModelOption'
+
+    AIFaultTreeGenerateRequest:
+      type: object
+      required: [docIds, topEvent, config]
+      properties:
+        docIds:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        topEvent:
+          type: string
+          maxLength: 60
+        config:
+          type: object
+          properties:
+            quality:
+              type: string
+            model:
+              type: string
+            depth:
+              type: integer
+            maxNodes:
+              type: integer
+
+    AIKnowledgeGraphGenerateRequest:
+      type: object
+      required: [docIds, config]
+      properties:
+        docIds:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        config:
+          type: object
+          properties:
+            quality:
+              type: string
+            model:
+              type: string
+            entityTypes:
+              type: array
+              items:
+                type: string
+
+    AIGenerateTaskAcceptedData:
+      type: object
+      required: [taskId, status]
+      properties:
+        taskId:
+          type: string
+        status:
+          type: string
+
     AIChatContext:
       type: object
-      description: Flexible graph snapshot passed to AI. Fault trees usually use `nodes`/`edges`; knowledge graphs may use `rfNodes`/`rfEdges`.
+      description: 'Flexible graph snapshot passed to AI. Fault trees usually use nodes and edges; knowledge graphs may use rfNodes and rfEdges.'
       additionalProperties: true
       properties:
         projectId:
@@ -1937,7 +2148,7 @@ components:
           $ref: '#/components/schemas/AIChatContext'
         type:
           type: string
-          description: Graph type field used by the current synchronous handler.
+          description: 'Graph type field used by the current synchronous handler.'
           enum: [faultTree, knowledgeGraph]
         message:
           type: string
@@ -1945,7 +2156,7 @@ components:
         model:
           type: string
           nullable: true
-          description: Optional per-request model override.
+          description: 'Optional per-request model override.'
 
     AIChatResponseData:
       type: object
@@ -1965,7 +2176,7 @@ components:
           $ref: '#/components/schemas/AIChatContext'
         contextType:
           type: string
-          description: Graph type field used by the current streaming handler.
+          description: 'Graph type field used by the current streaming handler.'
           enum: [faultTree, knowledgeGraph]
         message:
           type: string

@@ -101,11 +101,15 @@ func (s *AITaskService) extractDocumentTexts(
 	onProgress func(done, total int),
 ) []string {
 	if len(docIDs) == 0 {
-		return nil
+		return []string{}
 	}
 	docs, err := s.docRepo.FindByIDs(docIDs)
-	if err != nil || len(docs) == 0 {
-		return nil
+	if err != nil {
+		log.Warn().Err(err).Strs("docIds", docIDs).Msg("查询文档失败")
+		return []string{}
+	}
+	if len(docs) == 0 {
+		return []string{}
 	}
 
 	total := len(docs)
@@ -228,6 +232,13 @@ func (s *AITaskService) runGenerateFaultTree(taskID string, input GenerateFaultT
 		// Only update Redis during this phase to avoid hammering the DB.
 		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, pct, "parsing", label)
 	})
+	if len(contents) == 0 {
+		errMsg := "没有可用于 AI 生成的文档内容"
+		log.Warn().Str("taskId", taskID).Strs("docIds", input.DocIDs).Msg(errMsg)
+		_ = s.taskRepo.SetFailed(taskID, errMsg)
+		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		return
+	}
 
 	// ─ Stage 2: LLM generation (40% → 90%) ──────────────────────────────
 	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
@@ -307,6 +318,13 @@ func (s *AITaskService) runGenerateKnowledgeGraph(taskID string, input GenerateK
 		label := fmt.Sprintf("正在解析文档 (%d/%d)", done, total)
 		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, pct, "parsing", label)
 	})
+	if len(contents) == 0 {
+		errMsg := "没有可用于 AI 生成的文档内容"
+		log.Warn().Str("taskId", taskID).Strs("docIds", input.DocIDs).Msg(errMsg)
+		_ = s.taskRepo.SetFailed(taskID, errMsg)
+		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		return
+	}
 
 	// ─ Stage 2: LLM generation (40% → 90%) ──────────────────────────────
 	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")

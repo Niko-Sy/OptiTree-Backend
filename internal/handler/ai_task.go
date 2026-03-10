@@ -22,6 +22,19 @@ func NewAITaskHandler(aiTaskService *service.AITaskService) *AITaskHandler {
 	return &AITaskHandler{aiTaskService: aiTaskService}
 }
 
+// GetModels handles GET /ai/models.
+// This provides frontend-selectable model options for document parsing/generation flows.
+func (h *AITaskHandler) GetModels(c *gin.Context) {
+	util.Success(c, gin.H{
+		"list": []gin.H{
+			{"value": "qwen3.5-flash", "label": "通义千问-3.5-Flash（推荐）", "recommended": true},
+			{"value": "qwen-plus", "label": "通义千问-Plus"},
+			{"value": "qwen-turbo", "label": "通义千问-Turbo（快速）"},
+			{"value": "deepseek-v3", "label": "DeepSeek-V3"},
+		},
+	})
+}
+
 // GetTask handles GET /ai/tasks/:taskId
 func (h *AITaskHandler) GetTask(c *gin.Context) {
 	taskID := c.Param("taskId")

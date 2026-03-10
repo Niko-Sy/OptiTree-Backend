@@ -118,23 +118,45 @@ func (c *Client) complete(ctx context.Context, model string, messages []oaiMsg) 
 	return oaiResp.Choices[0].Message.Content, nil
 }
 
-func (c *Client) modelFor(override string) string {
-	if override != "" {
-		return override
+// normalizeModelName maps user-facing aliases to actually configured provider models.
+// This prevents request-level overrides such as "qwen3" from breaking when the account
+// only has access to a concrete deployable model like "qwen3.5-flash".
+func normalizeModelName(name string, fallback string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return strings.TrimSpace(fallback)
 	}
-	return c.defaultModel
+
+	switch strings.ToLower(trimmed) {
+	case "qwen3", "qwen-3":
+		fallback = strings.TrimSpace(fallback)
+		if fallback != "" && !strings.EqualFold(fallback, trimmed) {
+			return fallback
+		}
+		return "qwen3.5-flash"
+	default:
+		return trimmed
+	}
+}
+
+func (c *Client) modelFor(override string) string {
+	return normalizeModelName(override, c.defaultModel)
 }
 
 // chatModelFor resolves the model for Chat/ChatStream calls.
 // Priority: per-request override → dedicated chat model → default model.
 func (c *Client) chatModelFor(override string) string {
 	if override != "" {
-		return override
+		fallback := c.chatModel
+		if fallback == "" {
+			fallback = c.defaultModel
+		}
+		return normalizeModelName(override, fallback)
 	}
 	if c.chatModel != "" {
-		return c.chatModel
+		return normalizeModelName(c.chatModel, c.defaultModel)
 	}
-	return c.defaultModel
+	return normalizeModelName(c.defaultModel, c.defaultModel)
 }
 
 // extractJSON finds the first complete JSON object in s, tolerating markdown code fences.

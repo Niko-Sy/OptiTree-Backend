@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"mime"
 
 	"optitree-backend/internal/constant"
@@ -26,11 +27,22 @@ func (h *DocumentHandler) Upload(c *gin.Context) {
 		return
 	}
 
-	files := form.File["files"]
+	// Support both files and files[] for frontend compatibility.
+	files := append(form.File["files"], form.File["files[]"]...)
 	if len(files) == 0 {
 		util.Fail(c, constant.CodeInvalidParam, "请至少上传一个文件")
 		return
 	}
+
+	quality := c.PostForm("quality")
+	if quality == "" {
+		quality = "balanced"
+	}
+	modelName := c.PostForm("model")
+	if modelName == "" {
+		modelName = "qwen3.5-flash"
+	}
+	projectType := c.PostForm("projectType")
 
 	projectIDStr := c.PostForm("projectId")
 	var projectID *string
@@ -40,7 +52,8 @@ func (h *DocumentHandler) Upload(c *gin.Context) {
 	}
 
 	userID := middleware.GetUserID(c)
-	var results []interface{}
+	var docIDs []string
+	var documents []gin.H
 
 	for _, fh := range files {
 		f, err := fh.Open()
@@ -75,10 +88,29 @@ func (h *DocumentHandler) Upload(c *gin.Context) {
 			}
 			return
 		}
-		results = append(results, doc)
+		docIDs = append(docIDs, doc.ID)
+		documents = append(documents, gin.H{
+			"id":       doc.ID,
+			"fileName": doc.FileName,
+			"status":   doc.Status,
+		})
 	}
 
-	util.Success(c, gin.H{"documents": results})
+	summary := fmt.Sprintf(
+		"已上传 %d 份文档，quality=%s，model=%s",
+		len(documents),
+		quality,
+		modelName,
+	)
+	if projectType != "" {
+		summary += ", projectType=" + projectType
+	}
+
+	util.Success(c, gin.H{
+		"docIds":    docIDs,
+		"summary":   summary,
+		"documents": documents,
+	})
 }
 
 func (h *DocumentHandler) GetByID(c *gin.Context) {

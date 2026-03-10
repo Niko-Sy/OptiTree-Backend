@@ -112,6 +112,13 @@ type llmKGConfig struct {
 	EntityTypes []string `json:"entity_types,omitempty"`
 }
 
+func normalizeDocuments(documents []string) []string {
+	if documents == nil {
+		return []string{}
+	}
+	return documents
+}
+
 // ─── SSE event wire types ─────────────────────────────────────────────────────
 
 // sseEvent is the union type for all SSE event shapes.
@@ -150,7 +157,7 @@ func (c *LLMServerClient) GenerateFaultTree(
 	onProgress func(stage string, pct int),
 ) (*FaultTreeResult, error) {
 	payload := llmFTRequest{
-		Documents: documents,
+		Documents: normalizeDocuments(documents),
 		TopEvent:  topEvent,
 		Config: llmFTConfig{
 			Quality:  cfg.Quality,
@@ -208,7 +215,7 @@ func (c *LLMServerClient) GenerateKnowledgeGraph(
 	onProgress func(stage string, pct int),
 ) (*KnowledgeGraphResult, error) {
 	payload := llmKGRequest{
-		Documents: documents,
+		Documents: normalizeDocuments(documents),
 		Config: llmKGConfig{
 			Quality: cfg.Quality,
 			Model:   cfg.Model,
