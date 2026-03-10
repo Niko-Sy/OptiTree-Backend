@@ -15,6 +15,8 @@ type Config struct {
 	Storage   StorageConfig   `mapstructure:"storage"`
 	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
 	AI        AIConfig        `mapstructure:"ai"`
+	OCR       OCRConfig       `mapstructure:"ocr"`
+	LLMServer LLMServerConfig `mapstructure:"llm_server"`
 }
 
 type AIConfig struct {
@@ -22,6 +24,19 @@ type AIConfig struct {
 	APIKey       string        `mapstructure:"api_key"`
 	DefaultModel string        `mapstructure:"default_model"`
 	Timeout      time.Duration `mapstructure:"timeout"`
+}
+
+// OCRConfig holds settings for the PaddleOCR layout-parsing service.
+type OCRConfig struct {
+	URL     string        `mapstructure:"url"`
+	Token   string        `mapstructure:"token"`
+	Timeout time.Duration `mapstructure:"timeout"`
+}
+
+// LLMServerConfig holds settings for the self-hosted FastAPI LLM generation service.
+type LLMServerConfig struct {
+	BaseURL string        `mapstructure:"base_url"`
+	Timeout time.Duration `mapstructure:"timeout"`
 }
 
 type ServerConfig struct {

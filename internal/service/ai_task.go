@@ -13,6 +13,7 @@ import (
 	"optitree-backend/internal/ai"
 	"optitree-backend/internal/constant"
 	"optitree-backend/internal/model"
+	"optitree-backend/internal/ocr"
 	"optitree-backend/internal/repository"
 	"optitree-backend/internal/util"
 
@@ -21,11 +22,13 @@ import (
 )
 
 type AITaskService struct {
-	taskRepo *repository.AITaskRepository
-	docRepo  *repository.DocumentRepository
-	storage  *StorageService
-	provider ai.AIProvider
-	rdb      *redis.Client
+	taskRepo     *repository.AITaskRepository
+	docRepo      *repository.DocumentRepository
+	storage      *StorageService
+	provider     ai.AIProvider       // used for Chat only
+	ocrClient    *ocr.Client         // PaddleOCR layout-parsing
+	llmSrvClient *ai.LLMServerClient // FastAPI LLM generation service
+	rdb          *redis.Client
 }
 
 func NewAITaskService(
@@ -33,14 +36,18 @@ func NewAITaskService(
 	docRepo *repository.DocumentRepository,
 	storage *StorageService,
 	provider ai.AIProvider,
+	ocrClient *ocr.Client,
+	llmSrvClient *ai.LLMServerClient,
 	rdb *redis.Client,
 ) *AITaskService {
 	return &AITaskService{
-		taskRepo: taskRepo,
-		docRepo:  docRepo,
-		storage:  storage,
-		provider: provider,
-		rdb:      rdb,
+		taskRepo:     taskRepo,
+		docRepo:      docRepo,
+		storage:      storage,
+		provider:     provider,
+		ocrClient:    ocrClient,
+		llmSrvClient: llmSrvClient,
+		rdb:          rdb,
 	}
 }
 
@@ -80,10 +87,19 @@ func (s *AITaskService) cacheStatus(ctx context.Context, id, status string, prog
 	_ = s.rdb.Expire(ctx, key, 24*time.Hour).Err()
 }
 
-// readDocumentContents resolves docIDs to text content for LLM consumption.
-// For binary formats (PDF, DOCX) a placeholder is included so the LLM is aware
-// documents exist even without full text extraction support.
-func (s *AITaskService) readDocumentContents(docIDs []string) []string {
+// extractDocumentTexts resolves docIDs to plain-text / Markdown content for LLM consumption.
+//
+// Extraction strategy:
+//   - txt → read directly from disk (up to 50 KB)
+//   - pdf / docx / doc / xlsx / xls → call PaddleOCR layout-parsing API
+//   - anything else → placeholder string so the LLM knows the document exists
+//
+// Each document's text is returned as a separate element in the slice.
+// Progress is reported via onProgress(docIndex, totalDocs) after each document.
+func (s *AITaskService) extractDocumentTexts(
+	docIDs []string,
+	onProgress func(done, total int),
+) []string {
 	if len(docIDs) == 0 {
 		return nil
 	}
@@ -91,23 +107,62 @@ func (s *AITaskService) readDocumentContents(docIDs []string) []string {
 	if err != nil || len(docs) == 0 {
 		return nil
 	}
-	contents := make([]string, 0, len(docs))
-	for _, doc := range docs {
+
+	total := len(docs)
+	contents := make([]string, 0, total)
+
+	for i, doc := range docs {
 		localPath := s.storage.LocalPath(doc.SourceURL)
 		if localPath == "" {
 			contents = append(contents, fmt.Sprintf("[Document: %s — storage path unavailable]", doc.FileName))
+			if onProgress != nil {
+				onProgress(i+1, total)
+			}
 			continue
 		}
-		if doc.FileType == "txt" {
+
+		switch {
+		case doc.FileType == "txt":
 			text, err := readTextFile(localPath, 50_000)
 			if err == nil {
 				contents = append(contents, text)
-				continue
+			} else {
+				log.Warn().Err(err).Str("docId", doc.ID).Msg("读取 txt 文档失败")
+				contents = append(contents, fmt.Sprintf("[Document: %s — read error]", doc.FileName))
 			}
+
+		case ocr.IsBinaryDoc(doc.FileType):
+			// PDF, DOCX, XLSX etc. — use PaddleOCR.
+			// PaddleOCR API only accepts fileType=0 (PDF) or fileType=1 (image).
+			// Non-PDF binary formats fall back to a placeholder until a dedicated
+			// extraction path (e.g. docx XML parser) is added (see project notes).
+			if doc.FileType != "pdf" {
+				contents = append(contents, fmt.Sprintf(
+					"[Document: %s (%s) — non-PDF binary; text extraction not yet supported]",
+					doc.FileName, doc.FileType))
+				break
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			markdown, err := s.ocrClient.ParseToMarkdown(ctx, localPath, ocr.FileTypePDF)
+			cancel()
+			if err != nil {
+				log.Warn().Err(err).Str("docId", doc.ID).Msg("OCR 解析失败，使用占位文本")
+				contents = append(contents, fmt.Sprintf(
+					"[Document: %s (pdf) — OCR failed: %s]", doc.FileName, err.Error()))
+			} else if markdown == "" {
+				contents = append(contents, fmt.Sprintf("[Document: %s (pdf) — OCR returned empty]", doc.FileName))
+			} else {
+				contents = append(contents, markdown)
+			}
+
+		default:
+			contents = append(contents, fmt.Sprintf(
+				"[Document: %s (%s) — unsupported format]", doc.FileName, doc.FileType))
 		}
-		// Binary formats: include a placeholder until a text-extraction pipeline is added.
-		contents = append(contents, fmt.Sprintf("[Document: %s (%s) — binary format, text extraction pending]",
-			doc.FileName, doc.FileType))
+
+		if onProgress != nil {
+			onProgress(i+1, total)
+		}
 	}
 	return contents
 }
@@ -161,22 +216,40 @@ func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFau
 
 func (s *AITaskService) runGenerateFaultTree(taskID string, input GenerateFaultTreeInput) {
 	bg := context.Background()
+
+	// ─ Stage 1: document parsing (10% → 40%) ───────────────────────────────
 	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 10, "parsing", "正在解析文档")
 	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 10, "parsing", "正在解析文档")
 
-	contents := s.readDocumentContents(input.DocIDs)
+	contents := s.extractDocumentTexts(input.DocIDs, func(done, total int) {
+		// Map per-document completion to 10-40% range.
+		pct := 10 + int(float64(done)/float64(total)*30)
+		label := fmt.Sprintf("正在解析文档 (%d/%d)", done, total)
+		// Only update Redis during this phase to avoid hammering the DB.
+		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, pct, "parsing", label)
+	})
 
+	// ─ Stage 2: LLM generation (40% → 90%) ──────────────────────────────
 	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
 	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
 
 	ctx, cancel := context.WithTimeout(bg, 5*time.Minute)
 	defer cancel()
 
-	result, err := s.provider.GenerateFaultTree(ctx, ai.GenerateFaultTreeRequest{
-		DocumentContents: contents,
-		TopEvent:         input.TopEvent,
-		Config:           input.Config,
-	})
+	// Forward SSE progress events from the LLM server to Redis (no DB write in this phase).
+	onProgress := func(stage string, pct int) {
+		// Clamp the LLM server's 0-100 pct to our 40-90% window.
+		mapped := 40 + int(float64(pct)*0.5)
+		if mapped > 90 {
+			mapped = 90
+		}
+		if mapped < 40 {
+			mapped = 40
+		}
+		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, mapped, stage, "AI 生成中")
+	}
+
+	result, err := s.llmSrvClient.GenerateFaultTree(ctx, contents, input.TopEvent, input.Config, onProgress)
 	if err != nil {
 		log.Error().Err(err).Str("taskId", taskID).Msg("AI 故障树生成失败")
 		_ = s.taskRepo.SetFailed(taskID, err.Error())
@@ -184,6 +257,8 @@ func (s *AITaskService) runGenerateFaultTree(taskID string, input GenerateFaultT
 		return
 	}
 
+	// ─ Stage 3: persist result (90% → 100%) ─────────────────────────────
+	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 90, "saving", "正在保存结果")
 	resultJSON, _ := json.Marshal(result)
 	if err := s.taskRepo.SetCompleted(taskID, resultJSON); err != nil {
 		log.Error().Err(err).Str("taskId", taskID).Msg("保存 AI 任务结果失败")
@@ -222,21 +297,36 @@ func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input Genera
 
 func (s *AITaskService) runGenerateKnowledgeGraph(taskID string, input GenerateKnowledgeGraphInput) {
 	bg := context.Background()
+
+	// ─ Stage 1: document parsing (10% → 40%) ───────────────────────────────
 	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 10, "parsing", "正在解析文档")
 	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 10, "parsing", "正在解析文档")
 
-	contents := s.readDocumentContents(input.DocIDs)
+	contents := s.extractDocumentTexts(input.DocIDs, func(done, total int) {
+		pct := 10 + int(float64(done)/float64(total)*30)
+		label := fmt.Sprintf("正在解析文档 (%d/%d)", done, total)
+		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, pct, "parsing", label)
+	})
 
+	// ─ Stage 2: LLM generation (40% → 90%) ──────────────────────────────
 	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
 	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
 
 	ctx, cancel := context.WithTimeout(bg, 5*time.Minute)
 	defer cancel()
 
-	result, err := s.provider.GenerateKnowledgeGraph(ctx, ai.GenerateKnowledgeGraphRequest{
-		DocumentContents: contents,
-		Config:           input.Config,
-	})
+	onProgress := func(stage string, pct int) {
+		mapped := 40 + int(float64(pct)*0.5)
+		if mapped > 90 {
+			mapped = 90
+		}
+		if mapped < 40 {
+			mapped = 40
+		}
+		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, mapped, stage, "AI 生成中")
+	}
+
+	result, err := s.llmSrvClient.GenerateKnowledgeGraph(ctx, contents, input.Config, onProgress)
 	if err != nil {
 		log.Error().Err(err).Str("taskId", taskID).Msg("AI 知识图谱生成失败")
 		_ = s.taskRepo.SetFailed(taskID, err.Error())
@@ -244,6 +334,8 @@ func (s *AITaskService) runGenerateKnowledgeGraph(taskID string, input GenerateK
 		return
 	}
 
+	// ─ Stage 3: persist result (90% → 100%) ─────────────────────────────
+	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 90, "saving", "正在保存结果")
 	resultJSON, _ := json.Marshal(result)
 	if err := s.taskRepo.SetCompleted(taskID, resultJSON); err != nil {
 		log.Error().Err(err).Str("taskId", taskID).Msg("保存 AI 任务结果失败")

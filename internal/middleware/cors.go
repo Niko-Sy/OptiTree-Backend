@@ -3,7 +3,6 @@ package middleware
 import (
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -12,20 +11,21 @@ import (
 // CORSLocalhost 仅允许来自 localhost 的跨域请求，用于本地开发联调。
 func CORSLocalhost() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		origin := c.GetHeader("Origin")
-		if origin == "" {
-			c.Next()
-			return
-		}
+		// origin := c.GetHeader("Origin")
+		// if origin == "" {
+		// 	c.Next()
+		// 	return
+		// }
 
-		parsed, err := url.Parse(origin)
-		if err != nil || !isLocalhost(parsed.Hostname()) {
-			c.Next()
-			return
-		}
+		// parsed, err := url.Parse(origin)
+		// if err != nil || !isLocalhost(parsed.Hostname()) {
+		// 	c.Next()
+		// 	return
+		// }
 
 		headers := c.Writer.Header()
-		headers.Set("Access-Control-Allow-Origin", origin)
+		// headers.Set("Access-Control-Allow-Origin", origin)
+		headers.Set("Access-Control-Allow-Origin", "*")
 		headers.Set("Access-Control-Allow-Credentials", "true")
 		headers.Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
 		headers.Set("Access-Control-Expose-Headers", "X-Request-Id")

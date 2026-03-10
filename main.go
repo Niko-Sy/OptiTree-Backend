@@ -21,6 +21,7 @@ import (
 	"optitree-backend/internal/config"
 	"optitree-backend/internal/handler"
 	"optitree-backend/internal/middleware"
+	"optitree-backend/internal/ocr"
 	"optitree-backend/internal/repository"
 	"optitree-backend/internal/service"
 	"optitree-backend/pkg/jwt"
@@ -97,13 +98,15 @@ func main() {
 		cfg.Storage.AllowedDocTypes,
 	)
 	aiClient := ai.NewClient(cfg.AI.Endpoint, cfg.AI.APIKey, cfg.AI.DefaultModel, cfg.AI.Timeout)
+	ocrClient := ocr.NewClient(cfg.OCR.URL, cfg.OCR.Token, cfg.OCR.Timeout)
+	llmSrvClient := ai.NewLLMServerClient(cfg.LLMServer.BaseURL, cfg.LLMServer.Timeout)
 	authSvc := service.NewAuthService(userRepo, authRepo, jwtManager, rdb)
 	userSvc := service.NewUserService(userRepo, storageSvc)
 	projectSvc := service.NewProjectService(db, projectRepo, memberRepo, graphRepo, versionRepo, docRepo)
 	ftSvc := service.NewFaultTreeService(db, projectRepo, graphRepo, rdb)
 	kgSvc := service.NewKnowledgeGraphService(db, projectRepo, graphRepo, rdb)
 	versionSvc := service.NewVersionService(versionRepo, projectRepo, graphRepo, ftSvc, kgSvc)
-	aiTaskSvc := service.NewAITaskService(aiTaskRepo, docRepo, storageSvc, aiClient, rdb)
+	aiTaskSvc := service.NewAITaskService(aiTaskRepo, docRepo, storageSvc, aiClient, ocrClient, llmSrvClient, rdb)
 	docSvc := service.NewDocumentService(docRepo, storageSvc)
 	memberSvc := service.NewMemberService(memberRepo, projectRepo, userRepo)
 	teamSvc := service.NewTeamService(db)
