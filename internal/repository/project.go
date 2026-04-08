@@ -1,32 +1,73 @@
 package repository
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"strings"
+	"time"
 
+	"optitree-backend/internal/constant"
 	"optitree-backend/internal/model"
 
+	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 )
 
 type ProjectRepository struct {
-	db *gorm.DB
+	db                       *gorm.DB
+	rdb                      *redis.Client
+	projectDetailCacheEnable bool
+	projectDetailTTL         time.Duration
 }
 
-func NewProjectRepository(db *gorm.DB) *ProjectRepository {
-	return &ProjectRepository{db: db}
+func NewProjectRepository(db *gorm.DB, rdb *redis.Client, projectDetailCacheEnable bool, projectDetailTTL time.Duration) *ProjectRepository {
+	if projectDetailTTL <= 0 {
+		projectDetailTTL = 30 * time.Minute
+	}
+	return &ProjectRepository{
+		db:                       db,
+		rdb:                      rdb,
+		projectDetailCacheEnable: projectDetailCacheEnable,
+		projectDetailTTL:         projectDetailTTL,
+	}
 }
 
 func (r *ProjectRepository) Create(project *model.Project) error {
-	return r.db.Create(project).Error
+	err := r.db.Create(project).Error
+	if err == nil {
+		r.cacheProjectDetail(context.Background(), project)
+	}
+	return err
 }
 
 func (r *ProjectRepository) FindByID(id string) (*model.Project, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, nil
+	}
+
+	cacheKey := r.projectDetailKey(id)
+	if r.canUseProjectDetailCache() {
+		if cached, err := r.rdb.Get(context.Background(), cacheKey).Bytes(); err == nil {
+			var project model.Project
+			if err := json.Unmarshal(cached, &project); err == nil {
+				return &project, nil
+			}
+		}
+	}
+
 	var project model.Project
-	err := r.db.Where("id = ?", id).First(&project).Error
+	err := r.db.Where("id = ?", id).Take(&project).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
-	return &project, err
+	if err != nil {
+		return nil, err
+	}
+
+	r.cacheProjectDetail(context.Background(), &project)
+	return &project, nil
 }
 
 type ProjectListParams struct {
@@ -43,13 +84,12 @@ func (r *ProjectRepository) List(params ProjectListParams) ([]model.Project, int
 	var projects []model.Project
 	var total int64
 
-	// 查询用户能访问的项目（自己创建 + 成员身份）
-	subQuery := r.db.Model(&model.ProjectMember{}).
-		Select("project_id").
-		Where("user_id = ? AND status = 'active'", params.UserID)
-
 	q := r.db.Model(&model.Project{}).
-		Where("created_by = ? OR id IN (?)", params.UserID, subQuery)
+		Where(
+			"created_by = ? OR EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = projects.id AND pm.user_id = ? AND pm.status = 'active')",
+			params.UserID,
+			params.UserID,
+		)
 
 	if params.Type != "" {
 		q = q.Where("type = ?", params.Type)
@@ -82,11 +122,19 @@ func (r *ProjectRepository) List(params ProjectListParams) ([]model.Project, int
 }
 
 func (r *ProjectRepository) Update(project *model.Project) error {
-	return r.db.Save(project).Error
+	err := r.db.Save(project).Error
+	if err == nil {
+		r.invalidateProjectDetailCache(context.Background(), project.ID)
+	}
+	return err
 }
 
 func (r *ProjectRepository) UpdateFields(id string, fields map[string]interface{}) error {
-	return r.db.Model(&model.Project{}).Where("id = ?", id).Updates(fields).Error
+	err := r.db.Model(&model.Project{}).Where("id = ?", id).Updates(fields).Error
+	if err == nil {
+		r.invalidateProjectDetailCache(context.Background(), id)
+	}
+	return err
 }
 
 // UpdateRevision 乐观锁 CAS 更新 revision，返回影响行数
@@ -94,6 +142,9 @@ func (r *ProjectRepository) UpdateRevision(id string, oldRev, newRev int) (int64
 	result := r.db.Model(&model.Project{}).
 		Where("id = ? AND graph_revision = ?", id, oldRev).
 		Update("graph_revision", newRev)
+	if result.Error == nil && result.RowsAffected > 0 {
+		r.invalidateProjectDetailCache(context.Background(), id)
+	}
 	return result.RowsAffected, result.Error
 }
 
@@ -116,42 +167,81 @@ func (r *ProjectRepository) UpdateGraphMetaCAS(
 			"entity_count":   entityCount,
 			"relation_count": relationCount,
 		})
+	if result.Error == nil && result.RowsAffected > 0 {
+		r.invalidateProjectDetailCache(context.Background(), id)
+	}
 	return result.RowsAffected, result.Error
 }
 
 // UpdateCounts 更新项目的统计计数
 func (r *ProjectRepository) UpdateCounts(id string, nodeCount, edgeCount, entityCount, relationCount int) error {
-	return r.db.Model(&model.Project{}).Where("id = ?", id).Updates(map[string]interface{}{
+	err := r.db.Model(&model.Project{}).Where("id = ?", id).Updates(map[string]interface{}{
 		"node_count":     nodeCount,
 		"edge_count":     edgeCount,
 		"entity_count":   entityCount,
 		"relation_count": relationCount,
 	}).Error
+	if err == nil {
+		r.invalidateProjectDetailCache(context.Background(), id)
+	}
+	return err
 }
 
 func (r *ProjectRepository) UpdateLatestVersion(id string, versionID *string) error {
-	return r.db.Model(&model.Project{}).Where("id = ?", id).
+	err := r.db.Model(&model.Project{}).Where("id = ?", id).
 		Update("latest_version_id", versionID).Error
+	if err == nil {
+		r.invalidateProjectDetailCache(context.Background(), id)
+	}
+	return err
 }
 
 func (r *ProjectRepository) UpdateGenerationStatus(id string, status *string) error {
-	return r.db.Model(&model.Project{}).Where("id = ?", id).
+	err := r.db.Model(&model.Project{}).Where("id = ?", id).
 		Update("generation_status", status).Error
+	if err == nil {
+		r.invalidateProjectDetailCache(context.Background(), id)
+	}
+	return err
 }
 
 func (r *ProjectRepository) Delete(tx *gorm.DB, id string) error {
 	if tx == nil {
 		tx = r.db
 	}
-	return tx.Where("id = ?", id).Delete(&model.Project{}).Error
+	err := tx.Where("id = ?", id).Delete(&model.Project{}).Error
+	if err == nil {
+		r.invalidateProjectDetailCache(context.Background(), id)
+	}
+	return err
+}
+
+func (r *ProjectRepository) canUseProjectDetailCache() bool {
+	return r.rdb != nil && r.projectDetailCacheEnable
+}
+
+func (r *ProjectRepository) projectDetailKey(id string) string {
+	return constant.RedisKeyProjectDetail + strings.TrimSpace(id)
+}
+
+func (r *ProjectRepository) cacheProjectDetail(ctx context.Context, project *model.Project) {
+	if !r.canUseProjectDetailCache() || project == nil || strings.TrimSpace(project.ID) == "" {
+		return
+	}
+	if data, err := json.Marshal(project); err == nil {
+		_ = r.rdb.Set(ctx, r.projectDetailKey(project.ID), data, r.projectDetailTTL).Err()
+	}
+}
+
+func (r *ProjectRepository) invalidateProjectDetailCache(ctx context.Context, id string) {
+	if !r.canUseProjectDetailCache() || strings.TrimSpace(id) == "" {
+		return
+	}
+	_ = r.rdb.Del(ctx, r.projectDetailKey(id)).Err()
 }
 
 // CountByUser 统计用户的项目数量，按类型分组
 func (r *ProjectRepository) CountByUser(userID string) (ftCount, kgCount int64, err error) {
-	subQuery := r.db.Model(&model.ProjectMember{}).
-		Select("project_id").
-		Where("user_id = ? AND status = 'active'", userID)
-
 	type TypeCount struct {
 		Type  string
 		Count int64
@@ -159,7 +249,11 @@ func (r *ProjectRepository) CountByUser(userID string) (ftCount, kgCount int64, 
 	var results []TypeCount
 	err = r.db.Model(&model.Project{}).
 		Select("type, count(*) as count").
-		Where("created_by = ? OR id IN (?)", userID, subQuery).
+		Where(
+			"created_by = ? OR EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = projects.id AND pm.user_id = ? AND pm.status = 'active')",
+			userID,
+			userID,
+		).
 		Group("type").
 		Scan(&results).Error
 	if err != nil {
@@ -177,10 +271,6 @@ func (r *ProjectRepository) CountByUser(userID string) (ftCount, kgCount int64, 
 
 // SumNodeCounts 统计用户项目的节点总数
 func (r *ProjectRepository) SumNodeCounts(userID string) (nodeSum, entitySum int64, err error) {
-	subQuery := r.db.Model(&model.ProjectMember{}).
-		Select("project_id").
-		Where("user_id = ? AND status = 'active'", userID)
-
 	type Sums struct {
 		NodeSum   int64
 		EntitySum int64
@@ -188,7 +278,11 @@ func (r *ProjectRepository) SumNodeCounts(userID string) (nodeSum, entitySum int
 	var result Sums
 	err = r.db.Model(&model.Project{}).
 		Select("COALESCE(SUM(node_count), 0) as node_sum, COALESCE(SUM(entity_count), 0) as entity_sum").
-		Where("created_by = ? OR id IN (?)", userID, subQuery).
+		Where(
+			"created_by = ? OR EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = projects.id AND pm.user_id = ? AND pm.status = 'active')",
+			userID,
+			userID,
+		).
 		Scan(&result).Error
 	nodeSum = result.NodeSum
 	entitySum = result.EntitySum

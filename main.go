@@ -91,7 +91,12 @@ func main() {
 
 	// ---- 仓储层 ----
 	userRepo := repository.NewUserRepository(db)
-	projectRepo := repository.NewProjectRepository(db)
+	projectRepo := repository.NewProjectRepository(
+		db,
+		rdb,
+		cfg.Cache.Enabled && cfg.Cache.ProjectDetailEnabled,
+		cfg.Cache.ProjectDetailTTL,
+	)
 	graphRepo := repository.NewGraphRepository(db)
 	versionRepo := repository.NewVersionRepository(db)
 	memberRepo := repository.NewMemberRepository(db)
@@ -113,12 +118,27 @@ func main() {
 	)
 	aiClient := ai.NewClient(cfg.AI.Endpoint, cfg.AI.APIKey, cfg.AI.DefaultModel, cfg.AI.ChatModel, cfg.AI.Timeout)
 	taskProgressHub := service.NewTaskProgressHub()
+	cachePolicy := service.CachePolicy{
+		Enabled:               cfg.Cache.Enabled,
+		ProjectDetailEnabled:  cfg.Cache.ProjectDetailEnabled,
+		ProjectListEnabled:    cfg.Cache.ProjectListEnabled,
+		VersionListEnabled:    cfg.Cache.VersionListEnabled,
+		FaultTreeGraphEnabled: cfg.Cache.FaultTreeGraphEnabled,
+		KnowledgeGraphEnabled: cfg.Cache.KnowledgeGraphEnabled,
+		ProjectDetailTTL:      cfg.Cache.ProjectDetailTTL,
+		ProjectListTTL:        cfg.Cache.ProjectListTTL,
+		ProjectListIndexTTL:   cfg.Cache.ProjectListIndexTTL,
+		VersionListTTL:        cfg.Cache.VersionListTTL,
+		VersionListIndexTTL:   cfg.Cache.VersionListIndexTTL,
+		FaultTreeGraphTTL:     cfg.Cache.FaultTreeGraphTTL,
+		KnowledgeGraphTTL:     cfg.Cache.KnowledgeGraphTTL,
+	}
 	authSvc := service.NewAuthService(userRepo, authRepo, jwtManager, rdb)
 	userSvc := service.NewUserService(userRepo, storageSvc)
-	projectSvc := service.NewProjectService(db, projectRepo, memberRepo, graphRepo, versionRepo, docRepo)
-	ftSvc := service.NewFaultTreeService(db, projectRepo, graphRepo, rdb)
-	kgSvc := service.NewKnowledgeGraphService(db, projectRepo, graphRepo, rdb)
-	versionSvc := service.NewVersionService(versionRepo, projectRepo, graphRepo, ftSvc, kgSvc)
+	projectSvc := service.NewProjectService(db, projectRepo, memberRepo, graphRepo, versionRepo, docRepo, rdb, cachePolicy)
+	ftSvc := service.NewFaultTreeService(db, projectRepo, graphRepo, rdb, cachePolicy)
+	kgSvc := service.NewKnowledgeGraphService(db, projectRepo, graphRepo, rdb, cachePolicy)
+	versionSvc := service.NewVersionService(versionRepo, projectRepo, graphRepo, ftSvc, kgSvc, rdb, cachePolicy)
 	aiTaskSvc := service.NewAITaskService(
 		aiTaskRepo,
 		docRepo,
@@ -157,7 +177,7 @@ func main() {
 		log.Fatal().Err(err).Msg("启动 AI 故障树调度器失败")
 	}
 	docSvc := service.NewDocumentService(docRepo, storageSvc)
-	memberSvc := service.NewMemberService(db, memberRepo, projectRepo, userRepo, notificationRepo, auditRepo)
+	memberSvc := service.NewMemberService(db, memberRepo, projectRepo, userRepo, notificationRepo, auditRepo, rdb, cachePolicy)
 	notificationSvc := service.NewNotificationService(notificationRepo)
 	teamSvc := service.NewTeamService(db)
 

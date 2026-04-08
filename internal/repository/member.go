@@ -38,13 +38,17 @@ func (r *MemberRepository) FindByProjectAndUser(projectID, userID string) (*mode
 }
 
 func (r *MemberRepository) FindByProjectAndUserWithTx(tx *gorm.DB, projectID, userID string) (*model.ProjectMember, error) {
-	var member model.ProjectMember
-	err := r.useTx(tx).Where("project_id = ? AND user_id = ? AND status = 'active'", projectID, userID).
-		First(&member).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
+	var members []model.ProjectMember
+	res := r.useTx(tx).Where("project_id = ? AND user_id = ? AND status = 'active'", projectID, userID).
+		Limit(1).
+		Find(&members)
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
 		return nil, nil
 	}
-	return &member, err
+	return &members[0], nil
 }
 
 func (r *MemberRepository) FindByProject(projectID string) ([]model.ProjectMember, error) {
@@ -104,6 +108,15 @@ func (r *MemberRepository) IncrMemberCountWithTx(tx *gorm.DB, projectID string, 
 		UpdateColumn("member_count", gorm.Expr("member_count + ?", delta)).Error
 }
 
+func (r *MemberRepository) ListActiveUserIDsByProject(projectID string) ([]string, error) {
+	var userIDs []string
+	err := r.db.Model(&model.ProjectMember{}).
+		Where("project_id = ? AND status = 'active'", projectID).
+		Distinct("user_id").
+		Pluck("user_id", &userIDs).Error
+	return userIDs, err
+}
+
 func (r *MemberRepository) CreateInvitation(tx *gorm.DB, invitation *model.Invitation) error {
 	return r.useTx(tx).Create(invitation).Error
 }
@@ -137,16 +150,19 @@ func (r *MemberRepository) FindPendingInvitationByProjectAndEmail(projectID, ema
 }
 
 func (r *MemberRepository) FindPendingInvitationByProjectAndEmailForUpdate(tx *gorm.DB, projectID, email string) (*model.Invitation, error) {
-	var invitation model.Invitation
+	var invitations []model.Invitation
 	db := r.useTx(tx).Where("project_id = ? AND email = ? AND status = ?", projectID, email, "pending")
 	if tx != nil {
 		db = db.Clauses(clause.Locking{Strength: "UPDATE"})
 	}
-	err := db.First(&invitation).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
+	res := db.Limit(1).Find(&invitations)
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
 		return nil, nil
 	}
-	return &invitation, err
+	return &invitations[0], nil
 }
 
 func (r *MemberRepository) ListInvitationsByProject(projectID, status string, page, pageSize int) ([]model.Invitation, int64, error) {

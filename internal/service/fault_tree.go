@@ -29,6 +29,7 @@ type FaultTreeService struct {
 	projectRepo *repository.ProjectRepository
 	graphRepo   *repository.GraphRepository
 	rdb         *redis.Client
+	cachePolicy CachePolicy
 	db          *gorm.DB
 }
 
@@ -37,12 +38,20 @@ func NewFaultTreeService(
 	projectRepo *repository.ProjectRepository,
 	graphRepo *repository.GraphRepository,
 	rdb *redis.Client,
+	cachePolicy CachePolicy,
 ) *FaultTreeService {
-	return &FaultTreeService{db: db, projectRepo: projectRepo, graphRepo: graphRepo, rdb: rdb}
+	cachePolicy = cachePolicy.normalize()
+	return &FaultTreeService{db: db, projectRepo: projectRepo, graphRepo: graphRepo, rdb: rdb, cachePolicy: cachePolicy}
 }
 
-func ftCacheKey(projectID string, revision int) string {
-	return fmt.Sprintf("%s%s:v%d", constant.RedisKeyGraphFT, projectID, revision)
+func ftCacheKey(projectID string) string {
+	return fmt.Sprintf("%s%s", constant.RedisKeyGraphFT, projectID)
+}
+
+type faultTreeCachePayload struct {
+	Revision int                   `json:"revision"`
+	Nodes    []model.FaultTreeNode `json:"nodes"`
+	Edges    []model.FaultTreeEdge `json:"edges"`
 }
 
 // GetGraph 获取故障树，先查缓存，未命中则查 DB
@@ -55,11 +64,13 @@ func (s *FaultTreeService) GetGraph(ctx context.Context, projectID string) (*Fau
 		return nil, 0, ErrProjectNotFound
 	}
 
-	cacheKey := ftCacheKey(projectID, project.GraphRevision)
-	if cached, err := s.rdb.Get(ctx, cacheKey).Bytes(); err == nil {
-		var graph FaultTreeGraph
-		if err := json.Unmarshal(cached, &graph); err == nil {
-			return &graph, project.GraphRevision, nil
+	cacheKey := ftCacheKey(projectID)
+	if s.rdb != nil && s.cachePolicy.Enabled && s.cachePolicy.FaultTreeGraphEnabled {
+		if cached, err := s.rdb.Get(ctx, cacheKey).Bytes(); err == nil {
+			var payload faultTreeCachePayload
+			if err := json.Unmarshal(cached, &payload); err == nil && payload.Revision == project.GraphRevision {
+				return &FaultTreeGraph{Nodes: payload.Nodes, Edges: payload.Edges}, project.GraphRevision, nil
+			}
 		}
 	}
 
@@ -70,8 +81,15 @@ func (s *FaultTreeService) GetGraph(ctx context.Context, projectID string) (*Fau
 	graph := &FaultTreeGraph{Nodes: nodes, Edges: edges}
 
 	// 回填缓存
-	if data, err := json.Marshal(graph); err == nil {
-		_ = s.rdb.Set(ctx, cacheKey, data, 5*time.Minute)
+	if s.rdb != nil && s.cachePolicy.Enabled && s.cachePolicy.FaultTreeGraphEnabled {
+		payload := faultTreeCachePayload{
+			Revision: project.GraphRevision,
+			Nodes:    graph.Nodes,
+			Edges:    graph.Edges,
+		}
+		if data, err := json.Marshal(payload); err == nil {
+			_ = s.rdb.Set(ctx, cacheKey, data, s.cachePolicy.FaultTreeGraphTTL).Err()
+		}
 	}
 
 	return graph, project.GraphRevision, nil
@@ -137,11 +155,8 @@ func (s *FaultTreeService) SaveGraph(ctx context.Context, projectID string, inpu
 		return nil, err
 	}
 
-	// 清除旧缓存
-	pattern := fmt.Sprintf("%s%s:v*", constant.RedisKeyGraphFT, projectID)
-	keys, _ := s.rdb.Keys(ctx, pattern).Result()
-	if len(keys) > 0 {
-		_ = s.rdb.Del(ctx, keys...).Err()
+	if s.rdb != nil && s.cachePolicy.Enabled && s.cachePolicy.FaultTreeGraphEnabled {
+		_ = s.rdb.Del(ctx, ftCacheKey(projectID)).Err()
 	}
 
 	return &result, nil

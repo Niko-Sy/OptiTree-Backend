@@ -11,6 +11,7 @@ type Config struct {
 	Server    ServerConfig    `mapstructure:"server"`
 	Database  DatabaseConfig  `mapstructure:"database"`
 	Redis     RedisConfig     `mapstructure:"redis"`
+	Cache     CacheConfig     `mapstructure:"cache"`
 	JWT       JWTConfig       `mapstructure:"jwt"`
 	Storage   StorageConfig   `mapstructure:"storage"`
 	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
@@ -83,6 +84,22 @@ type RedisConfig struct {
 	MaxRetries   int    `mapstructure:"max_retries"`
 	PoolSize     int    `mapstructure:"pool_size"`
 	MinIdleConns int    `mapstructure:"min_idle_conns"`
+}
+
+type CacheConfig struct {
+	Enabled               bool          `mapstructure:"enabled"`
+	ProjectDetailEnabled  bool          `mapstructure:"project_detail_enabled"`
+	ProjectListEnabled    bool          `mapstructure:"project_list_enabled"`
+	VersionListEnabled    bool          `mapstructure:"version_list_enabled"`
+	FaultTreeGraphEnabled bool          `mapstructure:"fault_tree_graph_enabled"`
+	KnowledgeGraphEnabled bool          `mapstructure:"knowledge_graph_enabled"`
+	ProjectDetailTTL      time.Duration `mapstructure:"project_detail_ttl"`
+	ProjectListTTL        time.Duration `mapstructure:"project_list_ttl"`
+	ProjectListIndexTTL   time.Duration `mapstructure:"project_list_index_ttl"`
+	VersionListTTL        time.Duration `mapstructure:"version_list_ttl"`
+	VersionListIndexTTL   time.Duration `mapstructure:"version_list_index_ttl"`
+	FaultTreeGraphTTL     time.Duration `mapstructure:"fault_tree_graph_ttl"`
+	KnowledgeGraphTTL     time.Duration `mapstructure:"knowledge_graph_ttl"`
 }
 
 type JWTConfig struct {

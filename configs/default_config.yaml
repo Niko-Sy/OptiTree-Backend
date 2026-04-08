@@ -23,6 +23,21 @@ redis:
   pool_size: 20
   min_idle_conns: 10
 
+cache:
+  enabled: true
+  project_detail_enabled: true
+  project_list_enabled: true
+  version_list_enabled: true
+  fault_tree_graph_enabled: true
+  knowledge_graph_enabled: true
+  project_detail_ttl: 30m
+  project_list_ttl: 2h
+  project_list_index_ttl: 130m
+  version_list_ttl: 30m
+  version_list_index_ttl: 40m
+  fault_tree_graph_ttl: 30m
+  knowledge_graph_ttl: 30m
+
 jwt:
   secret: "change-this-to-a-very-long-random-secret-key-in-production"
   access_expire: 2h

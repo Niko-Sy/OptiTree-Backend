@@ -11,6 +11,8 @@ import (
 	"optitree-backend/internal/model"
 	"optitree-backend/internal/repository"
 	"optitree-backend/internal/util"
+
+	"github.com/redis/go-redis/v9"
 )
 
 var ErrVersionNotFound = errors.New("版本不存在")
@@ -21,6 +23,8 @@ type VersionService struct {
 	graphRepo   *repository.GraphRepository
 	ftService   *FaultTreeService
 	kgService   *KnowledgeGraphService
+	rdb         *redis.Client
+	cachePolicy CachePolicy
 }
 
 func NewVersionService(
@@ -29,14 +33,24 @@ func NewVersionService(
 	graphRepo *repository.GraphRepository,
 	ftService *FaultTreeService,
 	kgService *KnowledgeGraphService,
+	rdb *redis.Client,
+	cachePolicy CachePolicy,
 ) *VersionService {
+	cachePolicy = cachePolicy.normalize()
 	return &VersionService{
 		versionRepo: versionRepo,
 		projectRepo: projectRepo,
 		graphRepo:   graphRepo,
 		ftService:   ftService,
 		kgService:   kgService,
+		rdb:         rdb,
+		cachePolicy: cachePolicy,
 	}
+}
+
+type versionListCachePayload struct {
+	List  []model.VersionSnapshot `json:"list"`
+	Total int64                   `json:"total"`
 }
 
 type CreateVersionInput struct {
@@ -86,11 +100,34 @@ func (s *VersionService) Create(ctx context.Context, input CreateVersionInput) (
 
 	// 更新项目最新版本ID
 	_ = s.projectRepo.UpdateLatestVersion(input.ProjectID, &version.ID)
+	s.invalidateVersionListCache(ctx, input.ProjectID)
 
 	return version, nil
 }
 
 func (s *VersionService) List(ctx context.Context, projectID string, page, pageSize int) ([]model.VersionSnapshot, int64, error) {
+	if s.canUseVersionListCache() {
+		cacheKey := buildVersionListCacheKey(projectID, page, pageSize)
+		if cached, err := s.rdb.Get(ctx, cacheKey).Bytes(); err == nil {
+			var payload versionListCachePayload
+			if err := json.Unmarshal(cached, &payload); err == nil {
+				return payload.List, payload.Total, nil
+			}
+		}
+
+		list, total, err := s.versionRepo.ListByProject(projectID, page, pageSize)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		payload := versionListCachePayload{List: list, Total: total}
+		if data, err := json.Marshal(payload); err == nil {
+			_ = s.rdb.Set(ctx, cacheKey, data, s.cachePolicy.VersionListTTL).Err()
+			addVersionListCacheIndex(ctx, s.rdb, projectID, cacheKey, s.cachePolicy.VersionListIndexTTL)
+		}
+		return list, total, nil
+	}
+
 	return s.versionRepo.ListByProject(projectID, page, pageSize)
 }
 
@@ -113,7 +150,11 @@ func (s *VersionService) Delete(ctx context.Context, projectID, versionID string
 	if v == nil || v.ProjectID != projectID {
 		return ErrVersionNotFound
 	}
-	return s.versionRepo.Delete(versionID)
+	if err := s.versionRepo.Delete(versionID); err != nil {
+		return err
+	}
+	s.invalidateVersionListCache(ctx, projectID)
+	return nil
 }
 
 type RollbackInput struct {
@@ -179,4 +220,15 @@ func (s *VersionService) Rollback(ctx context.Context, input RollbackInput) erro
 	}
 
 	return err
+}
+
+func (s *VersionService) canUseVersionListCache() bool {
+	return s.rdb != nil && s.cachePolicy.Enabled && s.cachePolicy.VersionListEnabled
+}
+
+func (s *VersionService) invalidateVersionListCache(ctx context.Context, projectID string) {
+	if !s.canUseVersionListCache() {
+		return
+	}
+	invalidateVersionListCacheByProject(ctx, s.rdb, projectID)
 }

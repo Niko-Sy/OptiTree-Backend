@@ -26,6 +26,7 @@ type KnowledgeGraphService struct {
 	projectRepo *repository.ProjectRepository
 	graphRepo   *repository.GraphRepository
 	rdb         *redis.Client
+	cachePolicy CachePolicy
 	db          *gorm.DB
 }
 
@@ -34,12 +35,20 @@ func NewKnowledgeGraphService(
 	projectRepo *repository.ProjectRepository,
 	graphRepo *repository.GraphRepository,
 	rdb *redis.Client,
+	cachePolicy CachePolicy,
 ) *KnowledgeGraphService {
-	return &KnowledgeGraphService{db: db, projectRepo: projectRepo, graphRepo: graphRepo, rdb: rdb}
+	cachePolicy = cachePolicy.normalize()
+	return &KnowledgeGraphService{db: db, projectRepo: projectRepo, graphRepo: graphRepo, rdb: rdb, cachePolicy: cachePolicy}
 }
 
-func kgCacheKey(projectID string, revision int) string {
-	return fmt.Sprintf("%s%s:v%d", constant.RedisKeyGraphKG, projectID, revision)
+func kgCacheKey(projectID string) string {
+	return fmt.Sprintf("%s%s", constant.RedisKeyGraphKG, projectID)
+}
+
+type knowledgeGraphCachePayload struct {
+	Revision int                        `json:"revision"`
+	Nodes    []model.KnowledgeGraphNode `json:"rfNodes"`
+	Edges    []model.KnowledgeGraphEdge `json:"rfEdges"`
 }
 
 func (s *KnowledgeGraphService) GetGraph(ctx context.Context, projectID string) (*KnowledgeGraphData, int, error) {
@@ -51,11 +60,13 @@ func (s *KnowledgeGraphService) GetGraph(ctx context.Context, projectID string) 
 		return nil, 0, ErrProjectNotFound
 	}
 
-	cacheKey := kgCacheKey(projectID, project.GraphRevision)
-	if cached, err := s.rdb.Get(ctx, cacheKey).Bytes(); err == nil {
-		var graph KnowledgeGraphData
-		if err := json.Unmarshal(cached, &graph); err == nil {
-			return &graph, project.GraphRevision, nil
+	cacheKey := kgCacheKey(projectID)
+	if s.rdb != nil && s.cachePolicy.Enabled && s.cachePolicy.KnowledgeGraphEnabled {
+		if cached, err := s.rdb.Get(ctx, cacheKey).Bytes(); err == nil {
+			var payload knowledgeGraphCachePayload
+			if err := json.Unmarshal(cached, &payload); err == nil && payload.Revision == project.GraphRevision {
+				return &KnowledgeGraphData{Nodes: payload.Nodes, Edges: payload.Edges}, project.GraphRevision, nil
+			}
 		}
 	}
 
@@ -65,8 +76,15 @@ func (s *KnowledgeGraphService) GetGraph(ctx context.Context, projectID string) 
 	}
 
 	graph := &KnowledgeGraphData{Nodes: nodes, Edges: edges}
-	if data, err := json.Marshal(graph); err == nil {
-		_ = s.rdb.Set(ctx, cacheKey, data, 5*time.Minute)
+	if s.rdb != nil && s.cachePolicy.Enabled && s.cachePolicy.KnowledgeGraphEnabled {
+		payload := knowledgeGraphCachePayload{
+			Revision: project.GraphRevision,
+			Nodes:    graph.Nodes,
+			Edges:    graph.Edges,
+		}
+		if data, err := json.Marshal(payload); err == nil {
+			_ = s.rdb.Set(ctx, cacheKey, data, s.cachePolicy.KnowledgeGraphTTL).Err()
+		}
 	}
 
 	return graph, project.GraphRevision, nil
@@ -233,10 +251,8 @@ func (s *KnowledgeGraphService) SaveGraph(ctx context.Context, projectID string,
 		return nil, err
 	}
 
-	pattern := fmt.Sprintf("%s%s:v*", constant.RedisKeyGraphKG, projectID)
-	keys, _ := s.rdb.Keys(ctx, pattern).Result()
-	if len(keys) > 0 {
-		_ = s.rdb.Del(ctx, keys...).Err()
+	if s.rdb != nil && s.cachePolicy.Enabled && s.cachePolicy.KnowledgeGraphEnabled {
+		_ = s.rdb.Del(ctx, kgCacheKey(projectID)).Err()
 	}
 
 	return &result, nil

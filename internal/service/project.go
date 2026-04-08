@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"optitree-backend/internal/constant"
 	"optitree-backend/internal/model"
@@ -11,6 +13,7 @@ import (
 	"optitree-backend/internal/util"
 
 	"github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 )
 
@@ -26,6 +29,8 @@ type ProjectService struct {
 	graphRepo   *repository.GraphRepository
 	versionRepo *repository.VersionRepository
 	docRepo     *repository.DocumentRepository
+	rdb         *redis.Client
+	cachePolicy CachePolicy
 	db          *gorm.DB
 }
 
@@ -36,7 +41,10 @@ func NewProjectService(
 	graphRepo *repository.GraphRepository,
 	versionRepo *repository.VersionRepository,
 	docRepo *repository.DocumentRepository,
+	rdb *redis.Client,
+	cachePolicy CachePolicy,
 ) *ProjectService {
+	cachePolicy = cachePolicy.normalize()
 	return &ProjectService{
 		db:          db,
 		projectRepo: projectRepo,
@@ -44,6 +52,8 @@ func NewProjectService(
 		graphRepo:   graphRepo,
 		versionRepo: versionRepo,
 		docRepo:     docRepo,
+		rdb:         rdb,
+		cachePolicy: cachePolicy,
 	}
 }
 
@@ -88,6 +98,8 @@ func (s *ProjectService) Create(ctx context.Context, userID string, input Create
 		return nil, err
 	}
 
+	s.invalidateProjectListCaches(ctx, []string{userID})
+
 	return project, nil
 }
 
@@ -112,8 +124,13 @@ type ListProjectsInput struct {
 	PageSize  int
 }
 
+type projectListCachePayload struct {
+	List  []model.Project `json:"list"`
+	Total int64           `json:"total"`
+}
+
 func (s *ProjectService) List(ctx context.Context, input ListProjectsInput) ([]model.Project, int64, error) {
-	return s.projectRepo.List(repository.ProjectListParams{
+	params := repository.ProjectListParams{
 		UserID:    input.UserID,
 		Type:      input.Type,
 		Keyword:   input.Keyword,
@@ -121,7 +138,31 @@ func (s *ProjectService) List(ctx context.Context, input ListProjectsInput) ([]m
 		SortOrder: input.SortOrder,
 		Page:      input.Page,
 		PageSize:  input.PageSize,
-	})
+	}
+
+	if s.canUseProjectListCache() {
+		cacheKey := buildProjectListCacheKey(params)
+		if cached, err := s.rdb.Get(ctx, cacheKey).Bytes(); err == nil {
+			var payload projectListCachePayload
+			if err := json.Unmarshal(cached, &payload); err == nil {
+				return payload.List, payload.Total, nil
+			}
+		}
+
+		projects, total, err := s.projectRepo.List(params)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		payload := projectListCachePayload{List: projects, Total: total}
+		if data, err := json.Marshal(payload); err == nil {
+			_ = s.rdb.Set(ctx, cacheKey, data, s.cachePolicy.ProjectListTTL).Err()
+			addProjectListCacheIndex(ctx, s.rdb, input.UserID, cacheKey, int64(s.cachePolicy.ProjectListIndexTTL/time.Second))
+		}
+		return projects, total, nil
+	}
+
+	return s.projectRepo.List(params)
 }
 
 type UpdateProjectInput struct {
@@ -150,6 +191,7 @@ func (s *ProjectService) Update(ctx context.Context, id string, input UpdateProj
 	if err := s.projectRepo.Update(project); err != nil {
 		return nil, err
 	}
+	s.invalidateProjectListCachesByProject(ctx, id)
 	return project, nil
 }
 
@@ -171,12 +213,15 @@ func (s *ProjectService) Rename(ctx context.Context, id string, input RenameProj
 	if err := s.projectRepo.Update(project); err != nil {
 		return nil, err
 	}
+	s.invalidateProjectListCachesByProject(ctx, id)
 	return project, nil
 }
 
 // Delete 事务删除项目及所有关联数据
 func (s *ProjectService) Delete(ctx context.Context, id string) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	usersToInvalidate, _ := s.memberRepo.ListActiveUserIDsByProject(id)
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := s.graphRepo.DeleteFaultTreeByProject(tx, id); err != nil {
 			return err
 		}
@@ -194,6 +239,34 @@ func (s *ProjectService) Delete(ctx context.Context, id string) error {
 		}
 		return s.projectRepo.Delete(tx, id)
 	})
+	if err != nil {
+		return err
+	}
+
+	s.invalidateProjectListCaches(ctx, usersToInvalidate)
+	return nil
+}
+
+func (s *ProjectService) canUseProjectListCache() bool {
+	return s.rdb != nil && s.cachePolicy.Enabled && s.cachePolicy.ProjectListEnabled
+}
+
+func (s *ProjectService) invalidateProjectListCaches(ctx context.Context, userIDs []string) {
+	if !s.canUseProjectListCache() || len(userIDs) == 0 {
+		return
+	}
+	invalidateProjectListCacheByUserIDs(ctx, s.rdb, userIDs)
+}
+
+func (s *ProjectService) invalidateProjectListCachesByProject(ctx context.Context, projectID string) {
+	if !s.canUseProjectListCache() {
+		return
+	}
+	userIDs, err := s.memberRepo.ListActiveUserIDsByProject(projectID)
+	if err != nil {
+		return
+	}
+	s.invalidateProjectListCaches(ctx, userIDs)
 }
 
 type DashboardSummary struct {

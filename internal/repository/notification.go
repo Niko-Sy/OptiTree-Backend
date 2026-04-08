@@ -2,6 +2,7 @@ package repository
 
 import (
 	"errors"
+	"strings"
 
 	"optitree-backend/internal/model"
 
@@ -104,5 +105,23 @@ func (r *AuditLogRepository) useTx(tx *gorm.DB) *gorm.DB {
 }
 
 func (r *AuditLogRepository) Create(tx *gorm.DB, log *model.AuditLog) error {
-	return r.useTx(tx).Create(log).Error
+	if log == nil {
+		return nil
+	}
+
+	if log.IPAddress != nil && strings.TrimSpace(*log.IPAddress) == "" {
+		log.IPAddress = nil
+	}
+	if log.UserAgent != nil && strings.TrimSpace(*log.UserAgent) == "" {
+		log.UserAgent = nil
+	}
+
+	db := r.useTx(tx)
+	if log.IPAddress == nil {
+		db = db.Omit("IPAddress")
+	}
+	if log.UserAgent == nil {
+		db = db.Omit("UserAgent")
+	}
+	return db.Create(log).Error
 }

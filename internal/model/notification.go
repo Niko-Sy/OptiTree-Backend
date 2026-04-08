@@ -31,8 +31,8 @@ type AuditLog struct {
 	ResourceType string    `gorm:"column:resource_type;size:40;not null" json:"resourceType"`
 	ResourceID   string    `gorm:"column:resource_id;size:32;not null" json:"resourceId"`
 	Summary      string    `gorm:"column:summary" json:"summary"`
-	IPAddress    string    `gorm:"column:ip_address;size:45" json:"ipAddress"`
-	UserAgent    string    `gorm:"column:user_agent;size:500" json:"userAgent"`
+	IPAddress    *string   `gorm:"column:ip_address;size:45" json:"ipAddress,omitempty"`
+	UserAgent    *string   `gorm:"column:user_agent;size:500" json:"userAgent,omitempty"`
 	ProjectID    *string   `gorm:"column:project_id;size:32;index" json:"projectId,omitempty"`
 	CreatedAt    time.Time `gorm:"column:created_at;not null;autoCreateTime" json:"createdAt"`
 }

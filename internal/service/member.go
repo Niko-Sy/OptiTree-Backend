@@ -13,6 +13,7 @@ import (
 	"optitree-backend/internal/repository"
 	"optitree-backend/internal/util"
 
+	"github.com/redis/go-redis/v9"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -37,6 +38,8 @@ type MemberService struct {
 	userRepo         *repository.UserRepository
 	notificationRepo *repository.NotificationRepository
 	auditRepo        *repository.AuditLogRepository
+	rdb              *redis.Client
+	cachePolicy      CachePolicy
 }
 
 func NewMemberService(
@@ -46,7 +49,10 @@ func NewMemberService(
 	userRepo *repository.UserRepository,
 	notificationRepo *repository.NotificationRepository,
 	auditRepo *repository.AuditLogRepository,
+	rdb *redis.Client,
+	cachePolicy CachePolicy,
 ) *MemberService {
+	cachePolicy = cachePolicy.normalize()
 	return &MemberService{
 		db:               db,
 		memberRepo:       memberRepo,
@@ -54,6 +60,8 @@ func NewMemberService(
 		userRepo:         userRepo,
 		notificationRepo: notificationRepo,
 		auditRepo:        auditRepo,
+		rdb:              rdb,
+		cachePolicy:      cachePolicy,
 	}
 }
 
@@ -376,6 +384,8 @@ func (s *MemberService) AcceptInvitation(ctx context.Context, projectID, invitat
 		return nil, err
 	}
 
+	s.invalidateProjectListCacheByProject(ctx, projectID)
+
 	return member, nil
 }
 
@@ -546,6 +556,17 @@ func (s *MemberService) RevokeInvitation(ctx context.Context, projectID, invitat
 	return nil
 }
 
+func (s *MemberService) invalidateProjectListCacheByProject(ctx context.Context, projectID string) {
+	if s.rdb == nil || !s.cachePolicy.Enabled || !s.cachePolicy.ProjectListEnabled {
+		return
+	}
+	userIDs, err := s.memberRepo.ListActiveUserIDsByProject(projectID)
+	if err != nil {
+		return
+	}
+	invalidateProjectListCacheByUserIDs(ctx, s.rdb, userIDs)
+}
+
 func (s *MemberService) UpdateRole(ctx context.Context, projectID, memberID, newRole, operatorID string) (*model.ProjectMember, error) {
 	if !isValidRole(newRole) {
 		return nil, ErrInvalidRole
@@ -698,6 +719,14 @@ func (s *MemberService) RemoveMember(ctx context.Context, projectID, memberID, o
 			Summary:      fmt.Sprintf("移除成员 %s", targetUserID),
 			ProjectID:    &projectIDVal,
 		})
+	}
+
+	if s.rdb != nil && s.cachePolicy.Enabled && s.cachePolicy.ProjectListEnabled {
+		activeUserIDs, err := s.memberRepo.ListActiveUserIDsByProject(projectID)
+		if err == nil {
+			activeUserIDs = append(activeUserIDs, targetUserID)
+			invalidateProjectListCacheByUserIDs(ctx, s.rdb, activeUserIDs)
+		}
 	}
 
 	return nil
