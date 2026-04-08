@@ -2189,10 +2189,10 @@ components:
           type: string
         type:
           type: string
-          enum: [generateFaultTree, generateKnowledgeGraph, parseDocument, validateGraph]
+          enum: [generateFaultTree, generateKnowledgeGraph]
         status:
           type: string
-          enum: [pending, parsing, generating, completed, failed, cancelled]
+          enum: [pending, processing, retrying, completed, failed, dead]
         progress:
           type: integer
         stage:

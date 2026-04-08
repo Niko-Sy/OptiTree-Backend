@@ -29,14 +29,29 @@ jwt:
   refresh_expire: 168h      # 7 days
   refresh_expire_long: 720h # 30 days (remember me)
 
-ocr:
-  url: "https://v0ab68sfjbcf9ale.aistudio-app.com/layout-parsing"
-  token: ""
-  timeout: 300s
+ai_task:
+  stream: "stream:ai:tasks"
+  stream_max_len: 10000
+  callback_header: "X-Internal-Token"
+  callback_token: "change-me"
+  producer_stream: "stream:ai:tasks:producer"
+  producer_group: "ai-ft-producer"
+  producer_read_count: 10
+  producer_block_ms: 3000
+  dispatcher_workers: 5
+  producer_delayed_zset: "zset:ai:tasks:producer:delayed"
+  producer_retry_delay_ms: 2000
+  project_lock_ttl: 20m
+  callback_dedupe_ttl: 24h
+  snapshot_ttl: 24h
 
 llm_server:
   base_url: "http://localhost:8001"
   timeout: 300s
+
+log:
+  enabled: true
+  dir: "./logs"   # daily log files: logs/app-YYYY-MM-DD.log
 
 storage:
   local_path: "./storage"

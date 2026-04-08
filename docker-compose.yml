@@ -74,6 +74,55 @@ services:
       OPTITREE_STORAGE_LOCAL_PATH:        ./storage
       OPTITREE_STORAGE_BASE_URL:          ${STORAGE_BASE_URL:-http://localhost:8080/static}
       OPTITREE_STORAGE_MAX_FILE_SIZE:     52428800
+      # ── AI Task Stream ──
+      OPTITREE_AI_TASK_STREAM:            ${AI_TASK_STREAM:-stream:ai:tasks}
+      OPTITREE_AI_TASK_STREAM_MAX_LEN:    ${AI_TASK_STREAM_MAX_LEN:-10000}
+      OPTITREE_AI_TASK_CALLBACK_HEADER:   ${AI_TASK_CALLBACK_HEADER:-X-Internal-Token}
+      OPTITREE_AI_TASK_CALLBACK_TOKEN:    ${AI_TASK_CALLBACK_TOKEN:-change-this-token}
+      TZ: Asia/Shanghai
+    networks:
+      - optitree-net
+
+  # ── Python Worker (Redis Stream Consumer) ────────────────────────────────
+  python-worker:
+    image: python:3.11-slim
+    container_name: optitree-python-worker
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_started
+    working_dir: /worker
+    command: >
+      sh -c "pip install --no-cache-dir -r requirements-worker.txt &&
+      python worker.py"
+    volumes:
+      - ./tools/server:/worker
+      - storage_data:/app/storage
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:-optitree_redis}@redis:6379/0
+      AI_TASK_STREAM: ${AI_TASK_STREAM:-stream:ai:tasks}
+      AI_TASK_GROUP: ${AI_TASK_GROUP:-ai-workers}
+      AI_TASK_CONSUMER: ${AI_TASK_CONSUMER:-worker-1}
+      AI_TASK_READ_COUNT: ${AI_TASK_READ_COUNT:-1}
+      AI_TASK_BLOCK_MS: ${AI_TASK_BLOCK_MS:-5000}
+      AI_TASK_MAX_RETRIES: ${AI_TASK_MAX_RETRIES:-3}
+      AI_TASK_DLQ_STREAM: ${AI_TASK_DLQ_STREAM:-stream:ai:tasks:dlq}
+      AI_TASK_DELAYED_ZSET: ${AI_TASK_DELAYED_ZSET:-zset:ai:tasks:delayed}
+      AI_TASK_RETRY_BACKOFF_BASE_MS: ${AI_TASK_RETRY_BACKOFF_BASE_MS:-2000}
+      AI_TASK_RETRY_BACKOFF_MAX_MS: ${AI_TASK_RETRY_BACKOFF_MAX_MS:-60000}
+      AI_TASK_RECLAIM_IDLE_MS: ${AI_TASK_RECLAIM_IDLE_MS:-60000}
+      AI_TASK_RECLAIM_BATCH: ${AI_TASK_RECLAIM_BATCH:-20}
+      AI_TASK_RELEASE_BATCH: ${AI_TASK_RELEASE_BATCH:-20}
+      GO_CALLBACK_URL: http://app:8080/internal/ai/tasks/callback
+      AI_TASK_CALLBACK_HEADER: ${AI_TASK_CALLBACK_HEADER:-X-Internal-Token}
+      AI_TASK_CALLBACK_TOKEN: ${AI_TASK_CALLBACK_TOKEN:-change-this-token}
+      STORAGE_BASE_URL: ${STORAGE_BASE_URL:-http://localhost:8080/static}
+      STORAGE_LOCAL_PATH: /app/storage
+      LLM_SERVER_URL: ${LLM_SERVER_URL:-http://host.docker.internal:8001}
+      OCR_URL: ${OCR_URL:-}
+      OCR_TOKEN: ${OCR_TOKEN:-}
       TZ: Asia/Shanghai
     networks:
       - optitree-net

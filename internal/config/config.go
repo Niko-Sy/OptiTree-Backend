@@ -15,8 +15,17 @@ type Config struct {
 	Storage   StorageConfig   `mapstructure:"storage"`
 	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
 	AI        AIConfig        `mapstructure:"ai"`
-	OCR       OCRConfig       `mapstructure:"ocr"`
+	AITask    AITaskConfig    `mapstructure:"ai_task"`
 	LLMServer LLMServerConfig `mapstructure:"llm_server"`
+	Log       LogConfig       `mapstructure:"log"`
+}
+
+// LogConfig controls file-based log output.
+type LogConfig struct {
+	// Dir is the directory where daily log files are stored (e.g. "./logs").
+	// File names follow the pattern app-YYYY-MM-DD.log.
+	Dir     string `mapstructure:"dir"`
+	Enabled bool   `mapstructure:"enabled"`
 }
 
 type AIConfig struct {
@@ -29,11 +38,23 @@ type AIConfig struct {
 	Timeout   time.Duration `mapstructure:"timeout"`
 }
 
-// OCRConfig holds settings for the PaddleOCR layout-parsing service.
-type OCRConfig struct {
-	URL     string        `mapstructure:"url"`
-	Token   string        `mapstructure:"token"`
-	Timeout time.Duration `mapstructure:"timeout"`
+// AITaskConfig holds queue and callback settings for async AI generation tasks.
+type AITaskConfig struct {
+	Stream         string `mapstructure:"stream"`
+	StreamMaxLen   int64  `mapstructure:"stream_max_len"`
+	CallbackHeader string `mapstructure:"callback_header"`
+	CallbackToken  string `mapstructure:"callback_token"`
+
+	ProducerStream      string        `mapstructure:"producer_stream"`
+	ProducerGroup       string        `mapstructure:"producer_group"`
+	ProducerReadCount   int64         `mapstructure:"producer_read_count"`
+	ProducerBlockMs     int64         `mapstructure:"producer_block_ms"`
+	DispatcherWorkers   int           `mapstructure:"dispatcher_workers"`
+	ProducerDelayedZSet string        `mapstructure:"producer_delayed_zset"`
+	ProducerRetryDelay  int64         `mapstructure:"producer_retry_delay_ms"`
+	ProjectLockTTL      time.Duration `mapstructure:"project_lock_ttl"`
+	CallbackDedupeTTL   time.Duration `mapstructure:"callback_dedupe_ttl"`
+	SnapshotTTL         time.Duration `mapstructure:"snapshot_ttl"`
 }
 
 // LLMServerConfig holds settings for the self-hosted FastAPI LLM generation service.

@@ -20,6 +20,8 @@ type GenerateConfig struct {
 	Model    string // model override; empty = use client default
 	Depth    int
 	MaxNodes int
+	// EntityTypes is used by knowledge-graph generation.
+	EntityTypes []string
 }
 
 // GenerateFaultTreeRequest is the input to GenerateFaultTree.

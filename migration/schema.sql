@@ -430,14 +430,12 @@ CREATE TABLE IF NOT EXISTS ai_tasks (
     type          VARCHAR(40)  NOT NULL
                                CHECK (type IN (
                                    'generateFaultTree',
-                                   'generateKnowledgeGraph',
-                                   'parseDocument',
-                                   'validateGraph'
+                                   'generateKnowledgeGraph'
                                )),
     status        VARCHAR(20)  NOT NULL DEFAULT 'pending'
                                CHECK (status IN (
-                                   'pending', 'parsing', 'generating',
-                                   'completed', 'failed', 'cancelled'
+                                   'pending', 'processing', 'retrying',
+                                   'completed', 'failed', 'dead'
                                )),
     -- 进度百分比 [0, 100]
     progress      INT          NOT NULL DEFAULT 0
@@ -450,8 +448,15 @@ CREATE TABLE IF NOT EXISTS ai_tasks (
     result_json   JSONB,
     -- 失败时的错误信息
     error_message TEXT,
+    attempt_count INT          NOT NULL DEFAULT 0,
+    max_attempts  INT          NOT NULL DEFAULT 3,
+    worker_id     VARCHAR(64),
+    queued_at     TIMESTAMPTZ,
+    started_at    TIMESTAMPTZ,
+    completed_at  TIMESTAMPTZ,
+    idempotency_key VARCHAR(64),
     created_by    VARCHAR(32)  NOT NULL,
-    -- 关联的项目（可为空，如纯文档解析任务）
+    -- 关联的项目
     project_id    VARCHAR(32),
     -- 使用的 AI 模型（如 "qwen-plus"）
     model         VARCHAR(50),
@@ -467,11 +472,18 @@ CREATE TABLE IF NOT EXISTS ai_tasks (
 
 COMMENT ON TABLE  ai_tasks             IS 'AI 异步任务表';
 COMMENT ON COLUMN ai_tasks.id          IS '任务ID，格式：task_{timestamp}_{随机}';
-COMMENT ON COLUMN ai_tasks.type        IS '任务类型：generateFaultTree / generateKnowledgeGraph / parseDocument / validateGraph';
-COMMENT ON COLUMN ai_tasks.status      IS '任务状态：pending / parsing / generating / completed / failed / cancelled';
+COMMENT ON COLUMN ai_tasks.type        IS '任务类型：generateFaultTree / generateKnowledgeGraph';
+COMMENT ON COLUMN ai_tasks.status      IS '任务状态：pending / processing / retrying / completed / failed / dead';
 COMMENT ON COLUMN ai_tasks.progress    IS '进度 [0,100]';
 COMMENT ON COLUMN ai_tasks.result_json IS '任务成功后的结果数据（JSONB）';
 COMMENT ON COLUMN ai_tasks.model       IS '使用的 AI 模型名称';
+COMMENT ON COLUMN ai_tasks.attempt_count IS '当前已尝试次数';
+COMMENT ON COLUMN ai_tasks.max_attempts  IS '最大重试次数';
+COMMENT ON COLUMN ai_tasks.worker_id     IS '当前或最后执行该任务的 Worker 标识';
+COMMENT ON COLUMN ai_tasks.queued_at     IS '入队时间';
+COMMENT ON COLUMN ai_tasks.started_at    IS '首次开始处理时间';
+COMMENT ON COLUMN ai_tasks.completed_at  IS '完成或最终失败时间';
+COMMENT ON COLUMN ai_tasks.idempotency_key IS '任务幂等键';
 
 
 -- ─── AI 对话会话表 ────────────────────────────────────────────

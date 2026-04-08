@@ -1,19 +1,20 @@
 package service
 
 import (
-	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
-	"os"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"optitree-backend/internal/ai"
 	"optitree-backend/internal/constant"
 	"optitree-backend/internal/model"
-	"optitree-backend/internal/ocr"
 	"optitree-backend/internal/repository"
 	"optitree-backend/internal/util"
 
@@ -21,20 +22,83 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+var (
+	ErrAITaskNoDocuments             = errors.New("没有可用文档")
+	ErrAITaskCallbackTaskNotFound    = errors.New("任务不存在")
+	ErrAITaskCallbackInvalidStatus   = errors.New("任务状态非法")
+	ErrAITaskCallbackProjectMismatch = errors.New("回调 projectId 与任务不一致")
+)
+
 type AITaskService struct {
 	taskRepo       *repository.AITaskRepository
 	docRepo        *repository.DocumentRepository
 	projectRepo    *repository.ProjectRepository
 	memberRepo     *repository.MemberRepository
-	storage        *StorageService
 	projectService *ProjectService
 	ftService      *FaultTreeService
 	kgService      *KnowledgeGraphService
-	provider       ai.AIProvider       // used for Chat only
-	ocrClient      *ocr.Client         // PaddleOCR layout-parsing
-	llmSrvClient   *ai.LLMServerClient // FastAPI LLM generation service
+	provider       ai.AIProvider // used for Chat only
 	progressHub    *TaskProgressHub
 	rdb            *redis.Client
+
+	queueStream    string
+	queueMaxLen    int64
+	callbackHeader string
+	callbackToken  string
+
+	producerStream      string
+	producerGroup       string
+	producerReadCount   int64
+	producerBlockMS     int64
+	producerDelayedZSet string
+	producerRetryDelay  int64
+	dispatcherWorkers   int
+	projectLockTTL      time.Duration
+	callbackDedupeTTL   time.Duration
+	snapshotTTL         time.Duration
+
+	dispatcherMu      sync.Mutex
+	dispatcherCtx     context.Context
+	dispatcherCancel  context.CancelFunc
+	dispatcherWG      sync.WaitGroup
+	dispatcherStarted bool
+}
+
+type AITaskQueueDocument struct {
+	ID        string `json:"id"`
+	FileName  string `json:"fileName"`
+	FileType  string `json:"fileType"`
+	SourceURL string `json:"sourceUrl"`
+}
+
+type AITaskQueueMessage struct {
+	TaskID    string                `json:"taskId"`
+	ProjectID string                `json:"projectId"`
+	TaskType  string                `json:"taskType"`
+	UserID    string                `json:"userId"`
+	TopEvent  string                `json:"topEvent,omitempty"`
+	DocIDs    []string              `json:"docIds"`
+	Documents []AITaskQueueDocument `json:"documents"`
+	Config    ai.GenerateConfig     `json:"config"`
+	Attempt   int                   `json:"attempt"`
+	TraceID   string                `json:"traceId,omitempty"`
+	CreatedAt string                `json:"createdAt"`
+}
+
+type TaskCallbackInput struct {
+	TaskID       string                 `json:"taskId"`
+	ProjectID    string                 `json:"projectId,omitempty"`
+	TraceID      string                 `json:"traceId,omitempty"`
+	EventKey     string                 `json:"eventKey,omitempty"`
+	EventVersion int                    `json:"eventVersion,omitempty"`
+	Status       string                 `json:"status"`
+	Progress     int                    `json:"progress"`
+	Stage        string                 `json:"stage,omitempty"`
+	StageLabel   string                 `json:"stageLabel,omitempty"`
+	ErrorMessage string                 `json:"errorMessage,omitempty"`
+	Result       map[string]interface{} `json:"result,omitempty"`
+	WorkerID     string                 `json:"workerId,omitempty"`
+	Attempt      int                    `json:"attempt,omitempty"`
 }
 
 func NewAITaskService(
@@ -42,31 +106,105 @@ func NewAITaskService(
 	docRepo *repository.DocumentRepository,
 	projectRepo *repository.ProjectRepository,
 	memberRepo *repository.MemberRepository,
-	storage *StorageService,
 	projectService *ProjectService,
 	ftService *FaultTreeService,
 	kgService *KnowledgeGraphService,
 	provider ai.AIProvider,
-	ocrClient *ocr.Client,
-	llmSrvClient *ai.LLMServerClient,
 	progressHub *TaskProgressHub,
 	rdb *redis.Client,
+	queueStream string,
+	queueMaxLen int64,
+	callbackHeader string,
+	callbackToken string,
+	producerStream string,
+	producerGroup string,
+	producerReadCount int64,
+	producerBlockMS int64,
+	dispatcherWorkers int,
+	producerDelayedZSet string,
+	producerRetryDelay int64,
+	projectLockTTL time.Duration,
+	callbackDedupeTTL time.Duration,
+	snapshotTTL time.Duration,
 ) *AITaskService {
-	return &AITaskService{
-		taskRepo:       taskRepo,
-		docRepo:        docRepo,
-		projectRepo:    projectRepo,
-		memberRepo:     memberRepo,
-		storage:        storage,
-		projectService: projectService,
-		ftService:      ftService,
-		kgService:      kgService,
-		provider:       provider,
-		ocrClient:      ocrClient,
-		llmSrvClient:   llmSrvClient,
-		progressHub:    progressHub,
-		rdb:            rdb,
+	if strings.TrimSpace(queueStream) == "" {
+		queueStream = "stream:ai:tasks"
 	}
+	if queueMaxLen <= 0 {
+		queueMaxLen = 10000
+	}
+	if strings.TrimSpace(callbackHeader) == "" {
+		callbackHeader = "X-Internal-Token"
+	}
+	if strings.TrimSpace(producerStream) == "" {
+		producerStream = queueStream + ":producer"
+	}
+	if strings.TrimSpace(producerGroup) == "" {
+		producerGroup = "ai-ft-producer"
+	}
+	if producerReadCount <= 0 {
+		producerReadCount = 10
+	}
+	if producerBlockMS <= 0 {
+		producerBlockMS = 3000
+	}
+	if dispatcherWorkers <= 0 {
+		dispatcherWorkers = 5
+	}
+	if strings.TrimSpace(producerDelayedZSet) == "" {
+		producerDelayedZSet = "zset:ai:tasks:producer:delayed"
+	}
+	if producerRetryDelay <= 0 {
+		producerRetryDelay = 2000
+	}
+	if projectLockTTL <= 0 {
+		projectLockTTL = 20 * time.Minute
+	}
+	if callbackDedupeTTL <= 0 {
+		callbackDedupeTTL = 24 * time.Hour
+	}
+	if snapshotTTL <= 0 {
+		snapshotTTL = 24 * time.Hour
+	}
+	return &AITaskService{
+		taskRepo:            taskRepo,
+		docRepo:             docRepo,
+		projectRepo:         projectRepo,
+		memberRepo:          memberRepo,
+		projectService:      projectService,
+		ftService:           ftService,
+		kgService:           kgService,
+		provider:            provider,
+		progressHub:         progressHub,
+		rdb:                 rdb,
+		queueStream:         strings.TrimSpace(queueStream),
+		queueMaxLen:         queueMaxLen,
+		callbackHeader:      strings.TrimSpace(callbackHeader),
+		callbackToken:       strings.TrimSpace(callbackToken),
+		producerStream:      strings.TrimSpace(producerStream),
+		producerGroup:       strings.TrimSpace(producerGroup),
+		producerReadCount:   producerReadCount,
+		producerBlockMS:     producerBlockMS,
+		producerDelayedZSet: strings.TrimSpace(producerDelayedZSet),
+		producerRetryDelay:  producerRetryDelay,
+		dispatcherWorkers:   dispatcherWorkers,
+		projectLockTTL:      projectLockTTL,
+		callbackDedupeTTL:   callbackDedupeTTL,
+		snapshotTTL:         snapshotTTL,
+	}
+}
+
+func (s *AITaskService) CallbackHeader() string {
+	return s.callbackHeader
+}
+
+func (s *AITaskService) AuthorizeCallback(token string) bool {
+	if strings.TrimSpace(s.callbackToken) == "" {
+		return false
+	}
+	provided := strings.TrimSpace(token)
+	expected := strings.TrimSpace(s.callbackToken)
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
 }
 
 // GetTask returns the current state of an AI task.
@@ -74,24 +212,51 @@ func (s *AITaskService) GetTask(ctx context.Context, taskID string) (*model.AITa
 	return s.taskRepo.FindByID(taskID)
 }
 
-// createTask inserts a new pending task record and caches its initial state in Redis.
-func (s *AITaskService) createTask(ctx context.Context, taskType, modelName, userID string, projectID *string) (*model.AITask, error) {
-	task := &model.AITask{
-		ID:         util.NewAITaskID(),
-		Type:       taskType,
-		Status:     constant.AITaskStatusPending,
-		Progress:   0,
-		Stage:      "pending",
-		StageLabel: "任务已提交，等待处理",
-		Model:      modelName,
-		CreatedBy:  userID,
-		ProjectID:  projectID,
+func (s *AITaskService) GetLatestFaultTreeTaskByProject(ctx context.Context, projectID, userID string) (*model.AITask, error) {
+	projectID = strings.TrimSpace(projectID)
+	userID = strings.TrimSpace(userID)
+	if projectID == "" {
+		return nil, ErrProjectNotFound
 	}
-	if err := s.taskRepo.Create(task); err != nil {
+
+	project, err := s.projectRepo.FindByID(projectID)
+	if err != nil {
 		return nil, err
 	}
-	s.cacheStatus(ctx, task.ID, task.Status, task.Progress, task.Stage, task.StageLabel)
-	return task, nil
+	if project == nil {
+		return nil, ErrProjectNotFound
+	}
+	if project.Type != constant.ProjectTypeFT {
+		return nil, ErrProjectTypeMismatch
+	}
+
+	member, err := s.memberRepo.FindByProjectAndUser(projectID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if member == nil {
+		return nil, ErrProjectPermissionDenied
+	}
+
+	if s.rdb != nil {
+		if snapshotText, snapshotErr := s.rdb.Get(ctx, constant.RedisKeyAITaskLatest+projectID).Result(); snapshotErr == nil && strings.TrimSpace(snapshotText) != "" {
+			var snapshot TaskProgressEvent
+			if jsonErr := json.Unmarshal([]byte(snapshotText), &snapshot); jsonErr == nil {
+				snapshotTaskID := strings.TrimSpace(snapshot.TaskID)
+				if snapshotTaskID != "" {
+					task, findErr := s.taskRepo.FindByID(snapshotTaskID)
+					if findErr != nil {
+						return nil, findErr
+					}
+					if task != nil && task.ProjectID != nil && strings.TrimSpace(*task.ProjectID) == projectID && task.Type == constant.AITaskTypeGenerateFaultTree {
+						return task, nil
+					}
+				}
+			}
+		}
+	}
+
+	return s.taskRepo.FindLatestByProjectAndType(projectID, constant.AITaskTypeGenerateFaultTree)
 }
 
 func (s *AITaskService) cacheStatus(ctx context.Context, id, status string, progress int, stage, stageLabel string) {
@@ -105,109 +270,157 @@ func (s *AITaskService) cacheStatus(ctx context.Context, id, status string, prog
 	_ = s.rdb.Expire(ctx, key, 24*time.Hour).Err()
 }
 
-// extractDocumentTexts resolves docIDs to plain-text / Markdown content for LLM consumption.
-//
-// Extraction strategy:
-//   - txt → read directly from disk (up to 50 KB)
-//   - pdf / docx / doc / xlsx / xls → call PaddleOCR layout-parsing API
-//   - anything else → placeholder string so the LLM knows the document exists
-//
-// Each document's text is returned as a separate element in the slice.
-// Progress is reported via onProgress(docIndex, totalDocs) after each document.
-func (s *AITaskService) extractDocumentTexts(
-	docIDs []string,
-	onProgress func(done, total int),
-) []string {
+func (s *AITaskService) createTask(
+	ctx context.Context,
+	taskType, modelName, userID string,
+	projectID *string,
+	idempotencyKey string,
+) (*model.AITask, error) {
+	now := time.Now().UTC()
+	task := &model.AITask{
+		ID:           util.NewAITaskID(),
+		Type:         taskType,
+		Status:       constant.AITaskStatusPending,
+		Progress:     0,
+		Stage:        "queued",
+		StageLabel:   "任务已入队，等待 Worker 处理",
+		Model:        modelName,
+		CreatedBy:    userID,
+		ProjectID:    projectID,
+		AttemptCount: 0,
+		MaxAttempts:  3,
+		QueuedAt:     &now,
+	}
+	if strings.TrimSpace(idempotencyKey) != "" {
+		v := strings.TrimSpace(idempotencyKey)
+		task.IdempotencyKey = &v
+	}
+	if err := s.taskRepo.Create(task); err != nil {
+		return nil, err
+	}
+	s.cacheStatus(ctx, task.ID, task.Status, task.Progress, task.Stage, task.StageLabel)
+	return task, nil
+}
+
+func (s *AITaskService) collectTaskDocuments(docIDs []string) ([]AITaskQueueDocument, error) {
 	if len(docIDs) == 0 {
-		return []string{}
+		return nil, ErrAITaskNoDocuments
 	}
 	docs, err := s.docRepo.FindByIDs(docIDs)
 	if err != nil {
-		log.Warn().Err(err).Strs("docIds", docIDs).Msg("查询文档失败")
-		return []string{}
+		return nil, err
 	}
 	if len(docs) == 0 {
-		return []string{}
+		return nil, ErrAITaskNoDocuments
 	}
 
-	total := len(docs)
-	contents := make([]string, 0, total)
+	byID := make(map[string]model.Document, len(docs))
+	for _, doc := range docs {
+		byID[doc.ID] = doc
+	}
 
-	for i, doc := range docs {
-		localPath := s.storage.LocalPath(doc.SourceURL)
-		if localPath == "" {
-			contents = append(contents, fmt.Sprintf("[Document: %s — storage path unavailable]", doc.FileName))
-			if onProgress != nil {
-				onProgress(i+1, total)
-			}
+	refs := make([]AITaskQueueDocument, 0, len(docIDs))
+	for _, id := range docIDs {
+		doc, ok := byID[id]
+		if !ok {
 			continue
 		}
-
-		switch {
-		case doc.FileType == "txt":
-			text, err := readTextFile(localPath, 50_000)
-			if err == nil {
-				contents = append(contents, text)
-			} else {
-				log.Warn().Err(err).Str("docId", doc.ID).Msg("读取 txt 文档失败")
-				contents = append(contents, fmt.Sprintf("[Document: %s — read error]", doc.FileName))
-			}
-
-		case ocr.IsBinaryDoc(doc.FileType):
-			// PDF, DOCX, XLSX etc. — use PaddleOCR.
-			// PaddleOCR API only accepts fileType=0 (PDF) or fileType=1 (image).
-			// Non-PDF binary formats fall back to a placeholder until a dedicated
-			// extraction path (e.g. docx XML parser) is added (see project notes).
-			if doc.FileType != "pdf" {
-				contents = append(contents, fmt.Sprintf(
-					"[Document: %s (%s) — non-PDF binary; text extraction not yet supported]",
-					doc.FileName, doc.FileType))
-				break
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			markdown, err := s.ocrClient.ParseToMarkdown(ctx, localPath, ocr.FileTypePDF)
-			cancel()
-			if err != nil {
-				log.Warn().Err(err).Str("docId", doc.ID).Msg("OCR 解析失败，使用占位文本")
-				contents = append(contents, fmt.Sprintf(
-					"[Document: %s (pdf) — OCR failed: %s]", doc.FileName, err.Error()))
-			} else if markdown == "" {
-				contents = append(contents, fmt.Sprintf("[Document: %s (pdf) — OCR returned empty]", doc.FileName))
-			} else {
-				contents = append(contents, markdown)
-			}
-
-		default:
-			contents = append(contents, fmt.Sprintf(
-				"[Document: %s (%s) — unsupported format]", doc.FileName, doc.FileType))
-		}
-
-		if onProgress != nil {
-			onProgress(i+1, total)
-		}
+		refs = append(refs, AITaskQueueDocument{
+			ID:        doc.ID,
+			FileName:  doc.FileName,
+			FileType:  doc.FileType,
+			SourceURL: doc.SourceURL,
+		})
 	}
-	return contents
+	if len(refs) == 0 {
+		return nil, ErrAITaskNoDocuments
+	}
+	return refs, nil
 }
 
-func readTextFile(path string, maxBytes int64) (string, error) {
-	f, err := os.Open(path)
+func buildIdempotencyKey(
+	taskType, userID string,
+	projectID *string,
+	topEvent string,
+	docIDs []string,
+	cfg ai.GenerateConfig,
+) string {
+	sortedDocIDs := make([]string, len(docIDs))
+	copy(sortedDocIDs, docIDs)
+	sort.Strings(sortedDocIDs)
+
+	payload := map[string]interface{}{
+		"taskType": taskType,
+		"userID":   strings.TrimSpace(userID),
+		"projectID": strings.TrimSpace(func() string {
+			if projectID == nil {
+				return ""
+			}
+			return *projectID
+		}()),
+		"topEvent": strings.TrimSpace(topEvent),
+		"docIDs":   sortedDocIDs,
+		"config": map[string]interface{}{
+			"quality":     cfg.Quality,
+			"model":       cfg.Model,
+			"depth":       cfg.Depth,
+			"maxNodes":    cfg.MaxNodes,
+			"entityTypes": cfg.EntityTypes,
+		},
+	}
+	b, _ := json.Marshal(payload)
+	return util.SHA256(string(b))
+}
+
+func (s *AITaskService) enqueueTask(ctx context.Context, msg AITaskQueueMessage) error {
+	payload, err := json.Marshal(msg)
 	if err != nil {
-		return "", err
+		return fmt.Errorf("序列化任务消息失败: %w", err)
 	}
-	defer f.Close()
-	r := io.LimitReader(f, maxBytes)
-	scanner := bufio.NewScanner(r)
-	var sb strings.Builder
-	for scanner.Scan() {
-		sb.WriteString(scanner.Text())
-		sb.WriteByte('\n')
+
+	_, err = s.rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: s.queueStream,
+		MaxLen: s.queueMaxLen,
+		Approx: true,
+		Values: map[string]interface{}{
+			"taskId":    msg.TaskID,
+			"projectId": msg.ProjectID,
+			"taskType":  msg.TaskType,
+			"attempt":   msg.Attempt,
+			"payload":   string(payload),
+		},
+	}).Result()
+	if err != nil {
+		return fmt.Errorf("写入 Redis Stream 失败: %w", err)
 	}
-	return sb.String(), scanner.Err()
+	return nil
 }
 
-// ─── Generate Fault Tree ──────────────────────────────────────────────────────
+func (s *AITaskService) enqueueFaultTreeProducerTask(ctx context.Context, msg AITaskQueueMessage) error {
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("序列化生产任务失败: %w", err)
+	}
 
-// GenerateFaultTreeInput is the service-layer input for fault tree generation.
+	_, err = s.rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: s.producerStream,
+		MaxLen: s.queueMaxLen,
+		Approx: true,
+		Values: map[string]interface{}{
+			"taskId":    msg.TaskID,
+			"projectId": msg.ProjectID,
+			"taskType":  msg.TaskType,
+			"payload":   string(payload),
+		},
+	}).Result()
+	if err != nil {
+		return fmt.Errorf("写入生产接入流失败: %w", err)
+	}
+	return nil
+}
+
+// Generate Fault Tree
+
 type GenerateFaultTreeInput struct {
 	DocIDs    []string
 	TopEvent  string
@@ -216,15 +429,12 @@ type GenerateFaultTreeInput struct {
 	UserID    string
 }
 
-// GenerateFaultTreeOutput is the immediate API response — a task reference for polling.
 type GenerateFaultTreeOutput struct {
 	TaskID    string `json:"taskId"`
 	Status    string `json:"status"`
 	ProjectID string `json:"projectId"`
 }
 
-// GenerateFaultTree creates an async task and launches generation in a goroutine.
-// The caller polls GET /ai/tasks/:taskId for progress and the final result.
 func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFaultTreeInput) (*GenerateFaultTreeOutput, error) {
 	project, err := s.resolveOrCreateProject(ctx, input.ProjectID, input.UserID, constant.ProjectTypeFT, input.TopEvent)
 	if err != nil {
@@ -234,192 +444,65 @@ func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFau
 		return nil, err
 	}
 
-	modelName := input.Config.Model
+	modelName := strings.TrimSpace(input.Config.Model)
 	if modelName == "" {
 		modelName = "default"
 	}
 	projectID := project.ID
-	task, err := s.createTask(ctx, constant.AITaskTypeGenerateFaultTree, modelName, input.UserID, &projectID)
+	idem := buildIdempotencyKey(constant.AITaskTypeGenerateFaultTree, input.UserID, &projectID, input.TopEvent, input.DocIDs, input.Config)
+	task, err := s.createTask(ctx, constant.AITaskTypeGenerateFaultTree, modelName, input.UserID, &projectID, idem)
 	if err != nil {
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
 		return nil, err
 	}
 
+	documents, err := s.collectTaskDocuments(input.DocIDs)
+	if err != nil {
+		_ = s.taskRepo.SetFailed(task.ID, err.Error())
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
+		s.cacheStatus(ctx, task.ID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		return nil, err
+	}
+
+	message := AITaskQueueMessage{
+		TaskID:    task.ID,
+		ProjectID: projectID,
+		TaskType:  constant.AITaskTypeGenerateFaultTree,
+		UserID:    input.UserID,
+		TopEvent:  input.TopEvent,
+		DocIDs:    input.DocIDs,
+		Documents: documents,
+		Config:    input.Config,
+		Attempt:   0,
+		TraceID:   task.ID,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := s.enqueueFaultTreeProducerTask(ctx, message); err != nil {
+		_ = s.taskRepo.SetFailed(task.ID, err.Error())
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
+		s.cacheStatus(ctx, task.ID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		return nil, err
+	}
+
+	_ = s.taskRepo.UpdateStatus(task.ID, constant.AITaskStatusPending, 1, "producer_queued", "任务已进入调度队列")
+	s.cacheStatus(ctx, task.ID, constant.AITaskStatusPending, 1, "producer_queued", "任务已进入调度队列")
+
 	s.publishTaskEvent(TaskProgressEvent{
-		Event:         "task.pending",
+		Event:         "task.progress",
 		ProjectID:     projectID,
 		TaskID:        task.ID,
-		Status:        task.Status,
+		Status:        constant.AITaskStatusPending,
 		ProjectStatus: constant.ProjectGenerationPending,
-		Progress:      0,
-		Stage:         task.Stage,
-		StageLabel:    task.StageLabel,
+		Progress:      1,
+		Stage:         "producer_queued",
+		StageLabel:    "任务已进入调度队列",
 	})
 
-	go s.runGenerateFaultTree(task.ID, projectID, input)
 	return &GenerateFaultTreeOutput{TaskID: task.ID, Status: task.Status, ProjectID: projectID}, nil
 }
 
-func (s *AITaskService) runGenerateFaultTree(taskID, projectID string, input GenerateFaultTreeInput) {
-	bg := context.Background()
-	if err := s.setProjectGenerationStatus(projectID, constant.ProjectGenerationRunning); err != nil {
-		log.Error().Err(err).Str("projectId", projectID).Msg("更新项目生成状态失败")
-	}
+// Generate Knowledge Graph
 
-	// ─ Stage 1: document parsing (10% → 40%) ───────────────────────────────
-	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 10, "parsing", "正在解析文档")
-	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 10, "parsing", "正在解析文档")
-	s.publishTaskEvent(TaskProgressEvent{
-		Event:         "task.progress",
-		ProjectID:     projectID,
-		TaskID:        taskID,
-		Status:        constant.AITaskStatusGenerating,
-		ProjectStatus: constant.ProjectGenerationRunning,
-		Progress:      10,
-		Stage:         "parsing",
-		StageLabel:    "正在解析文档",
-	})
-
-	contents := s.extractDocumentTexts(input.DocIDs, func(done, total int) {
-		// Map per-document completion to 10-40% range.
-		pct := 10 + int(float64(done)/float64(total)*30)
-		label := fmt.Sprintf("正在解析文档 (%d/%d)", done, total)
-		// Only update Redis during this phase to avoid hammering the DB.
-		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, pct, "parsing", label)
-		s.publishTaskEvent(TaskProgressEvent{
-			Event:         "task.progress",
-			ProjectID:     projectID,
-			TaskID:        taskID,
-			Status:        constant.AITaskStatusGenerating,
-			ProjectStatus: constant.ProjectGenerationRunning,
-			Progress:      pct,
-			Stage:         "parsing",
-			StageLabel:    label,
-		})
-	})
-	if len(contents) == 0 {
-		errMsg := "没有可用于 AI 生成的文档内容"
-		log.Warn().Str("taskId", taskID).Strs("docIds", input.DocIDs).Msg(errMsg)
-		_ = s.taskRepo.SetFailed(taskID, errMsg)
-		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
-		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
-		s.publishTaskEvent(TaskProgressEvent{
-			Event:         "task.failed",
-			ProjectID:     projectID,
-			TaskID:        taskID,
-			Status:        constant.AITaskStatusFailed,
-			ProjectStatus: constant.ProjectGenerationFailed,
-			ErrorMessage:  errMsg,
-			Stage:         "failed",
-			StageLabel:    "生成失败",
-		})
-		return
-	}
-
-	// ─ Stage 2: LLM generation (40% → 90%) ──────────────────────────────
-	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
-	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
-	s.publishTaskEvent(TaskProgressEvent{
-		Event:         "task.progress",
-		ProjectID:     projectID,
-		TaskID:        taskID,
-		Status:        constant.AITaskStatusGenerating,
-		ProjectStatus: constant.ProjectGenerationRunning,
-		Progress:      40,
-		Stage:         "generating",
-		StageLabel:    "AI 生成中",
-	})
-
-	ctx, cancel := context.WithTimeout(bg, 5*time.Minute)
-	defer cancel()
-
-	// Forward SSE progress events from the LLM server to Redis (no DB write in this phase).
-	onProgress := func(stage string, pct int) {
-		// Clamp the LLM server's 0-100 pct to our 40-90% window.
-		mapped := 40 + int(float64(pct)*0.5)
-		if mapped > 90 {
-			mapped = 90
-		}
-		if mapped < 40 {
-			mapped = 40
-		}
-		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, mapped, stage, "AI 生成中")
-		s.publishTaskEvent(TaskProgressEvent{
-			Event:         "task.progress",
-			ProjectID:     projectID,
-			TaskID:        taskID,
-			Status:        constant.AITaskStatusGenerating,
-			ProjectStatus: constant.ProjectGenerationRunning,
-			Progress:      mapped,
-			Stage:         stage,
-			StageLabel:    "AI 生成中",
-		})
-	}
-
-	result, err := s.llmSrvClient.GenerateFaultTree(ctx, contents, input.TopEvent, input.Config, onProgress)
-	if err != nil {
-		log.Error().Err(err).Str("taskId", taskID).Msg("AI 故障树生成失败")
-		_ = s.taskRepo.SetFailed(taskID, err.Error())
-		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
-		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
-		s.publishTaskEvent(TaskProgressEvent{
-			Event:         "task.failed",
-			ProjectID:     projectID,
-			TaskID:        taskID,
-			Status:        constant.AITaskStatusFailed,
-			ProjectStatus: constant.ProjectGenerationFailed,
-			ErrorMessage:  err.Error(),
-			Stage:         "failed",
-			StageLabel:    "生成失败",
-		})
-		return
-	}
-
-	if err := s.saveGeneratedFaultTreeToProject(ctx, projectID, result); err != nil {
-		log.Error().Err(err).Str("taskId", taskID).Str("projectId", projectID).Msg("保存故障树图数据失败")
-		_ = s.taskRepo.SetFailed(taskID, "保存项目图数据失败: "+err.Error())
-		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
-		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
-		s.publishTaskEvent(TaskProgressEvent{
-			Event:         "task.failed",
-			ProjectID:     projectID,
-			TaskID:        taskID,
-			Status:        constant.AITaskStatusFailed,
-			ProjectStatus: constant.ProjectGenerationFailed,
-			ErrorMessage:  "保存项目图数据失败: " + err.Error(),
-			Stage:         "failed",
-			StageLabel:    "生成失败",
-		})
-		return
-	}
-
-	// ─ Stage 3: persist result (90% → 100%) ─────────────────────────────
-	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 90, "saving", "正在保存结果")
-	resultJSON, _ := json.Marshal(result)
-	if err := s.taskRepo.SetCompleted(taskID, resultJSON); err != nil {
-		log.Error().Err(err).Str("taskId", taskID).Msg("保存 AI 任务结果失败")
-	}
-	_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationCompleted)
-	s.cacheStatus(bg, taskID, constant.AITaskStatusCompleted, 100, "completed", "生成完成")
-	s.publishTaskEvent(TaskProgressEvent{
-		Event:         "task.completed",
-		ProjectID:     projectID,
-		TaskID:        taskID,
-		Status:        constant.AITaskStatusCompleted,
-		ProjectStatus: constant.ProjectGenerationCompleted,
-		Progress:      100,
-		Stage:         "completed",
-		StageLabel:    "生成完成",
-		Result: map[string]interface{}{
-			"summary":  result.Summary,
-			"accuracy": result.Accuracy,
-		},
-	})
-}
-
-// ─── Generate Knowledge Graph ─────────────────────────────────────────────────
-
-// GenerateKnowledgeGraphInput is the service-layer input for knowledge graph generation.
 type GenerateKnowledgeGraphInput struct {
 	DocIDs    []string
 	Config    ai.GenerateConfig
@@ -427,14 +510,12 @@ type GenerateKnowledgeGraphInput struct {
 	UserID    string
 }
 
-// GenerateKnowledgeGraphOutput is the immediate API response — a task reference for polling.
 type GenerateKnowledgeGraphOutput struct {
 	TaskID    string `json:"taskId"`
 	Status    string `json:"status"`
 	ProjectID string `json:"projectId"`
 }
 
-// GenerateKnowledgeGraph creates an async task and launches generation in a goroutine.
 func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input GenerateKnowledgeGraphInput) (*GenerateKnowledgeGraphOutput, error) {
 	project, err := s.resolveOrCreateProject(ctx, input.ProjectID, input.UserID, constant.ProjectTypeKG, "")
 	if err != nil {
@@ -444,14 +525,42 @@ func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input Genera
 		return nil, err
 	}
 
-	modelName := input.Config.Model
+	modelName := strings.TrimSpace(input.Config.Model)
 	if modelName == "" {
 		modelName = "default"
 	}
 	projectID := project.ID
-	task, err := s.createTask(ctx, constant.AITaskTypeGenerateKnowledgeGraph, modelName, input.UserID, &projectID)
+	idem := buildIdempotencyKey(constant.AITaskTypeGenerateKnowledgeGraph, input.UserID, &projectID, "", input.DocIDs, input.Config)
+	task, err := s.createTask(ctx, constant.AITaskTypeGenerateKnowledgeGraph, modelName, input.UserID, &projectID, idem)
 	if err != nil {
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
+		return nil, err
+	}
+
+	documents, err := s.collectTaskDocuments(input.DocIDs)
+	if err != nil {
+		_ = s.taskRepo.SetFailed(task.ID, err.Error())
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
+		s.cacheStatus(ctx, task.ID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		return nil, err
+	}
+
+	message := AITaskQueueMessage{
+		TaskID:    task.ID,
+		ProjectID: projectID,
+		TaskType:  constant.AITaskTypeGenerateKnowledgeGraph,
+		UserID:    input.UserID,
+		DocIDs:    input.DocIDs,
+		Documents: documents,
+		Config:    input.Config,
+		Attempt:   0,
+		TraceID:   task.ID,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := s.enqueueTask(ctx, message); err != nil {
+		_ = s.taskRepo.SetFailed(task.ID, err.Error())
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
+		s.cacheStatus(ctx, task.ID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
 		return nil, err
 	}
 
@@ -466,165 +575,336 @@ func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input Genera
 		StageLabel:    task.StageLabel,
 	})
 
-	go s.runGenerateKnowledgeGraph(task.ID, projectID, input)
 	return &GenerateKnowledgeGraphOutput{TaskID: task.ID, Status: task.Status, ProjectID: projectID}, nil
 }
 
-func (s *AITaskService) runGenerateKnowledgeGraph(taskID, projectID string, input GenerateKnowledgeGraphInput) {
-	bg := context.Background()
-	if err := s.setProjectGenerationStatus(projectID, constant.ProjectGenerationRunning); err != nil {
-		log.Error().Err(err).Str("projectId", projectID).Msg("更新项目生成状态失败")
+func (s *AITaskService) HandleTaskCallback(ctx context.Context, input TaskCallbackInput) error {
+	taskID := strings.TrimSpace(input.TaskID)
+	if taskID == "" {
+		return ErrAITaskCallbackTaskNotFound
 	}
 
-	// ─ Stage 1: document parsing (10% → 40%) ───────────────────────────────
-	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 10, "parsing", "正在解析文档")
-	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 10, "parsing", "正在解析文档")
-	s.publishTaskEvent(TaskProgressEvent{
-		Event:         "task.progress",
-		ProjectID:     projectID,
-		TaskID:        taskID,
-		Status:        constant.AITaskStatusGenerating,
-		ProjectStatus: constant.ProjectGenerationRunning,
-		Progress:      10,
-		Stage:         "parsing",
-		StageLabel:    "正在解析文档",
-	})
+	eventKey := strings.TrimSpace(input.EventKey)
+	if eventKey != "" {
+		dedupeKey := constant.RedisKeyAITaskDedupe + taskID + ":" + eventKey
+		ok, err := s.rdb.SetNX(ctx, dedupeKey, "1", s.callbackDedupeTTL).Result()
+		if err != nil {
+			log.Warn().Err(err).Str("taskId", taskID).Msg("callback 去重写入失败，继续处理")
+		} else if !ok {
+			return nil
+		}
+	}
 
-	contents := s.extractDocumentTexts(input.DocIDs, func(done, total int) {
-		pct := 10 + int(float64(done)/float64(total)*30)
-		label := fmt.Sprintf("正在解析文档 (%d/%d)", done, total)
-		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, pct, "parsing", label)
+	task, err := s.taskRepo.FindByID(taskID)
+	if err != nil {
+		return err
+	}
+	if task == nil {
+		return ErrAITaskCallbackTaskNotFound
+	}
+	if task.ProjectID == nil || strings.TrimSpace(*task.ProjectID) == "" {
+		return ErrProjectNotFound
+	}
+
+	projectID := strings.TrimSpace(*task.ProjectID)
+	if inPID := strings.TrimSpace(input.ProjectID); inPID != "" && inPID != projectID {
+		return ErrAITaskCallbackProjectMismatch
+	}
+
+	status := strings.TrimSpace(input.Status)
+	if status == "" {
+		return ErrAITaskCallbackInvalidStatus
+	}
+
+	if isAITaskTerminalStatus(task.Status) {
+		if !(task.Status == constant.AITaskStatusFailed && status == constant.AITaskStatusDead) {
+			return nil
+		}
+	}
+
+	stage := strings.TrimSpace(input.Stage)
+	stageLabel := strings.TrimSpace(input.StageLabel)
+	progress := input.Progress
+	if progress < 0 {
+		progress = 0
+	}
+	if progress > 100 {
+		progress = 100
+	}
+	attempt := input.Attempt
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt == 0 {
+		attempt = task.AttemptCount
+	}
+	if attempt > 0 && task.AttemptCount > 0 && attempt < task.AttemptCount {
+		return nil
+	}
+	if !isAITaskTerminalStatus(status) && progress < task.Progress && attempt <= task.AttemptCount {
+		return nil
+	}
+
+	workerID := strings.TrimSpace(input.WorkerID)
+	var workerPtr *string
+	if workerID != "" {
+		workerPtr = &workerID
+	}
+
+	switch status {
+	case constant.AITaskStatusProcessing, constant.AITaskStatusRetrying:
+		s.touchProjectLock(ctx, projectID, taskID)
+		if stage == "" {
+			stage = "processing"
+		}
+		if stageLabel == "" {
+			stageLabel = "任务处理中"
+		}
+		if err := s.taskRepo.UpdateStatusExt(taskID, status, progress, stage, stageLabel, workerPtr, attempt, nil); err != nil {
+			return err
+		}
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationRunning)
+		s.cacheStatus(ctx, taskID, status, progress, stage, stageLabel)
+		eventName := "task.progress"
+		if status == constant.AITaskStatusRetrying {
+			eventName = "task.retrying"
+		}
 		s.publishTaskEvent(TaskProgressEvent{
-			Event:         "task.progress",
+			Event:         eventName,
 			ProjectID:     projectID,
 			TaskID:        taskID,
-			Status:        constant.AITaskStatusGenerating,
+			Status:        status,
 			ProjectStatus: constant.ProjectGenerationRunning,
-			Progress:      pct,
-			Stage:         "parsing",
-			StageLabel:    label,
+			Progress:      progress,
+			Stage:         stage,
+			StageLabel:    stageLabel,
 		})
-	})
-	if len(contents) == 0 {
-		errMsg := "没有可用于 AI 生成的文档内容"
-		log.Warn().Str("taskId", taskID).Strs("docIds", input.DocIDs).Msg(errMsg)
-		_ = s.taskRepo.SetFailed(taskID, errMsg)
-		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
-		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		return nil
+
+	case constant.AITaskStatusCompleted:
+		if task.Status == constant.AITaskStatusCompleted {
+			s.releaseProjectLock(ctx, projectID, taskID)
+			return nil
+		}
+		if stage == "" {
+			stage = "completed"
+		}
+		if stageLabel == "" {
+			stageLabel = "生成完成"
+		}
+		if err := s.persistGeneratedGraph(ctx, task, input.Result); err != nil {
+			errMsg := "保存生成结果失败: " + err.Error()
+			_ = s.taskRepo.SetFailed(taskID, errMsg)
+			s.releaseProjectLock(ctx, projectID, taskID)
+			_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
+			s.cacheStatus(ctx, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+			s.publishTaskEvent(TaskProgressEvent{
+				Event:         "task.failed",
+				ProjectID:     projectID,
+				TaskID:        taskID,
+				Status:        constant.AITaskStatusFailed,
+				ProjectStatus: constant.ProjectGenerationFailed,
+				ErrorMessage:  errMsg,
+				Stage:         "failed",
+				StageLabel:    "生成失败",
+			})
+			return err
+		}
+
+		resultJSON, _ := json.Marshal(input.Result)
+		if err := s.taskRepo.SetCompleted(taskID, resultJSON); err != nil {
+			return err
+		}
+		s.releaseProjectLock(ctx, projectID, taskID)
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationCompleted)
+		s.cacheStatus(ctx, taskID, constant.AITaskStatusCompleted, 100, stage, stageLabel)
 		s.publishTaskEvent(TaskProgressEvent{
-			Event:         "task.failed",
+			Event:         "task.completed",
 			ProjectID:     projectID,
 			TaskID:        taskID,
-			Status:        constant.AITaskStatusFailed,
+			Status:        constant.AITaskStatusCompleted,
+			ProjectStatus: constant.ProjectGenerationCompleted,
+			Progress:      100,
+			Stage:         stage,
+			StageLabel:    stageLabel,
+			Result:        extractResultSummary(task.Type, input.Result),
+		})
+		return nil
+
+	case constant.AITaskStatusFailed, constant.AITaskStatusDead:
+		if stage == "" {
+			stage = "failed"
+		}
+		if stageLabel == "" {
+			stageLabel = "生成失败"
+		}
+		errMsg := strings.TrimSpace(input.ErrorMessage)
+		if errMsg == "" {
+			errMsg = "任务执行失败"
+		}
+		if err := s.taskRepo.UpdateStatusExt(taskID, status, progress, stage, stageLabel, workerPtr, attempt, &errMsg); err != nil {
+			return err
+		}
+		s.releaseProjectLock(ctx, projectID, taskID)
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
+		s.cacheStatus(ctx, taskID, status, progress, stage, stageLabel)
+		eventName := "task.failed"
+		if status == constant.AITaskStatusDead {
+			eventName = "task.dead"
+		}
+		s.publishTaskEvent(TaskProgressEvent{
+			Event:         eventName,
+			ProjectID:     projectID,
+			TaskID:        taskID,
+			Status:        status,
 			ProjectStatus: constant.ProjectGenerationFailed,
 			ErrorMessage:  errMsg,
-			Stage:         "failed",
-			StageLabel:    "生成失败",
-		})
-		return
-	}
-
-	// ─ Stage 2: LLM generation (40% → 90%) ──────────────────────────────
-	_ = s.taskRepo.UpdateStatus(taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
-	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 40, "generating", "AI 生成中")
-	s.publishTaskEvent(TaskProgressEvent{
-		Event:         "task.progress",
-		ProjectID:     projectID,
-		TaskID:        taskID,
-		Status:        constant.AITaskStatusGenerating,
-		ProjectStatus: constant.ProjectGenerationRunning,
-		Progress:      40,
-		Stage:         "generating",
-		StageLabel:    "AI 生成中",
-	})
-
-	ctx, cancel := context.WithTimeout(bg, 5*time.Minute)
-	defer cancel()
-
-	onProgress := func(stage string, pct int) {
-		mapped := 40 + int(float64(pct)*0.5)
-		if mapped > 90 {
-			mapped = 90
-		}
-		if mapped < 40 {
-			mapped = 40
-		}
-		s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, mapped, stage, "AI 生成中")
-		s.publishTaskEvent(TaskProgressEvent{
-			Event:         "task.progress",
-			ProjectID:     projectID,
-			TaskID:        taskID,
-			Status:        constant.AITaskStatusGenerating,
-			ProjectStatus: constant.ProjectGenerationRunning,
-			Progress:      mapped,
+			Progress:      progress,
 			Stage:         stage,
-			StageLabel:    "AI 生成中",
+			StageLabel:    stageLabel,
 		})
+		return nil
+	default:
+		return ErrAITaskCallbackInvalidStatus
 	}
-
-	result, err := s.llmSrvClient.GenerateKnowledgeGraph(ctx, contents, input.Config, onProgress)
-	if err != nil {
-		log.Error().Err(err).Str("taskId", taskID).Msg("AI 知识图谱生成失败")
-		_ = s.taskRepo.SetFailed(taskID, err.Error())
-		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
-		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
-		s.publishTaskEvent(TaskProgressEvent{
-			Event:         "task.failed",
-			ProjectID:     projectID,
-			TaskID:        taskID,
-			Status:        constant.AITaskStatusFailed,
-			ProjectStatus: constant.ProjectGenerationFailed,
-			ErrorMessage:  err.Error(),
-			Stage:         "failed",
-			StageLabel:    "生成失败",
-		})
-		return
-	}
-
-	if err := s.saveGeneratedKnowledgeGraphToProject(ctx, projectID, result); err != nil {
-		log.Error().Err(err).Str("taskId", taskID).Str("projectId", projectID).Msg("保存知识图谱图数据失败")
-		_ = s.taskRepo.SetFailed(taskID, "保存项目图数据失败: "+err.Error())
-		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
-		s.cacheStatus(bg, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
-		s.publishTaskEvent(TaskProgressEvent{
-			Event:         "task.failed",
-			ProjectID:     projectID,
-			TaskID:        taskID,
-			Status:        constant.AITaskStatusFailed,
-			ProjectStatus: constant.ProjectGenerationFailed,
-			ErrorMessage:  "保存项目图数据失败: " + err.Error(),
-			Stage:         "failed",
-			StageLabel:    "生成失败",
-		})
-		return
-	}
-
-	// ─ Stage 3: persist result (90% → 100%) ─────────────────────────────
-	s.cacheStatus(bg, taskID, constant.AITaskStatusGenerating, 90, "saving", "正在保存结果")
-	resultJSON, _ := json.Marshal(result)
-	if err := s.taskRepo.SetCompleted(taskID, resultJSON); err != nil {
-		log.Error().Err(err).Str("taskId", taskID).Msg("保存 AI 任务结果失败")
-	}
-	_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationCompleted)
-	s.cacheStatus(bg, taskID, constant.AITaskStatusCompleted, 100, "completed", "生成完成")
-	s.publishTaskEvent(TaskProgressEvent{
-		Event:         "task.completed",
-		ProjectID:     projectID,
-		TaskID:        taskID,
-		Status:        constant.AITaskStatusCompleted,
-		ProjectStatus: constant.ProjectGenerationCompleted,
-		Progress:      100,
-		Stage:         "completed",
-		StageLabel:    "生成完成",
-		Result: map[string]interface{}{
-			"summary":       result.Summary,
-			"entityCount":   result.EntityCount,
-			"relationCount": result.RelationCount,
-		},
-	})
 }
 
-// ─── Chat ─────────────────────────────────────────────────────────────────────
+func isAITaskTerminalStatus(status string) bool {
+	switch status {
+	case constant.AITaskStatusCompleted, constant.AITaskStatusFailed, constant.AITaskStatusDead:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *AITaskService) persistGeneratedGraph(ctx context.Context, task *model.AITask, raw map[string]interface{}) error {
+	if task.ProjectID == nil || strings.TrimSpace(*task.ProjectID) == "" {
+		return ErrProjectNotFound
+	}
+	projectID := strings.TrimSpace(*task.ProjectID)
+
+	switch task.Type {
+	case constant.AITaskTypeGenerateFaultTree:
+		result, err := parseFaultTreeResult(raw)
+		if err != nil {
+			return err
+		}
+		return s.saveGeneratedFaultTreeToProject(ctx, projectID, result)
+	case constant.AITaskTypeGenerateKnowledgeGraph:
+		result, err := parseKnowledgeGraphResult(raw)
+		if err != nil {
+			return err
+		}
+		return s.saveGeneratedKnowledgeGraphToProject(ctx, projectID, result)
+	default:
+		return fmt.Errorf("不支持的任务类型: %s", task.Type)
+	}
+}
+
+func parseFaultTreeResult(raw map[string]interface{}) (*ai.FaultTreeResult, error) {
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
+	var result ai.FaultTreeResult
+	if err := json.Unmarshal(b, &result); err != nil {
+		return nil, err
+	}
+	if len(result.Nodes) == 0 {
+		return nil, ErrAIGenerationResultFormat
+	}
+	return &result, nil
+}
+
+func parseKnowledgeGraphResult(raw map[string]interface{}) (*ai.KnowledgeGraphResult, error) {
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
+	var result ai.KnowledgeGraphResult
+	if err := json.Unmarshal(b, &result); err != nil {
+		return nil, err
+	}
+	if len(result.Nodes) == 0 {
+		return nil, ErrAIGenerationResultFormat
+	}
+	if result.EntityCount == 0 {
+		result.EntityCount = len(result.Nodes)
+	}
+	if result.RelationCount == 0 {
+		result.RelationCount = len(result.Edges)
+	}
+	return &result, nil
+}
+
+func extractResultSummary(taskType string, raw map[string]interface{}) map[string]interface{} {
+	summary := strings.TrimSpace(fmt.Sprintf("%v", raw["summary"]))
+	if summary == "" || summary == "<nil>" {
+		summary = "生成完成"
+	}
+	if taskType == constant.AITaskTypeGenerateFaultTree {
+		return map[string]interface{}{
+			"summary":  summary,
+			"accuracy": toIntOrFloat(raw["accuracy"]),
+		}
+	}
+	entityCount := toInt(raw["entityCount"])
+	if entityCount == 0 {
+		entityCount = toInt(raw["entity_count"])
+	}
+	relationCount := toInt(raw["relationCount"])
+	if relationCount == 0 {
+		relationCount = toInt(raw["relation_count"])
+	}
+	return map[string]interface{}{
+		"summary":       summary,
+		"entityCount":   entityCount,
+		"relationCount": relationCount,
+	}
+}
+
+func toInt(v interface{}) int {
+	switch t := v.(type) {
+	case int:
+		return t
+	case int32:
+		return int(t)
+	case int64:
+		return int(t)
+	case float64:
+		return int(t)
+	case float32:
+		return int(t)
+	case json.Number:
+		i, err := t.Int64()
+		if err == nil {
+			return int(i)
+		}
+	case string:
+		i, err := strconv.Atoi(strings.TrimSpace(t))
+		if err == nil {
+			return i
+		}
+	}
+	return 0
+}
+
+func toIntOrFloat(v interface{}) interface{} {
+	switch t := v.(type) {
+	case int, int32, int64, float32, float64:
+		return t
+	case json.Number:
+		if f, err := t.Float64(); err == nil {
+			return f
+		}
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(t), 64); err == nil {
+			return f
+		}
+	}
+	return 0
+}
 
 // ChatInput is the service-layer input for AI chat.
 type ChatInput struct {

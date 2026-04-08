@@ -2,7 +2,9 @@ package repository
 
 import (
 	"errors"
+	"strings"
 
+	"optitree-backend/internal/constant"
 	"optitree-backend/internal/model"
 
 	"gorm.io/datatypes"
@@ -30,6 +32,17 @@ func (r *AITaskRepository) FindByID(id string) (*model.AITask, error) {
 	return &task, err
 }
 
+func (r *AITaskRepository) FindLatestByProjectAndType(projectID, taskType string) (*model.AITask, error) {
+	var task model.AITask
+	err := r.db.Where("project_id = ? AND type = ?", projectID, taskType).
+		Order("created_at DESC").
+		First(&task).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	return &task, err
+}
+
 func (r *AITaskRepository) UpdateStatus(id, status string, progress int, stage, stageLabel string) error {
 	return r.db.Model(&model.AITask{}).Where("id = ?", id).Updates(map[string]interface{}{
 		"status":      status,
@@ -39,24 +52,61 @@ func (r *AITaskRepository) UpdateStatus(id, status string, progress int, stage, 
 	}).Error
 }
 
+// UpdateStatusExt updates task status with worker/attempt metadata.
+func (r *AITaskRepository) UpdateStatusExt(
+	id, status string,
+	progress int,
+	stage, stageLabel string,
+	workerID *string,
+	attemptCount int,
+	errorMessage *string,
+) error {
+	updates := map[string]interface{}{
+		"status":        status,
+		"progress":      progress,
+		"stage":         stage,
+		"stage_label":   stageLabel,
+		"attempt_count": attemptCount,
+	}
+
+	if workerID != nil && strings.TrimSpace(*workerID) != "" {
+		updates["worker_id"] = strings.TrimSpace(*workerID)
+	}
+	if errorMessage != nil {
+		updates["error_message"] = strings.TrimSpace(*errorMessage)
+	}
+
+	if status == constant.AITaskStatusProcessing || status == constant.AITaskStatusRetrying {
+		updates["started_at"] = gorm.Expr("COALESCE(started_at, NOW())")
+	}
+	if status == constant.AITaskStatusCompleted || status == constant.AITaskStatusFailed || status == constant.AITaskStatusDead {
+		updates["completed_at"] = gorm.Expr("NOW()")
+	}
+
+	return r.db.Model(&model.AITask{}).Where("id = ?", id).Updates(updates).Error
+}
+
 // SetCompleted marks a task as completed and stores its result JSON.
 func (r *AITaskRepository) SetCompleted(id string, resultJSON []byte) error {
 	return r.db.Model(&model.AITask{}).Where("id = ?", id).Updates(map[string]interface{}{
-		"status":      "completed",
-		"progress":    100,
-		"stage":       "completed",
-		"stage_label": "生成完成",
-		"result_json": datatypes.JSON(resultJSON),
+		"status":        constant.AITaskStatusCompleted,
+		"progress":      100,
+		"stage":         "completed",
+		"stage_label":   "生成完成",
+		"result_json":   datatypes.JSON(resultJSON),
+		"error_message": nil,
+		"completed_at":  gorm.Expr("NOW()"),
 	}).Error
 }
 
 // SetFailed marks a task as failed with an error message.
 func (r *AITaskRepository) SetFailed(id, errMsg string) error {
 	return r.db.Model(&model.AITask{}).Where("id = ?", id).Updates(map[string]interface{}{
-		"status":        "failed",
+		"status":        constant.AITaskStatusFailed,
 		"stage":         "failed",
 		"stage_label":   "任务失败",
 		"error_message": errMsg,
+		"completed_at":  gorm.Expr("NOW()"),
 	}).Error
 }
 

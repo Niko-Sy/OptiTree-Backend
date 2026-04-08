@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
@@ -120,6 +121,17 @@ func (h *AITaskWSHandler) StreamTaskProgress(c *gin.Context) {
 	welcome.StageLabel = "订阅成功"
 	if err := conn.WriteJSON(welcome); err != nil {
 		return
+	}
+
+	if snapshotText, err := h.rdb.Get(c.Request.Context(), constant.RedisKeyAITaskLatest+projectID).Result(); err == nil && strings.TrimSpace(snapshotText) != "" {
+		var snapshot service.TaskProgressEvent
+		if jsonErr := json.Unmarshal([]byte(snapshotText), &snapshot); jsonErr == nil {
+			snapshot.Event = "task.snapshot"
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := conn.WriteJSON(snapshot); err != nil {
+				return
+			}
+		}
 	}
 
 	pingTicker := time.NewTicker(25 * time.Second)

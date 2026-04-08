@@ -139,9 +139,6 @@ type sseEvent struct {
 	// knowledge-graph extra result fields
 	EntityCount   int `json:"entity_count,omitempty"`
 	RelationCount int `json:"relation_count,omitempty"`
-
-	// error field
-	Error string `json:"message,omitempty"` // aliased to avoid clash with Message above
 }
 
 // ─── Public methods ───────────────────────────────────────────────────────────
@@ -217,8 +214,9 @@ func (c *LLMServerClient) GenerateKnowledgeGraph(
 	payload := llmKGRequest{
 		Documents: normalizeDocuments(documents),
 		Config: llmKGConfig{
-			Quality: cfg.Quality,
-			Model:   cfg.Model,
+			Quality:     cfg.Quality,
+			Model:       cfg.Model,
+			EntityTypes: cfg.EntityTypes,
 		},
 	}
 

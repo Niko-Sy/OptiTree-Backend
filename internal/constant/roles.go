@@ -49,18 +49,16 @@ const (
 const (
 	AITaskTypeGenerateFaultTree      = "generateFaultTree"
 	AITaskTypeGenerateKnowledgeGraph = "generateKnowledgeGraph"
-	AITaskTypeParseDocument          = "parseDocument"
-	AITaskTypeValidateGraph          = "validateGraph"
 )
 
 // AI 任务状态
 const (
 	AITaskStatusPending    = "pending"
-	AITaskStatusParsing    = "parsing"
-	AITaskStatusGenerating = "generating"
+	AITaskStatusProcessing = "processing"
+	AITaskStatusRetrying   = "retrying"
 	AITaskStatusCompleted  = "completed"
 	AITaskStatusFailed     = "failed"
-	AITaskStatusCancelled  = "cancelled"
+	AITaskStatusDead       = "dead"
 )
 
 // 用户状态
@@ -92,6 +90,9 @@ const (
 	RedisKeyGraphFT       = "graph:ft:"
 	RedisKeyGraphKG       = "graph:kg:"
 	RedisKeyAITask        = "ai:task:"
+	RedisKeyAITaskDedupe  = "ai:task:callback:dedupe:"
+	RedisKeyAITaskLock    = "ai:task:project:lock:"
+	RedisKeyAITaskLatest  = "ai:task:project:latest:"
 	RedisKeyResetPassword = "reset:"
 	RedisKeyUserInfo      = "user:info:"
 )

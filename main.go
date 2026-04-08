@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,20 +22,29 @@ import (
 	"optitree-backend/internal/config"
 	"optitree-backend/internal/handler"
 	"optitree-backend/internal/middleware"
-	"optitree-backend/internal/ocr"
 	"optitree-backend/internal/repository"
 	"optitree-backend/internal/service"
 	"optitree-backend/pkg/jwt"
+	applogger "optitree-backend/pkg/logger"
 )
 
 func main() {
-	// 日志初始化
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
+	// 日志初始化（控制台）
+	consoleWriter := zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}
+	log.Logger = zerolog.New(consoleWriter).With().Timestamp().Logger()
 
 	// 加载配置
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal().Err(err).Msg("加载配置失败")
+	}
+
+	// 日志重新初始化：按天写文件 + 控制台双输出
+	if cfg.Log.Enabled && cfg.Log.Dir != "" {
+		fileWriter := applogger.NewDailyFileWriter(cfg.Log.Dir)
+		multi := io.MultiWriter(consoleWriter, fileWriter)
+		log.Logger = zerolog.New(multi).With().Timestamp().Logger()
+		log.Info().Str("dir", cfg.Log.Dir).Msg("文件日志已启用")
 	}
 
 	// 设置 Gin 模式
@@ -98,8 +108,6 @@ func main() {
 		cfg.Storage.AllowedDocTypes,
 	)
 	aiClient := ai.NewClient(cfg.AI.Endpoint, cfg.AI.APIKey, cfg.AI.DefaultModel, cfg.AI.ChatModel, cfg.AI.Timeout)
-	ocrClient := ocr.NewClient(cfg.OCR.URL, cfg.OCR.Token, cfg.OCR.Timeout)
-	llmSrvClient := ai.NewLLMServerClient(cfg.LLMServer.BaseURL, cfg.LLMServer.Timeout)
 	taskProgressHub := service.NewTaskProgressHub()
 	authSvc := service.NewAuthService(userRepo, authRepo, jwtManager, rdb)
 	userSvc := service.NewUserService(userRepo, storageSvc)
@@ -112,16 +120,30 @@ func main() {
 		docRepo,
 		projectRepo,
 		memberRepo,
-		storageSvc,
 		projectSvc,
 		ftSvc,
 		kgSvc,
 		aiClient,
-		ocrClient,
-		llmSrvClient,
 		taskProgressHub,
 		rdb,
+		cfg.AITask.Stream,
+		cfg.AITask.StreamMaxLen,
+		cfg.AITask.CallbackHeader,
+		cfg.AITask.CallbackToken,
+		cfg.AITask.ProducerStream,
+		cfg.AITask.ProducerGroup,
+		cfg.AITask.ProducerReadCount,
+		cfg.AITask.ProducerBlockMs,
+		cfg.AITask.DispatcherWorkers,
+		cfg.AITask.ProducerDelayedZSet,
+		cfg.AITask.ProducerRetryDelay,
+		cfg.AITask.ProjectLockTTL,
+		cfg.AITask.CallbackDedupeTTL,
+		cfg.AITask.SnapshotTTL,
 	)
+	if err := aiTaskSvc.StartFaultTreeDispatcher(context.Background()); err != nil {
+		log.Fatal().Err(err).Msg("启动 AI 故障树调度器失败")
+	}
 	docSvc := service.NewDocumentService(docRepo, storageSvc)
 	memberSvc := service.NewMemberService(memberRepo, projectRepo, userRepo)
 	teamSvc := service.NewTeamService(db)
@@ -168,6 +190,7 @@ func main() {
 
 	// AI 任务实时进度推送（WebSocket）
 	router.GET("/api/v1/ws/tasks/:projectId", aiTaskWSH.StreamTaskProgress)
+	router.POST("/internal/ai/tasks/callback", aiTaskH.TaskCallback)
 
 	v1 := router.Group("/api/v1")
 
@@ -258,6 +281,7 @@ func main() {
 		{
 			ai.GET("/models", aiTaskH.GetModels)
 			ai.GET("/tasks/:taskId", aiTaskH.GetTask)
+			ai.GET("/projects/:projectId/tasks/latest", aiTaskH.GetLatestFaultTreeTaskByProject)
 			ai.POST("/fault-trees/generate", aiTaskH.GenerateFaultTree)
 			ai.POST("/knowledge-graphs/generate", aiTaskH.GenerateKnowledgeGraph)
 			ai.POST("/chat", aiTaskH.Chat)
@@ -299,6 +323,7 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Error().Err(err).Msg("服务关闭超时")
 	}
+	aiTaskSvc.StopFaultTreeDispatcher()
 
 	_ = rdb.Close()
 	log.Info().Msg("服务已关闭")

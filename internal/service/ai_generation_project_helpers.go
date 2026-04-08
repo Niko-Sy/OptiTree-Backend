@@ -89,6 +89,11 @@ func (s *AITaskService) publishTaskEvent(evt TaskProgressEvent) {
 	if evt.UpdatedAt == "" {
 		evt.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
+	if s.rdb != nil {
+		if raw, err := json.Marshal(evt); err == nil {
+			_ = s.rdb.Set(context.Background(), constant.RedisKeyAITaskLatest+evt.ProjectID, string(raw), s.snapshotTTL).Err()
+		}
+	}
 	s.progressHub.Publish(evt.ProjectID, evt)
 }
 
