@@ -7,6 +7,7 @@ APIREQUIRE.md
 .env
 storage/
 *.exe
+logs/
 
 main
 *.md
