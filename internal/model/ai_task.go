@@ -34,12 +34,15 @@ func (AITask) TableName() string {
 }
 
 type AIConversation struct {
-	ID        string    `gorm:"primaryKey;column:id;size:32" json:"id"`
-	ProjectID *string   `gorm:"column:project_id;size:32" json:"projectId"`
-	UserID    string    `gorm:"column:user_id;size:32;not null" json:"userId"`
-	Type      string    `gorm:"column:type;size:20;not null" json:"type"`
-	CreatedAt time.Time `gorm:"column:created_at;not null;autoCreateTime" json:"createdAt"`
-	UpdatedAt time.Time `gorm:"column:updated_at;not null;autoUpdateTime" json:"updatedAt"`
+	ID            string     `gorm:"primaryKey;column:id;size:32" json:"id"`
+	ProjectID     string     `gorm:"column:project_id;size:32;not null" json:"projectId"`
+	UserID        string     `gorm:"column:user_id;size:32;not null" json:"userId"`
+	Type          string     `gorm:"column:type;size:20;not null" json:"type"`
+	Title         string     `gorm:"column:title;size:120" json:"title"`
+	LastMessageAt *time.Time `gorm:"column:last_message_at" json:"lastMessageAt,omitempty"`
+	MessageCount  int        `gorm:"column:message_count;not null;default:0" json:"messageCount"`
+	CreatedAt     time.Time  `gorm:"column:created_at;not null;autoCreateTime" json:"createdAt"`
+	UpdatedAt     time.Time  `gorm:"column:updated_at;not null;autoUpdateTime" json:"updatedAt"`
 }
 
 func (AIConversation) TableName() string {
@@ -51,6 +54,9 @@ type AIChatMessage struct {
 	ConversationID string    `gorm:"column:conversation_id;size:32;not null;index" json:"conversationId"`
 	Role           string    `gorm:"column:role;size:20;not null" json:"role"`
 	Content        string    `gorm:"column:content;not null" json:"content"`
+	Model          *string   `gorm:"column:model;size:80" json:"model,omitempty"`
+	TokensUsed     *int      `gorm:"column:tokens_used" json:"tokensUsed,omitempty"`
+	IsPartial      bool      `gorm:"column:is_partial;not null;default:false" json:"isPartial"`
 	CreatedAt      time.Time `gorm:"column:created_at;not null;autoCreateTime" json:"createdAt"`
 }
 

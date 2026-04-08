@@ -98,6 +98,8 @@ func main() {
 	authRepo := repository.NewAuthRepository(db)
 	aiTaskRepo := repository.NewAITaskRepository(db)
 	docRepo := repository.NewDocumentRepository(db)
+	aiConversationRepo := repository.NewAIConversationRepository(db)
+	aiChatMessageRepo := repository.NewAIChatMessageRepository(db)
 
 	// ---- 服务层 ----
 	storageSvc := service.NewStorageService(
@@ -123,7 +125,6 @@ func main() {
 		projectSvc,
 		ftSvc,
 		kgSvc,
-		aiClient,
 		taskProgressHub,
 		rdb,
 		cfg.AITask.Stream,
@@ -140,6 +141,15 @@ func main() {
 		cfg.AITask.ProjectLockTTL,
 		cfg.AITask.CallbackDedupeTTL,
 		cfg.AITask.SnapshotTTL,
+	)
+	assistantSvc := service.NewAssistantService(
+		aiConversationRepo,
+		aiChatMessageRepo,
+		projectRepo,
+		memberRepo,
+		aiClient,
+		ftSvc,
+		kgSvc,
 	)
 	if err := aiTaskSvc.StartFaultTreeDispatcher(context.Background()); err != nil {
 		log.Fatal().Err(err).Msg("启动 AI 故障树调度器失败")
@@ -158,6 +168,7 @@ func main() {
 	versionH := handler.NewVersionHandler(versionSvc)
 	docH := handler.NewDocumentHandler(docSvc)
 	aiTaskH := handler.NewAITaskHandler(aiTaskSvc)
+	assistantH := handler.NewAssistantHandler(assistantSvc)
 	aiTaskWSH := handler.NewAITaskWSHandler(taskProgressHub, jwtManager, rdb, memberRepo)
 	memberH := handler.NewMemberHandler(memberSvc)
 	teamH := handler.NewTeamHandler(teamSvc)
@@ -279,13 +290,22 @@ func main() {
 		// AI 任务
 		ai := authed.Group("/ai")
 		{
-			ai.GET("/models", aiTaskH.GetModels)
 			ai.GET("/tasks/:taskId", aiTaskH.GetTask)
 			ai.GET("/projects/:projectId/tasks/latest", aiTaskH.GetLatestFaultTreeTaskByProject)
 			ai.POST("/fault-trees/generate", aiTaskH.GenerateFaultTree)
 			ai.POST("/knowledge-graphs/generate", aiTaskH.GenerateKnowledgeGraph)
-			ai.POST("/chat", aiTaskH.Chat)
-			ai.POST("/chat/stream", aiTaskH.ChatStream)
+		}
+
+		// AI 助手（会话化）
+		assistant := authed.Group("/assistant")
+		{
+			assistant.GET("/models", assistantH.GetModels)
+			assistant.POST("/conversations", assistantH.CreateConversation)
+			assistant.GET("/conversations", assistantH.ListConversations)
+			assistant.GET("/conversations/:conversationId/messages", assistantH.GetMessageHistory)
+			assistant.POST("/conversations/:conversationId/messages", assistantH.SendMessage)
+			assistant.POST("/conversations/:conversationId/messages/stream", assistantH.SendMessageStream)
+			assistant.DELETE("/conversations/:conversationId", assistantH.DeleteConversation)
 		}
 
 		// 团队总览

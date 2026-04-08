@@ -37,7 +37,6 @@ type AITaskService struct {
 	projectService *ProjectService
 	ftService      *FaultTreeService
 	kgService      *KnowledgeGraphService
-	provider       ai.AIProvider // used for Chat only
 	progressHub    *TaskProgressHub
 	rdb            *redis.Client
 
@@ -109,7 +108,6 @@ func NewAITaskService(
 	projectService *ProjectService,
 	ftService *FaultTreeService,
 	kgService *KnowledgeGraphService,
-	provider ai.AIProvider,
 	progressHub *TaskProgressHub,
 	rdb *redis.Client,
 	queueStream string,
@@ -174,7 +172,6 @@ func NewAITaskService(
 		projectService:      projectService,
 		ftService:           ftService,
 		kgService:           kgService,
-		provider:            provider,
 		progressHub:         progressHub,
 		rdb:                 rdb,
 		queueStream:         strings.TrimSpace(queueStream),
@@ -904,39 +901,4 @@ func toIntOrFloat(v interface{}) interface{} {
 		}
 	}
 	return 0
-}
-
-// ChatInput is the service-layer input for AI chat.
-type ChatInput struct {
-	ContextData interface{}
-	GraphType   string
-	Message     string
-	Model       string
-}
-
-// Chat performs synchronous AI conversation about a graph.
-func (s *AITaskService) Chat(ctx context.Context, input ChatInput) (*ai.ChatResponse, error) {
-	return s.provider.Chat(ctx, ai.ChatRequest{
-		ContextData: input.ContextData,
-		GraphType:   input.GraphType,
-		Message:     input.Message,
-		Model:       input.Model,
-	})
-}
-
-// ChatStreamInput is the service-layer input for streaming AI chat.
-type ChatStreamInput struct {
-	ContextData interface{}
-	ContextType string // "faultTree" | "knowledgeGraph"
-	Message     string
-}
-
-// ChatStream streams AI replies token by token via onChunk.
-// Returns the total tokens consumed and the model name actually used.
-func (s *AITaskService) ChatStream(ctx context.Context, input ChatStreamInput, onChunk func(chunk string)) (tokensUsed int, modelUsed string, err error) {
-	return s.provider.ChatStream(ctx, ai.ChatRequest{
-		ContextData: input.ContextData,
-		GraphType:   input.ContextType,
-		Message:     input.Message,
-	}, onChunk)
 }
