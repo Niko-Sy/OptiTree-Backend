@@ -45,10 +45,6 @@ ai_task:
   callback_dedupe_ttl: 24h
   snapshot_ttl: 24h
 
-llm_server:
-  base_url: "http://localhost:8001"
-  timeout: 300s
-
 log:
   enabled: true
   dir: "./logs"   # daily log files: logs/app-YYYY-MM-DD.log

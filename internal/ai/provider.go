@@ -6,8 +6,6 @@ import "context"
 // Implementations use an OpenAI-compatible HTTP API so any endpoint
 // (Qwen, DeepSeek, OpenAI, Ollama, etc.) can be swapped via config without code changes.
 type AIProvider interface {
-	GenerateFaultTree(ctx context.Context, req GenerateFaultTreeRequest) (*FaultTreeResult, error)
-	GenerateKnowledgeGraph(ctx context.Context, req GenerateKnowledgeGraphRequest) (*KnowledgeGraphResult, error)
 	Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error)
 	// ChatStream streams the AI reply token by token via onChunk callbacks.
 	// Returns the total tokens consumed and the actual model name used.
@@ -24,25 +22,12 @@ type GenerateConfig struct {
 	EntityTypes []string
 }
 
-// GenerateFaultTreeRequest is the input to GenerateFaultTree.
-type GenerateFaultTreeRequest struct {
-	DocumentContents []string // raw text extracted from uploaded documents
-	TopEvent         string
-	Config           GenerateConfig
-}
-
 // FaultTreeResult is the structured AI output, compatible with the React Flow fault tree editor.
 type FaultTreeResult struct {
 	Nodes    []map[string]interface{} `json:"nodes"`
 	Edges    []map[string]interface{} `json:"edges"`
 	Accuracy float64                  `json:"accuracy"`
 	Summary  string                   `json:"summary"`
-}
-
-// GenerateKnowledgeGraphRequest is the input to GenerateKnowledgeGraph.
-type GenerateKnowledgeGraphRequest struct {
-	DocumentContents []string
-	Config           GenerateConfig
 }
 
 // KnowledgeGraphResult is the structured AI output, compatible with the React Flow knowledge graph editor.

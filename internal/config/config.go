@@ -16,7 +16,6 @@ type Config struct {
 	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
 	AI        AIConfig        `mapstructure:"ai"`
 	AITask    AITaskConfig    `mapstructure:"ai_task"`
-	LLMServer LLMServerConfig `mapstructure:"llm_server"`
 	Log       LogConfig       `mapstructure:"log"`
 }
 
@@ -55,12 +54,6 @@ type AITaskConfig struct {
 	ProjectLockTTL      time.Duration `mapstructure:"project_lock_ttl"`
 	CallbackDedupeTTL   time.Duration `mapstructure:"callback_dedupe_ttl"`
 	SnapshotTTL         time.Duration `mapstructure:"snapshot_ttl"`
-}
-
-// LLMServerConfig holds settings for the self-hosted FastAPI LLM generation service.
-type LLMServerConfig struct {
-	BaseURL string        `mapstructure:"base_url"`
-	Timeout time.Duration `mapstructure:"timeout"`
 }
 
 type ServerConfig struct {
