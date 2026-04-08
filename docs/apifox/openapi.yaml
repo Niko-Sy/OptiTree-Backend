@@ -558,6 +558,41 @@ paths:
                           project:
                             $ref: '#/components/schemas/Project'
 
+  /api/v1/projects/{projectId}/rename:
+    post:
+      tags: [Projects]
+      summary: Rename project (editor role required)
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  maxLength: 100
+            example:
+              name: Hydraulic analysis renamed
+      responses:
+        '200':
+          description: Renamed project
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          project:
+                            $ref: '#/components/schemas/Project'
+
   /api/v1/projects/{projectId}/delete:
     post:
       tags: [Projects]

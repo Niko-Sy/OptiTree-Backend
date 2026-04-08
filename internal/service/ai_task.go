@@ -369,6 +369,21 @@ func buildIdempotencyKey(
 	return util.SHA256(string(b))
 }
 
+func defaultFaultTreeGenerateConfig() ai.GenerateConfig {
+	return ai.GenerateConfig{
+		Quality:  "balanced",
+		Depth:    4,
+		MaxNodes: 30,
+	}
+}
+
+func defaultKnowledgeGraphGenerateConfig() ai.GenerateConfig {
+	return ai.GenerateConfig{
+		Quality:     "balanced",
+		EntityTypes: []string{},
+	}
+}
+
 func (s *AITaskService) enqueueTask(ctx context.Context, msg AITaskQueueMessage) error {
 	payload, err := json.Marshal(msg)
 	if err != nil {
@@ -421,7 +436,6 @@ func (s *AITaskService) enqueueFaultTreeProducerTask(ctx context.Context, msg AI
 type GenerateFaultTreeInput struct {
 	DocIDs    []string
 	TopEvent  string
-	Config    ai.GenerateConfig
 	ProjectID *string
 	UserID    string
 }
@@ -433,6 +447,7 @@ type GenerateFaultTreeOutput struct {
 }
 
 func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFaultTreeInput) (*GenerateFaultTreeOutput, error) {
+	cfg := defaultFaultTreeGenerateConfig()
 	project, err := s.resolveOrCreateProject(ctx, input.ProjectID, input.UserID, constant.ProjectTypeFT, input.TopEvent)
 	if err != nil {
 		return nil, err
@@ -441,12 +456,12 @@ func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFau
 		return nil, err
 	}
 
-	modelName := strings.TrimSpace(input.Config.Model)
+	modelName := strings.TrimSpace(cfg.Model)
 	if modelName == "" {
 		modelName = "default"
 	}
 	projectID := project.ID
-	idem := buildIdempotencyKey(constant.AITaskTypeGenerateFaultTree, input.UserID, &projectID, input.TopEvent, input.DocIDs, input.Config)
+	idem := buildIdempotencyKey(constant.AITaskTypeGenerateFaultTree, input.UserID, &projectID, input.TopEvent, input.DocIDs, cfg)
 	task, err := s.createTask(ctx, constant.AITaskTypeGenerateFaultTree, modelName, input.UserID, &projectID, idem)
 	if err != nil {
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
@@ -469,7 +484,7 @@ func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFau
 		TopEvent:  input.TopEvent,
 		DocIDs:    input.DocIDs,
 		Documents: documents,
-		Config:    input.Config,
+		Config:    cfg,
 		Attempt:   0,
 		TraceID:   task.ID,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
@@ -502,7 +517,6 @@ func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFau
 
 type GenerateKnowledgeGraphInput struct {
 	DocIDs    []string
-	Config    ai.GenerateConfig
 	ProjectID *string
 	UserID    string
 }
@@ -514,6 +528,7 @@ type GenerateKnowledgeGraphOutput struct {
 }
 
 func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input GenerateKnowledgeGraphInput) (*GenerateKnowledgeGraphOutput, error) {
+	cfg := defaultKnowledgeGraphGenerateConfig()
 	project, err := s.resolveOrCreateProject(ctx, input.ProjectID, input.UserID, constant.ProjectTypeKG, "")
 	if err != nil {
 		return nil, err
@@ -522,12 +537,12 @@ func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input Genera
 		return nil, err
 	}
 
-	modelName := strings.TrimSpace(input.Config.Model)
+	modelName := strings.TrimSpace(cfg.Model)
 	if modelName == "" {
 		modelName = "default"
 	}
 	projectID := project.ID
-	idem := buildIdempotencyKey(constant.AITaskTypeGenerateKnowledgeGraph, input.UserID, &projectID, "", input.DocIDs, input.Config)
+	idem := buildIdempotencyKey(constant.AITaskTypeGenerateKnowledgeGraph, input.UserID, &projectID, "", input.DocIDs, cfg)
 	task, err := s.createTask(ctx, constant.AITaskTypeGenerateKnowledgeGraph, modelName, input.UserID, &projectID, idem)
 	if err != nil {
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
@@ -549,7 +564,7 @@ func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input Genera
 		UserID:    input.UserID,
 		DocIDs:    input.DocIDs,
 		Documents: documents,
-		Config:    input.Config,
+		Config:    cfg,
 		Attempt:   0,
 		TraceID:   task.ID,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),

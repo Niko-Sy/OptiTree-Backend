@@ -100,6 +100,8 @@ func main() {
 	docRepo := repository.NewDocumentRepository(db)
 	aiConversationRepo := repository.NewAIConversationRepository(db)
 	aiChatMessageRepo := repository.NewAIChatMessageRepository(db)
+	notificationRepo := repository.NewNotificationRepository(db)
+	auditRepo := repository.NewAuditLogRepository(db)
 
 	// ---- 服务层 ----
 	storageSvc := service.NewStorageService(
@@ -155,7 +157,8 @@ func main() {
 		log.Fatal().Err(err).Msg("启动 AI 故障树调度器失败")
 	}
 	docSvc := service.NewDocumentService(docRepo, storageSvc)
-	memberSvc := service.NewMemberService(memberRepo, projectRepo, userRepo)
+	memberSvc := service.NewMemberService(db, memberRepo, projectRepo, userRepo, notificationRepo, auditRepo)
+	notificationSvc := service.NewNotificationService(notificationRepo)
 	teamSvc := service.NewTeamService(db)
 
 	// ---- 处理器 ----
@@ -171,6 +174,7 @@ func main() {
 	assistantH := handler.NewAssistantHandler(assistantSvc)
 	aiTaskWSH := handler.NewAITaskWSHandler(taskProgressHub, jwtManager, rdb, memberRepo)
 	memberH := handler.NewMemberHandler(memberSvc)
+	notificationH := handler.NewNotificationHandler(notificationSvc, memberSvc)
 	teamH := handler.NewTeamHandler(teamSvc)
 
 	// ---- 路由 ----
@@ -230,6 +234,7 @@ func main() {
 			users.POST("/me/update", userH.UpdateProfile)
 			users.POST("/me/avatar", userH.UploadAvatar)
 			users.GET("/me/login-logs", userH.GetLoginLogs)
+			users.GET("/me/invitations", memberH.ListMyInvitations)
 		}
 
 		// 仪表盘
@@ -244,6 +249,7 @@ func main() {
 			projects.POST("", projectH.Create)
 			projects.GET("/:projectId", projectH.GetByID)
 			projects.POST("/:projectId/update", projectH.Update)
+			projects.POST("/:projectId/rename", withEditorRole(memberRepo, projectH.Rename))
 			projects.POST("/:projectId/delete", withAdminRole(memberRepo, projectH.Delete))
 
 			// 版本
@@ -256,8 +262,22 @@ func main() {
 			// 成员管理
 			projects.GET("/:projectId/members", memberH.ListMembers)
 			projects.POST("/:projectId/members/invite", withAdminRole(memberRepo, memberH.InviteMember))
+			projects.GET("/:projectId/members/invite-candidate", withAdminRole(memberRepo, memberH.QueryInviteCandidate))
+			projects.GET("/:projectId/invitations", withAdminRole(memberRepo, memberH.ListInvitations))
+			projects.POST("/:projectId/invitations/:invitationId/accept", memberH.AcceptInvitation)
+			projects.POST("/:projectId/invitations/:invitationId/reject", memberH.RejectInvitation)
+			projects.POST("/:projectId/invitations/:invitationId/revoke", withAdminRole(memberRepo, memberH.RevokeInvitation))
 			projects.POST("/:projectId/members/:memberId/update", withAdminRole(memberRepo, memberH.UpdateRole))
 			projects.POST("/:projectId/members/:memberId/remove", withAdminRole(memberRepo, memberH.RemoveMember))
+		}
+
+		notifications := authed.Group("/notifications")
+		{
+			notifications.GET("", notificationH.List)
+			notifications.GET("/unread-count", notificationH.UnreadCount)
+			notifications.POST("/:notificationId/read", notificationH.MarkRead)
+			notifications.POST("/read-all", notificationH.MarkAllRead)
+			notifications.POST("/:notificationId/action", notificationH.Action)
 		}
 
 		// 故障树

@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"sort"
 	"time"
 
+	"optitree-backend/internal/constant"
 	"optitree-backend/internal/model"
 
 	"gorm.io/gorm"
@@ -220,9 +222,9 @@ func (s *TeamService) ListActivities(ctx context.Context, userID string, limit i
 		return nil, err
 	}
 
-	items := make([]ActivityItem, len(rows))
-	for i, r := range rows {
-		items[i] = ActivityItem{
+	items := make([]ActivityItem, 0, len(rows)+limit)
+	for _, r := range rows {
+		items = append(items, ActivityItem{
 			ID:          "activity_" + r.ID,
 			Type:        "version_created",
 			ProjectID:   r.ProjectID,
@@ -235,8 +237,76 @@ func (s *TeamService) ListActivities(ctx context.Context, userID string, limit i
 				DisplayName: r.DisplayName,
 			},
 			CreatedAt: r.CreatedAt,
-		}
+		})
 	}
+
+	type auditRow struct {
+		ID           string
+		Action       string
+		ProjectID    string
+		ProjectType  string
+		ProjectName  string
+		Summary      string
+		CreatedAt    time.Time
+		UserID       *string
+		OperatorName string
+	}
+
+	auditActions := []string{
+		constant.AuditActionMemberInvite,
+		constant.AuditActionMemberInviteAccepted,
+		constant.AuditActionMemberInviteRejected,
+		constant.AuditActionMemberInviteRevoke,
+		constant.AuditActionMemberRoleUpdate,
+		constant.AuditActionMemberRemove,
+	}
+
+	var auditRows []auditRow
+	err = s.db.WithContext(ctx).
+		Table("audit_logs al").
+		Select("al.id, al.action, al.project_id, p.type AS project_type, p.name AS project_name, al.summary, al.created_at, al.user_id, COALESCE(NULLIF(al.operator_name, ''), COALESCE(u.display_name, u.username, '系统')) AS operator_name").
+		Joins("LEFT JOIN projects p ON p.id = al.project_id").
+		Joins("LEFT JOIN users u ON u.id = al.user_id").
+		Where("al.project_id IN ?", projectIDs).
+		Where("al.action IN ?", auditActions).
+		Order("al.created_at DESC").
+		Limit(limit).
+		Scan(&auditRows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	for _, r := range auditRows {
+		opID := ""
+		if r.UserID != nil {
+			opID = *r.UserID
+		}
+		label := r.Summary
+		if label == "" {
+			label = r.Action
+		}
+		items = append(items, ActivityItem{
+			ID:          "activity_audit_" + r.ID,
+			Type:        r.Action,
+			ProjectID:   r.ProjectID,
+			ProjectType: r.ProjectType,
+			ProjectName: r.ProjectName,
+			Label:       label,
+			Operator: OperatorSummary{
+				ID:          opID,
+				DisplayName: r.OperatorName,
+			},
+			CreatedAt: r.CreatedAt,
+		})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].CreatedAt.After(items[j].CreatedAt)
+	})
+	if len(items) > limit {
+		items = items[:limit]
+	}
+
 	return items, nil
 }
 

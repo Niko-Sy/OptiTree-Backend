@@ -28,6 +28,7 @@ type Invitation struct {
 	InvitedBy string    `gorm:"column:invited_by;size:32;not null" json:"invitedBy"`
 	ExpiresAt time.Time `gorm:"column:expires_at;not null" json:"expiresAt"`
 	CreatedAt time.Time `gorm:"column:created_at;not null;autoCreateTime" json:"createdAt"`
+	UpdatedAt time.Time `gorm:"column:updated_at;not null;autoUpdateTime" json:"updatedAt"`
 }
 
 func (Invitation) TableName() string {

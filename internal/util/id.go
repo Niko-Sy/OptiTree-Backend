@@ -49,6 +49,16 @@ func NewInviteID() string {
 	return NewID("invite")
 }
 
+// NewNotificationID 生成通知 ID
+func NewNotificationID() string {
+	return NewID("notif")
+}
+
+// NewAuditLogID 生成审计日志 ID
+func NewAuditLogID() string {
+	return NewID("alog")
+}
+
 // NewConversationID 生成会话 ID
 func NewConversationID() string {
 	return NewID("conv")

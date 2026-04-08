@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"optitree-backend/internal/constant"
 	"optitree-backend/internal/model"
@@ -129,6 +130,10 @@ type UpdateProjectInput struct {
 	Tags        []string
 }
 
+type RenameProjectInput struct {
+	Name string
+}
+
 func (s *ProjectService) Update(ctx context.Context, id string, input UpdateProjectInput) (*model.Project, error) {
 	project, err := s.projectRepo.FindByID(id)
 	if err != nil {
@@ -142,6 +147,27 @@ func (s *ProjectService) Update(ctx context.Context, id string, input UpdateProj
 	project.Description = input.Description
 	project.Tags = pq.StringArray(input.Tags)
 
+	if err := s.projectRepo.Update(project); err != nil {
+		return nil, err
+	}
+	return project, nil
+}
+
+func (s *ProjectService) Rename(ctx context.Context, id string, input RenameProjectInput) (*model.Project, error) {
+	project, err := s.projectRepo.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+	if project == nil {
+		return nil, ErrProjectNotFound
+	}
+
+	name := strings.TrimSpace(input.Name)
+	if name == "" {
+		return nil, ErrProjectNameEmpty
+	}
+
+	project.Name = name
 	if err := s.projectRepo.Update(project); err != nil {
 		return nil, err
 	}

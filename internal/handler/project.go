@@ -84,6 +84,10 @@ type updateProjectRequest struct {
 	Tags        []string `json:"tags"`
 }
 
+type renameProjectRequest struct {
+	Name string `json:"name" binding:"required,max=100"`
+}
+
 func (h *ProjectHandler) Update(c *gin.Context) {
 	var req updateProjectRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -105,6 +109,32 @@ func (h *ProjectHandler) Update(c *gin.Context) {
 		}
 		return
 	}
+	util.Success(c, gin.H{"project": project})
+}
+
+func (h *ProjectHandler) Rename(c *gin.Context) {
+	var req renameProjectRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		util.FailWithErrors(c, constant.CodeInvalidParam, constant.MsgInvalidParam, err.Error())
+		return
+	}
+
+	projectID := c.Param("projectId")
+	project, err := h.projectService.Rename(c.Request.Context(), projectID, service.RenameProjectInput{
+		Name: req.Name,
+	})
+	if err != nil {
+		switch err {
+		case service.ErrProjectNotFound:
+			util.FailNotFound(c)
+		case service.ErrProjectNameEmpty:
+			util.Fail(c, constant.CodeInvalidParam, service.ErrProjectNameEmpty.Error())
+		default:
+			util.FailServerError(c)
+		}
+		return
+	}
+
 	util.Success(c, gin.H{"project": project})
 }
 

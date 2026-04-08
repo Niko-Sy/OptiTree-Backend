@@ -76,6 +76,26 @@ const (
 	InviteStatusExpired  = "expired"
 )
 
+// 通知类型
+const (
+	NotificationTypeProjectInvite     = "project_invite"
+	NotificationTypeMemberRoleChanged = "member_role_changed"
+	NotificationTypeVersionCreated    = "version_created"
+	NotificationTypeAITaskCompleted   = "ai_task_completed"
+	NotificationTypeAITaskFailed      = "ai_task_failed"
+	NotificationTypeSystemAnnounce    = "system_announce"
+)
+
+// 审计动作
+const (
+	AuditActionMemberInvite         = "member.invite"
+	AuditActionMemberInviteAccepted = "member.invite.accept"
+	AuditActionMemberInviteRejected = "member.invite.reject"
+	AuditActionMemberInviteRevoke   = "member.invite.revoke"
+	AuditActionMemberRoleUpdate     = "member.role.update"
+	AuditActionMemberRemove         = "member.remove"
+)
+
 // 成员状态
 const (
 	MemberStatusActive   = "active"

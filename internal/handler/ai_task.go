@@ -6,7 +6,6 @@ import (
 	"io"
 	"strings"
 
-	"optitree-backend/internal/ai"
 	"optitree-backend/internal/constant"
 	"optitree-backend/internal/middleware"
 	"optitree-backend/internal/service"
@@ -71,12 +70,6 @@ type generateFaultTreeRequest struct {
 	DocIDs    []string `json:"docIds" binding:"required,min=1"`
 	TopEvent  string   `json:"topEvent" binding:"required,max=60"`
 	ProjectID *string  `json:"projectId"`
-	Config    struct {
-		Quality  string `json:"quality"`
-		Model    string `json:"model"`
-		Depth    int    `json:"depth"`
-		MaxNodes int    `json:"maxNodes"`
-	} `json:"config"`
 }
 
 // GenerateFaultTree handles POST /ai/fault-trees/generate.
@@ -93,13 +86,7 @@ func (h *AITaskHandler) GenerateFaultTree(c *gin.Context) {
 		DocIDs:    req.DocIDs,
 		TopEvent:  req.TopEvent,
 		ProjectID: req.ProjectID,
-		Config: ai.GenerateConfig{
-			Quality:  req.Config.Quality,
-			Model:    req.Config.Model,
-			Depth:    req.Config.Depth,
-			MaxNodes: req.Config.MaxNodes,
-		},
-		UserID: userID,
+		UserID:    userID,
 	})
 	if err != nil {
 		switch {
@@ -121,11 +108,6 @@ func (h *AITaskHandler) GenerateFaultTree(c *gin.Context) {
 type generateKGRequest struct {
 	DocIDs    []string `json:"docIds" binding:"required,min=1"`
 	ProjectID *string  `json:"projectId"`
-	Config    struct {
-		Quality     string   `json:"quality"`
-		Model       string   `json:"model"`
-		EntityTypes []string `json:"entityTypes"`
-	} `json:"config"`
 }
 
 // GenerateKnowledgeGraph handles POST /ai/knowledge-graphs/generate.
@@ -140,12 +122,7 @@ func (h *AITaskHandler) GenerateKnowledgeGraph(c *gin.Context) {
 	out, err := h.aiTaskService.GenerateKnowledgeGraph(c.Request.Context(), service.GenerateKnowledgeGraphInput{
 		DocIDs:    req.DocIDs,
 		ProjectID: req.ProjectID,
-		Config: ai.GenerateConfig{
-			Quality:     req.Config.Quality,
-			Model:       req.Config.Model,
-			EntityTypes: req.Config.EntityTypes,
-		},
-		UserID: userID,
+		UserID:    userID,
 	})
 	if err != nil {
 		switch {
