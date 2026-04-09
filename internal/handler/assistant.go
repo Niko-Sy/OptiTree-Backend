@@ -1,12 +1,15 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"optitree-backend/internal/constant"
 	"optitree-backend/internal/middleware"
@@ -19,6 +22,8 @@ import (
 type AssistantHandler struct {
 	assistantService *service.AssistantService
 }
+
+const assistantStreamHeartbeatInterval = 10 * time.Second
 
 func NewAssistantHandler(assistantService *service.AssistantService) *AssistantHandler {
 	return &AssistantHandler{assistantService: assistantService}
@@ -153,14 +158,62 @@ func (h *AssistantHandler) SendMessageStream(c *gin.Context) {
 	c.Header("X-Accel-Buffering", "no")
 	c.Header("Transfer-Encoding", "chunked")
 
-	writeEvent := func(payload map[string]interface{}) {
+	streamCtx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
+
+	var mu sync.Mutex
+	closed := false
+
+	writeEvent := func(payload map[string]interface{}) bool {
 		b, _ := json.Marshal(payload)
-		fmt.Fprintf(c.Writer, "data: %s\n\n", b)
+		mu.Lock()
+		defer mu.Unlock()
+		if closed {
+			return false
+		}
+		if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", b); err != nil {
+			closed = true
+			cancel()
+			return false
+		}
 		flusher.Flush()
+		return true
 	}
 
+	if !writeEvent(map[string]interface{}{
+		"type":           "started",
+		"conversationId": c.Param("conversationId"),
+	}) {
+		return
+	}
+
+	heartbeatStop := make(chan struct{})
+	var heartbeatWG sync.WaitGroup
+	heartbeatWG.Add(1)
+	go func() {
+		defer heartbeatWG.Done()
+		ticker := time.NewTicker(assistantStreamHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !writeEvent(map[string]interface{}{"type": "heartbeat"}) {
+					return
+				}
+			case <-streamCtx.Done():
+				return
+			case <-heartbeatStop:
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(heartbeatStop)
+		heartbeatWG.Wait()
+	}()
+
 	out, err := h.assistantService.SendMessageStream(
-		c.Request.Context(),
+		streamCtx,
 		service.SendMessageInput{
 			ConversationID: c.Param("conversationId"),
 			UserID:         middleware.GetUserID(c),
@@ -168,20 +221,33 @@ func (h *AssistantHandler) SendMessageStream(c *gin.Context) {
 			Model:          req.Model,
 		},
 		func(chunk string) {
-			writeEvent(map[string]interface{}{"type": "content", "content": chunk})
+			_ = writeEvent(map[string]interface{}{"type": "content", "content": chunk})
 		},
 	)
 	if err != nil {
 		if out != nil && out.AssistantMessageID != "" {
-			writeEvent(map[string]interface{}{
+			_ = writeEvent(map[string]interface{}{
 				"type":               "partial",
 				"assistantMessageId": out.AssistantMessageID,
 				"tokensUsed":         out.TokensUsed,
 				"modelId":            out.ModelUsed,
 				"isPartial":          out.IsPartial,
 			})
+			// Partial text has been persisted; finish stream with done to avoid client auto-retry loops on generic error events.
+			_ = writeEvent(map[string]interface{}{
+				"type":               "done",
+				"conversationId":     out.ConversationID,
+				"userMessageId":      out.UserMessageID,
+				"assistantMessageId": out.AssistantMessageID,
+				"tokensUsed":         out.TokensUsed,
+				"modelId":            out.ModelUsed,
+				"isPartial":          true,
+				"errorCode":          mapErrorCode(err, true),
+				"errorMessage":       err.Error(),
+			})
+			return
 		}
-		writeEvent(map[string]interface{}{
+		_ = writeEvent(map[string]interface{}{
 			"type":    "error",
 			"code":    mapErrorCode(err, true),
 			"message": err.Error(),
@@ -189,7 +255,7 @@ func (h *AssistantHandler) SendMessageStream(c *gin.Context) {
 		return
 	}
 
-	writeEvent(map[string]interface{}{
+	_ = writeEvent(map[string]interface{}{
 		"type":               "done",
 		"conversationId":     out.ConversationID,
 		"userMessageId":      out.UserMessageID,

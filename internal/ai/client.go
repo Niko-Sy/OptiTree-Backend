@@ -8,8 +8,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
+)
+
+const (
+	contextChunkNodeThreshold = 400
+	contextChunkSize          = 400
+	maxHistoryMessages        = 20
 )
 
 // Client implements AIProvider using an OpenAI-compatible chat completions API.
@@ -172,20 +179,30 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		graphTypeName = "knowledge graph"
 	}
 
-	contextSummary := buildContextSummary(req.ContextData, req.GraphType)
+	fullContextJSON, contextMode := buildFullContextJSON(req.ContextData, req.GraphType)
+	schemaHint := graphSchemaHint(req.GraphType)
 
 	sys := fmt.Sprintf(`You are an expert AI assistant helping users analyze and improve %s diagrams.
+You may receive prior conversation history and optional graph context payload.
+If graph context payload is provided, it is complete for this turn; use it as the primary source of structural truth.
+If contextMode is "chunked", reconstruct the full graph by combining all chunks and crossChunkEdges before reasoning.
+If contextMode is "chunked", first scan summaryHeader for quick orientation, then verify details in chunks and crossChunkEdges.
+First build an internal structural understanding of the graph, then answer the user question.
+When relevant, explain key node/edge relationships and logic paths that support your conclusion.
+If data is missing for a precise answer, clearly state what is missing and provide the best actionable next step.
 Be concise and helpful. Respond in the same language the user uses.
 Output ONLY valid JSON (no markdown, no extra text):
 {"reply":"<your answer>","suggestions":["<optional short suggestion>"]}
 Use an empty array for suggestions if none are needed.
 /no_think`, graphTypeName)
 
-	usr := fmt.Sprintf("%s\nUser question: %s", contextSummary, req.Message)
-	raw, err := c.complete(ctx, c.chatModelFor(req.Model), []oaiMsg{
-		{Role: "system", Content: sys},
-		{Role: "user", Content: usr},
-	})
+	usr := buildUserPrompt(req.GraphType, schemaHint, contextMode, fullContextJSON, req.Message)
+
+	messages := []oaiMsg{{Role: "system", Content: sys}}
+	messages = append(messages, historyToOAIMessages(req.History)...)
+	messages = append(messages, oaiMsg{Role: "user", Content: usr})
+
+	raw, err := c.complete(ctx, c.chatModelFor(req.Model), messages)
 	if err != nil {
 		return nil, err
 	}
@@ -271,7 +288,8 @@ func (c *Client) completeStream(ctx context.Context, model string, messages []oa
 	inThink := false
 
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 128*1024), 128*1024)
+	// Raise max token buffer to reduce scanner interruptions on large provider deltas.
+	scanner.Buffer(make([]byte, 256*1024), 1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -337,270 +355,402 @@ func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onChunk func(c
 		graphTypeName = "knowledge graph"
 	}
 
-	contextSummary := buildContextSummary(req.ContextData, req.GraphType)
+	fullContextJSON, contextMode := buildFullContextJSON(req.ContextData, req.GraphType)
+	schemaHint := graphSchemaHint(req.GraphType)
 
 	sys := fmt.Sprintf(`You are an expert AI assistant helping users analyze and improve %s diagrams.
+You may receive prior conversation history and optional graph context payload.
+If graph context payload is provided, it is complete for this turn; use it as the primary source of structural truth.
+If contextMode is "chunked", reconstruct the full graph by combining all chunks and crossChunkEdges before reasoning.
+If contextMode is "chunked", first scan summaryHeader for quick orientation, then verify details in chunks and crossChunkEdges.
+First build an internal structural understanding of the graph, then answer the user question.
+When relevant, explain key node/edge relationships and logic paths that support your conclusion.
+If data is missing for a precise answer, clearly state what is missing and provide the best actionable next step.
 Be concise, accurate, and helpful. Respond in the same language the user uses.
 Respond in plain natural language — do NOT wrap your answer in JSON.
 /no_think`, graphTypeName) //你是一位专家级 AI 助手，帮助用户分析和改进 %s 图表。请保持回答简洁、准确且有帮助。请使用与用户相同的语言进行回复。请用自然的纯文本回复——不要将答案包裹在 JSON 格式中。
 
-	usr := fmt.Sprintf("%s\nUser question: %s", contextSummary, req.Message)
+	usr := buildUserPrompt(req.GraphType, schemaHint, contextMode, fullContextJSON, req.Message)
+
+	messages := []oaiMsg{{Role: "system", Content: sys}}
+	messages = append(messages, historyToOAIMessages(req.History)...)
+	messages = append(messages, oaiMsg{Role: "user", Content: usr})
 
 	modelUsed = c.chatModelFor(req.Model)
-	tokensUsed, err = c.completeStream(ctx, modelUsed, []oaiMsg{
-		{Role: "system", Content: sys},
-		{Role: "user", Content: usr},
-	}, onChunk)
+	tokensUsed, err = c.completeStream(ctx, modelUsed, messages, onChunk)
 	return
 }
 
-// ─── Context summary builders ─────────────────────────────────────────────────
+func buildFullContextJSON(contextData interface{}, graphType string) (string, string) {
+	if contextData == nil {
+		return "null", "none"
+	}
 
-// buildContextSummary converts raw graph context (nodes/edges) into a structured
-// natural-language description so the LLM receives compact, readable input instead
-// of a large raw JSON blob.
-func buildContextSummary(contextData interface{}, graphType string) string {
+	chunkedPayload, ok := buildChunkedGraphPayload(contextData, graphType)
+	if ok {
+		encoded, err := json.Marshal(chunkedPayload)
+		if err == nil {
+			return string(encoded), "chunked"
+		}
+	}
+
 	raw, err := json.Marshal(contextData)
-	if err != nil || contextData == nil {
-		return "(no graph context provided)\n"
+	if err != nil {
+		return fmt.Sprintf("{\"contextEncodeError\":%q}", err.Error()), "error"
 	}
+	return string(raw), "full"
+}
 
-	// Decode into a loose struct to support both snake_case and camelCase field names.
-	var ctx struct {
-		Nodes   interface{} `json:"nodes"`
-		Edges   interface{} `json:"edges"`
-		RfNodes interface{} `json:"rfNodes"`
-		RfEdges interface{} `json:"rfEdges"`
-	}
-	if err := json.Unmarshal(raw, &ctx); err != nil {
-		return "(unable to parse graph context)\n"
-	}
-
-	nodes := toMapSlice(ctx.Nodes)
-	edges := toMapSlice(ctx.Edges)
-	// Knowledge graphs may use rfNodes/rfEdges instead of nodes/edges.
-	if len(nodes) == 0 {
-		nodes = toMapSlice(ctx.RfNodes)
-	}
-	if len(edges) == 0 {
-		edges = toMapSlice(ctx.RfEdges)
-	}
-
+func graphSchemaHint(graphType string) string {
 	if graphType == "knowledgeGraph" {
-		return buildKGSummary(nodes, edges)
+		return "- nodes/rfNodes: knowledge graph entities.\\n- edges/rfEdges: directed relations between entities, relation label may appear on edge.label or edge.data.label.\\n- Use entity and relation structure as primary evidence for answers."
 	}
-	return buildFaultTreeSummary(nodes, edges)
+	return "- nodes: fault tree nodes (top/mid/basic/gate). Key fields may appear as type/name/label/data.nodeType/data.label/probability.\\n- edges: fault-tree logical connections, source/target may appear as source-target or from-to forms.\\n- Use topology and logic-gate paths as primary evidence for answers."
 }
 
-func buildFaultTreeSummary(nodes []map[string]interface{}, edges []map[string]interface{}) string {
-	var sb strings.Builder
-	sb.WriteString("[故障树上下文]\n")
-	sb.WriteString(fmt.Sprintf("- 节点总数：%d，边总数：%d\n", len(nodes), len(edges)))
+func buildUserPrompt(graphType, schemaHint, contextMode, contextPayload, question string) string {
+	if contextMode == "none" {
+		return fmt.Sprintf("Graph type: %s\nSchema notes:\n%s\nGraph context for this turn: omitted to save tokens; rely on conversation history from previous turns.\nUser question: %s", graphType, schemaHint, question)
+	}
+	return fmt.Sprintf("Graph type: %s\nSchema notes:\n%s\nContext mode: %s\nGraph context payload:\n%s\nUser question: %s", graphType, schemaHint, contextMode, contextPayload, question)
+}
 
-	// Build the set of connected node IDs for isolated-node detection.
-	connected := make(map[string]bool, len(edges)*2)
+func historyToOAIMessages(history []ChatHistoryMessage) []oaiMsg {
+	if len(history) == 0 {
+		return []oaiMsg{}
+	}
+
+	if len(history) > maxHistoryMessages {
+		history = history[len(history)-maxHistoryMessages:]
+	}
+
+	messages := make([]oaiMsg, 0, len(history))
+	for _, h := range history {
+		role := strings.ToLower(strings.TrimSpace(h.Role))
+		if role != "user" && role != "assistant" {
+			continue
+		}
+		content := strings.TrimSpace(h.Content)
+		if content == "" {
+			continue
+		}
+		messages = append(messages, oaiMsg{Role: role, Content: content})
+	}
+	return messages
+}
+
+func buildChunkedGraphPayload(contextData interface{}, graphType string) (map[string]interface{}, bool) {
+	raw, err := json.Marshal(contextData)
+	if err != nil {
+		return nil, false
+	}
+
+	var obj map[string]interface{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, false
+	}
+
+	nodesField, edgesField, nodes, edges, ok := extractGraphArrays(obj, graphType)
+	if !ok || len(nodes) <= contextChunkNodeThreshold {
+		return nil, false
+	}
+
+	chunkCount := (len(nodes) + contextChunkSize - 1) / contextChunkSize
+	chunkNodes := make([][]map[string]interface{}, chunkCount)
+	chunkEdges := make([][]map[string]interface{}, chunkCount)
+	nodeChunkIndex := make(map[string]int, len(nodes))
+
+	for i, n := range nodes {
+		chunk := (i / contextChunkSize) + 1
+		chunkNodes[chunk-1] = append(chunkNodes[chunk-1], n)
+		if id := nodeID(n); id != "" {
+			nodeChunkIndex[id] = chunk
+		}
+	}
+
+	crossChunkEdges := make([]map[string]interface{}, 0)
 	for _, e := range edges {
-		if src := edgeSrc(e); src != "" {
-			connected[src] = true
+		srcChunk := nodeChunkIndex[edgeSourceID(e)]
+		tgtChunk := nodeChunkIndex[edgeTargetID(e)]
+		if srcChunk > 0 && tgtChunk > 0 && srcChunk == tgtChunk {
+			chunkEdges[srcChunk-1] = append(chunkEdges[srcChunk-1], e)
+			continue
 		}
-		if tgt := edgeTgt(e); tgt != "" {
-			connected[tgt] = true
-		}
+		ec := cloneMap(e)
+		ec["sourceChunk"] = srcChunk
+		ec["targetChunk"] = tgtChunk
+		crossChunkEdges = append(crossChunkEdges, ec)
 	}
 
-	var topEventLabel string
-	var orGates, andGates, notGates []string
-
-	type basicEvt struct {
-		label   string
-		prob    float64
-		hasProb bool
+	chunks := make([]map[string]interface{}, 0, chunkCount)
+	for i := 0; i < chunkCount; i++ {
+		start := i * contextChunkSize
+		end := start + len(chunkNodes[i])
+		chunks = append(chunks, map[string]interface{}{
+			"index":          i + 1,
+			"nodeStart":      start,
+			"nodeEnd":        end,
+			"nodeCount":      len(chunkNodes[i]),
+			"edgeCount":      len(chunkEdges[i]),
+			"nodes":          chunkNodes[i],
+			"edges":          chunkEdges[i],
+			"nodeIdRangeRef": fmt.Sprintf("nodes[%d:%d]", start, end),
+		})
 	}
-	var basicEvents []basicEvt
-	var midEvents []string
-	var isolated []string
 
+	summaryHeader := buildChunkSummaryHeader(graphType, nodes, edges, chunkNodes, chunkEdges, crossChunkEdges)
+
+	return map[string]interface{}{
+		"contextMode":         "chunked",
+		"graphType":           graphType,
+		"chunkSize":           contextChunkSize,
+		"nodeCount":           len(nodes),
+		"edgeCount":           len(edges),
+		"chunkCount":          chunkCount,
+		"nodesField":          nodesField,
+		"edgesField":          edgesField,
+		"summaryHeader":       summaryHeader,
+		"chunks":              chunks,
+		"crossChunkEdges":     crossChunkEdges,
+		"reconstructionHint":  "Reconstruct full graph by merging all chunks.nodes/chunks.edges and then adding crossChunkEdges.",
+		"indexingDescription": "chunk.index is 1-based. sourceChunk/targetChunk indicate cross-chunk edge endpoints.",
+	}, true
+}
+
+func buildChunkSummaryHeader(
+	graphType string,
+	nodes []map[string]interface{},
+	edges []map[string]interface{},
+	chunkNodes [][]map[string]interface{},
+	chunkEdges [][]map[string]interface{},
+	crossChunkEdges []map[string]interface{},
+) map[string]interface{} {
+	nodeTypeCounts := make(map[string]int)
+	nodeIDs := make(map[string]struct{}, len(nodes))
 	for _, n := range nodes {
-		id := getStr(n, "id")
-		nType := getStr(n, "type")
-		data := getMap(n, "data")
-		label := nType
-		nodeType := nType
-		if data != nil {
-			if l := getStr(data, "label"); l != "" {
-				label = l
-			}
-			if nt := getStr(data, "nodeType"); nt != "" {
-				nodeType = nt
-			}
+		if id := nodeID(n); id != "" {
+			nodeIDs[id] = struct{}{}
 		}
-		lnType := strings.ToLower(nodeType)
+		t := normalizeNodeCategory(graphType, n)
+		nodeTypeCounts[t]++
+	}
 
-		switch {
-		case lnType == "topevent":
-			topEventLabel = label
-		case lnType == "orgate":
-			orGates = append(orGates, id)
-		case lnType == "andgate":
-			andGates = append(andGates, id)
-		case lnType == "notgate":
-			notGates = append(notGates, id)
-		case lnType == "basicevent":
-			be := basicEvt{label: label}
-			if data != nil {
-				if p, ok := getFloat(data, "probability"); ok {
-					be.prob = p
-					be.hasProb = true
-				}
-			}
-			basicEvents = append(basicEvents, be)
-		case lnType == "intermediateevent" || lnType == "midevent":
-			midEvents = append(midEvents, label)
+	inDegree := make(map[string]int)
+	outDegree := make(map[string]int)
+	for _, e := range edges {
+		src := edgeSourceID(e)
+		tgt := edgeTargetID(e)
+		if src != "" {
+			outDegree[src]++
 		}
-
-		if len(edges) > 0 && !connected[id] {
-			isolated = append(isolated, id)
+		if tgt != "" {
+			inDegree[tgt]++
 		}
 	}
 
-	if topEventLabel != "" {
-		sb.WriteString(fmt.Sprintf("- 顶事件：\"%s\"\n", topEventLabel))
-	}
-
-	var gateDesc []string
-	if len(orGates) > 0 {
-		gateDesc = append(gateDesc, fmt.Sprintf("OR门×%d(%s)", len(orGates), strings.Join(orGates, ", ")))
-	}
-	if len(andGates) > 0 {
-		gateDesc = append(gateDesc, fmt.Sprintf("AND门×%d(%s)", len(andGates), strings.Join(andGates, ", ")))
-	}
-	if len(notGates) > 0 {
-		gateDesc = append(gateDesc, fmt.Sprintf("NOT门×%d(%s)", len(notGates), strings.Join(notGates, ", ")))
-	}
-	if len(gateDesc) > 0 {
-		sb.WriteString(fmt.Sprintf("- 逻辑门列表：%s\n", strings.Join(gateDesc, "，")))
-	}
-
-	if len(basicEvents) > 0 {
-		sb.WriteString("- 基本事件（附概率）：\n")
-		for _, be := range basicEvents {
-			if be.hasProb {
-				sb.WriteString(fmt.Sprintf("    %s（%.3f）\n", be.label, be.prob))
-			} else {
-				sb.WriteString(fmt.Sprintf("    %s\n", be.label))
-			}
+	isolated := 0
+	roots := 0
+	leaves := 0
+	for id := range nodeIDs {
+		in := inDegree[id]
+		out := outDegree[id]
+		if in == 0 && out == 0 {
+			isolated++
+		}
+		if in == 0 {
+			roots++
+		}
+		if out == 0 {
+			leaves++
 		}
 	}
 
-	if len(midEvents) > 0 {
-		sb.WriteString(fmt.Sprintf("- 中间事件：%s\n", strings.Join(midEvents, "、")))
+	chunkNodeCounts := make([]int, 0, len(chunkNodes))
+	chunkEdgeCounts := make([]int, 0, len(chunkEdges))
+	for i := 0; i < len(chunkNodes); i++ {
+		chunkNodeCounts = append(chunkNodeCounts, len(chunkNodes[i]))
+		chunkEdgeCounts = append(chunkEdgeCounts, len(chunkEdges[i]))
 	}
 
-	if len(isolated) > 0 {
-		sb.WriteString(fmt.Sprintf("- 孤立节点（无连接）：%s\n", strings.Join(isolated, "、")))
+	return map[string]interface{}{
+		"version":             1,
+		"purpose":             "quick orientation only; full reasoning must still use chunks and crossChunkEdges",
+		"nodeCount":           len(nodes),
+		"edgeCount":           len(edges),
+		"crossChunkEdgeCount": len(crossChunkEdges),
+		"chunkCount":          len(chunkNodes),
+		"chunkNodeCounts":     chunkNodeCounts,
+		"chunkEdgeCounts":     chunkEdgeCounts,
+		"nodeTypeTop":         topCountEntries(nodeTypeCounts, 10),
+		"topology": map[string]interface{}{
+			"rootLikeNodes":    roots,
+			"leafLikeNodes":    leaves,
+			"isolatedNodes":    isolated,
+			"estimatedDensity": estimateDensity(len(nodes), len(edges)),
+		},
 	}
-
-	return sb.String()
 }
 
-func buildKGSummary(nodes []map[string]interface{}, edges []map[string]interface{}) string {
-	var sb strings.Builder
-	sb.WriteString("[知识图谱上下文]\n")
-	sb.WriteString(fmt.Sprintf("- 实体总数：%d，关系总数：%d\n", len(nodes), len(edges)))
-
-	// Build id→label map for edge descriptions.
-	idToLabel := make(map[string]string, len(nodes))
-
-	maxNodes := 20
-	if len(nodes) < maxNodes {
-		maxNodes = len(nodes)
-	}
-	if maxNodes > 0 {
-		sb.WriteString("- 实体列表（最多20个）：\n")
-		for _, n := range nodes[:maxNodes] {
-			id := getStr(n, "id")
-			data := getMap(n, "data")
-			label := getStr(n, "label")
-			entityType := ""
-			if data != nil {
-				if l := getStr(data, "label"); l != "" {
-					label = l
-				}
-				entityType = getStr(data, "entityType")
-			}
-			idToLabel[id] = label
-			if entityType != "" {
-				sb.WriteString(fmt.Sprintf("    %s [%s]\n", label, entityType))
-			} else {
-				sb.WriteString(fmt.Sprintf("    %s\n", label))
+func normalizeNodeCategory(graphType string, node map[string]interface{}) string {
+	if graphType == "knowledgeGraph" {
+		if data, ok := node["data"].(map[string]interface{}); ok {
+			if s := mapString(data, "entityType"); s != "" {
+				return strings.ToLower(s)
 			}
 		}
+		if s := mapString(node, "entityType"); s != "" {
+			return strings.ToLower(s)
+		}
+		if s := mapString(node, "type"); s != "" {
+			return strings.ToLower(s)
+		}
+		return "unknown"
 	}
 
-	maxEdges := 15
-	if len(edges) < maxEdges {
-		maxEdges = len(edges)
-	}
-	if maxEdges > 0 {
-		sb.WriteString("- 关系列表（最多15条）：\n")
-		for _, e := range edges[:maxEdges] {
-			src := edgeSrc(e)
-			tgt := edgeTgt(e)
-			relLabel := getStr(e, "label")
-			if relLabel == "" {
-				if data := getMap(e, "data"); data != nil {
-					relLabel = getStr(data, "label")
-				}
-			}
-			srcLabel := idToLabel[src]
-			if srcLabel == "" {
-				srcLabel = src
-			}
-			tgtLabel := idToLabel[tgt]
-			if tgtLabel == "" {
-				tgtLabel = tgt
-			}
-			if relLabel != "" {
-				sb.WriteString(fmt.Sprintf("    %s -[%s]-> %s\n", srcLabel, relLabel, tgtLabel))
-			} else {
-				sb.WriteString(fmt.Sprintf("    %s --> %s\n", srcLabel, tgtLabel))
-			}
+	if data, ok := node["data"].(map[string]interface{}); ok {
+		if s := mapString(data, "nodeType"); s != "" {
+			return strings.ToLower(s)
 		}
 	}
-
-	return sb.String()
+	if s := mapString(node, "type"); s != "" {
+		return strings.ToLower(s)
+	}
+	if s := mapString(node, "gateType"); s != "" {
+		return "gate:" + strings.ToLower(s)
+	}
+	return "unknown"
 }
 
-// ─── Small map helpers ────────────────────────────────────────────────────────
+func mapString(m map[string]interface{}, key string) string {
+	v, ok := m[key]
+	if !ok {
+		return ""
+	}
+	s, _ := v.(string)
+	return strings.TrimSpace(s)
+}
 
-func getStr(m map[string]interface{}, key string) string {
-	if v, ok := m[key]; ok {
+func topCountEntries(counts map[string]int, limit int) []map[string]interface{} {
+	type kv struct {
+		Key   string
+		Count int
+	}
+	items := make([]kv, 0, len(counts))
+	for k, c := range counts {
+		items = append(items, kv{Key: k, Count: c})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Count == items[j].Count {
+			return items[i].Key < items[j].Key
+		}
+		return items[i].Count > items[j].Count
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	out := make([]map[string]interface{}, 0, len(items))
+	for _, it := range items {
+		out = append(out, map[string]interface{}{"type": it.Key, "count": it.Count})
+	}
+	return out
+}
+
+func estimateDensity(nodeCount, edgeCount int) float64 {
+	if nodeCount <= 1 {
+		return 0
+	}
+	denominator := float64(nodeCount * (nodeCount - 1))
+	if denominator == 0 {
+		return 0
+	}
+	value := float64(edgeCount) / denominator
+	if value < 0 {
+		return 0
+	}
+	if value > 1 {
+		return 1
+	}
+	return value
+}
+
+func extractGraphArrays(obj map[string]interface{}, graphType string) (string, string, []map[string]interface{}, []map[string]interface{}, bool) {
+	nodesCandidates := []string{"nodes", "rfNodes"}
+	edgesCandidates := []string{"edges", "rfEdges"}
+	if graphType == "knowledgeGraph" {
+		nodesCandidates = []string{"rfNodes", "nodes"}
+		edgesCandidates = []string{"rfEdges", "edges"}
+	}
+
+	var nodesField string
+	var nodes []map[string]interface{}
+	for _, key := range nodesCandidates {
+		nodes = toMapSlice(obj[key])
+		if len(nodes) > 0 {
+			nodesField = key
+			break
+		}
+	}
+	if nodesField == "" {
+		if arr, ok := obj[nodesCandidates[0]].([]interface{}); ok && len(arr) == 0 {
+			nodesField = nodesCandidates[0]
+			nodes = []map[string]interface{}{}
+		}
+	}
+
+	var edgesField string
+	var edges []map[string]interface{}
+	for _, key := range edgesCandidates {
+		edges = toMapSlice(obj[key])
+		if len(edges) > 0 {
+			edgesField = key
+			break
+		}
+	}
+	if edgesField == "" {
+		if arr, ok := obj[edgesCandidates[0]].([]interface{}); ok && len(arr) == 0 {
+			edgesField = edgesCandidates[0]
+			edges = []map[string]interface{}{}
+		}
+	}
+
+	if nodesField == "" || edgesField == "" {
+		return "", "", nil, nil, false
+	}
+	return nodesField, edgesField, nodes, edges, true
+}
+
+func nodeID(node map[string]interface{}) string {
+	if v, ok := node["id"]; ok {
 		s, _ := v.(string)
-		return s
+		return strings.TrimSpace(s)
 	}
 	return ""
 }
 
-func getMap(m map[string]interface{}, key string) map[string]interface{} {
-	if v, ok := m[key]; ok {
-		sub, _ := v.(map[string]interface{})
-		return sub
+func edgeSourceID(edge map[string]interface{}) string {
+	for _, key := range []string{"source", "from", "fromNodeId", "from_node_id"} {
+		if v, ok := edge[key]; ok {
+			s, _ := v.(string)
+			s = strings.TrimSpace(s)
+			if s != "" {
+				return s
+			}
+		}
 	}
-	return nil
+	return ""
 }
 
-func getFloat(m map[string]interface{}, key string) (float64, bool) {
-	v, ok := m[key]
-	if !ok {
-		return 0, false
+func edgeTargetID(edge map[string]interface{}) string {
+	for _, key := range []string{"target", "to", "toNodeId", "to_node_id"} {
+		if v, ok := edge[key]; ok {
+			s, _ := v.(string)
+			s = strings.TrimSpace(s)
+			if s != "" {
+				return s
+			}
+		}
 	}
-	switch f := v.(type) {
-	case float64:
-		return f, true
-	case float32:
-		return float64(f), true
-	}
-	return 0, false
+	return ""
 }
 
 func toMapSlice(v interface{}) []map[string]interface{} {
@@ -608,25 +758,19 @@ func toMapSlice(v interface{}) []map[string]interface{} {
 	if !ok {
 		return nil
 	}
-	result := make([]map[string]interface{}, 0, len(arr))
+	out := make([]map[string]interface{}, 0, len(arr))
 	for _, item := range arr {
 		if m, ok := item.(map[string]interface{}); ok {
-			result = append(result, m)
+			out = append(out, m)
 		}
 	}
-	return result
+	return out
 }
 
-func edgeSrc(e map[string]interface{}) string {
-	if s := getStr(e, "source"); s != "" {
-		return s
+func cloneMap(in map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(in)+2)
+	for k, v := range in {
+		out[k] = v
 	}
-	return getStr(e, "from")
-}
-
-func edgeTgt(e map[string]interface{}) string {
-	if t := getStr(e, "target"); t != "" {
-		return t
-	}
-	return getStr(e, "to")
+	return out
 }

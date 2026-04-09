@@ -19,6 +19,7 @@ import (
 const (
 	AssistantConversationTypeFaultTree      = "faultTree"
 	AssistantConversationTypeKnowledgeGraph = "knowledgeGraph"
+	assistantHistoryLimit                   = 20
 )
 
 var (
@@ -214,9 +215,17 @@ func (s *AssistantService) SendMessage(ctx context.Context, input SendMessageInp
 		return nil, ErrAssistantMessageEmpty
 	}
 
-	contextData, err := s.loadConversationContext(ctx, conversation)
+	historyMessages, err := s.messageRepo.ListRecentByConversation(conversation.ID, assistantHistoryLimit)
 	if err != nil {
 		return nil, err
+	}
+
+	var contextData interface{}
+	if conversation.MessageCount == 0 || len(historyMessages) == 0 {
+		contextData, err = s.loadConversationContext(ctx, conversation)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	userMessage := &model.AIChatMessage{
@@ -238,6 +247,7 @@ func (s *AssistantService) SendMessage(ctx context.Context, input SendMessageInp
 		GraphType:   conversation.Type,
 		Message:     messageText,
 		Model:       strings.TrimSpace(input.Model),
+		History:     toChatHistory(historyMessages),
 	})
 	if err != nil {
 		return nil, err
@@ -298,9 +308,17 @@ func (s *AssistantService) SendMessageStream(ctx context.Context, input SendMess
 		onChunk = func(string) {}
 	}
 
-	contextData, err := s.loadConversationContext(ctx, conversation)
+	historyMessages, err := s.messageRepo.ListRecentByConversation(conversation.ID, assistantHistoryLimit)
 	if err != nil {
 		return nil, err
+	}
+
+	var contextData interface{}
+	if conversation.MessageCount == 0 || len(historyMessages) == 0 {
+		contextData, err = s.loadConversationContext(ctx, conversation)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	userMessage := &model.AIChatMessage{
@@ -323,6 +341,7 @@ func (s *AssistantService) SendMessageStream(ctx context.Context, input SendMess
 		GraphType:   conversation.Type,
 		Message:     messageText,
 		Model:       strings.TrimSpace(input.Model),
+		History:     toChatHistory(historyMessages),
 	}, func(chunk string) {
 		if chunk == "" {
 			return
@@ -507,6 +526,26 @@ func buildConversationTitle(message string) string {
 		return trimmed
 	}
 	return string(runes[:30])
+}
+
+func toChatHistory(messages []model.AIChatMessage) []ai.ChatHistoryMessage {
+	if len(messages) == 0 {
+		return []ai.ChatHistoryMessage{}
+	}
+
+	history := make([]ai.ChatHistoryMessage, 0, len(messages))
+	for _, m := range messages {
+		role := strings.TrimSpace(strings.ToLower(m.Role))
+		if role != "user" && role != "assistant" {
+			continue
+		}
+		content := strings.TrimSpace(m.Content)
+		if content == "" {
+			continue
+		}
+		history = append(history, ai.ChatHistoryMessage{Role: role, Content: content})
+	}
+	return history
 }
 
 func encodeMessageCursor(createdAt time.Time, id string) string {

@@ -110,3 +110,26 @@ func (r *AIChatMessageRepository) ListByConversationBefore(conversationID string
 	}
 	return messages, hasMore, nil
 }
+
+// ListRecentByConversation returns recent messages in chronological order.
+func (r *AIChatMessageRepository) ListRecentByConversation(conversationID string, limit int) ([]model.AIChatMessage, error) {
+	if limit <= 0 {
+		return []model.AIChatMessage{}, nil
+	}
+
+	var messages []model.AIChatMessage
+	err := r.db.Model(&model.AIChatMessage{}).
+		Where("conversation_id = ?", strings.TrimSpace(conversationID)).
+		Order("created_at DESC").
+		Order("id DESC").
+		Limit(limit).
+		Find(&messages).Error
+	if err != nil {
+		return nil, err
+	}
+
+	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+		messages[i], messages[j] = messages[j], messages[i]
+	}
+	return messages, nil
+}

@@ -2,7 +2,7 @@ server:
   port: 8080
   mode: debug  # debug | release
   read_timeout: 30s
-  write_timeout: 30s
+  write_timeout: 0s # SSE 长连接建议禁用写超时
 
 database:
   host: localhost

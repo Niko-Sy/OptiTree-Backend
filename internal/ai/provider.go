@@ -41,10 +41,16 @@ type KnowledgeGraphResult struct {
 
 // ChatRequest is the input to Chat.
 type ChatRequest struct {
-	ContextData interface{} // full graph context (nodes/edges)
+	ContextData interface{} // full graph context (nodes/edges), usually only on the first turn
 	GraphType   string      // "faultTree" | "knowledgeGraph"
 	Message     string
-	Model       string // optional model override
+	Model       string               // optional model override
+	History     []ChatHistoryMessage // prior conversation turns in chronological order
+}
+
+type ChatHistoryMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 // ChatResponse is the synchronous AI reply.
