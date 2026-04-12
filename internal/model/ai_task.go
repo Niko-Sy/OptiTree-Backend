@@ -50,14 +50,17 @@ func (AIConversation) TableName() string {
 }
 
 type AIChatMessage struct {
-	ID             string    `gorm:"primaryKey;column:id;size:32" json:"id"`
-	ConversationID string    `gorm:"column:conversation_id;size:32;not null;index" json:"conversationId"`
-	Role           string    `gorm:"column:role;size:20;not null" json:"role"`
-	Content        string    `gorm:"column:content;not null" json:"content"`
-	Model          *string   `gorm:"column:model;size:80" json:"model,omitempty"`
-	TokensUsed     *int      `gorm:"column:tokens_used" json:"tokensUsed,omitempty"`
-	IsPartial      bool      `gorm:"column:is_partial;not null;default:false" json:"isPartial"`
-	CreatedAt      time.Time `gorm:"column:created_at;not null;autoCreateTime" json:"createdAt"`
+	ID               string         `gorm:"primaryKey;column:id;size:32" json:"id"`
+	ConversationID   string         `gorm:"column:conversation_id;size:32;not null;index" json:"conversationId"`
+	Role             string         `gorm:"column:role;size:20;not null" json:"role"`
+	Content          string         `gorm:"column:content;not null" json:"content"`
+	ReasoningContent *string        `gorm:"column:reasoning_content;type:text" json:"reasoningContent,omitempty"`
+	ToolCalls        datatypes.JSON `gorm:"column:tool_calls;type:jsonb" json:"toolCalls,omitempty"`
+	ToolCallID       *string        `gorm:"column:tool_call_id;size:64" json:"toolCallId,omitempty"`
+	Model            *string        `gorm:"column:model;size:80" json:"model,omitempty"`
+	TokensUsed       *int           `gorm:"column:tokens_used" json:"tokensUsed,omitempty"`
+	IsPartial        bool           `gorm:"column:is_partial;not null;default:false" json:"isPartial"`
+	CreatedAt        time.Time      `gorm:"column:created_at;not null;autoCreateTime" json:"createdAt"`
 }
 
 func (AIChatMessage) TableName() string {

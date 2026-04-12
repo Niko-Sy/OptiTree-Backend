@@ -60,6 +60,18 @@ ai_task:
   callback_dedupe_ttl: 24h
   snapshot_ttl: 24h
 
+agent:
+  enabled: false
+  max_rounds: 10
+  max_tool_calls: 30
+  max_nodes_per_session: 50
+  confirm_timeout: 300s
+  preview_timeout: 600s
+  session_ttl: 30m
+  tool_call_rate_limit: 5
+  enable_fallback_parser: true
+  agent_model: ""
+
 log:
   enabled: true
   dir: "./logs"   # daily log files: logs/app-YYYY-MM-DD.log
@@ -87,8 +99,37 @@ rate_limit:
   burst: 200
 
 ai:
-  # Default: local Ollama instance (no API key required)
-  endpoint: "http://localhost:11434/v1"
-  api_key: ""
-  default_model: "llama3.2"
   timeout: 120s
+  default_provider: "qwen"
+
+  # null(省略) = 使用 provider 默认；0 = 禁用字段；>0 = 显式下发
+  max_completion_tokens: 0
+  model_max_completion_tokens: {}
+
+  # 前端可见模型列表（GetModels 直接读取）。
+  models:
+    - value: "qwen3.5-flash"
+      label: "Qwen 3.5 Flash (Recommended)"
+      recommended: true
+    - value: "mimo:mimo-thinking"
+      label: "MiMo Thinking"
+      provider: "mimo"
+
+  providers:
+    qwen:
+      endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      api_key: ""
+      default_model: "qwen3.5-flash"
+      chat_model: "qwen3.5-flash"
+      model_prefixes: ["qwen"]
+      max_completion_tokens: 0
+      model_max_completion_tokens: {}
+
+    mimo:
+      endpoint: "https://api.minimax.chat/v1"
+      api_key: ""
+      default_model: "mimo-thinking"
+      chat_model: "mimo-thinking"
+      model_prefixes: ["mimo", "minimax"]
+      max_completion_tokens: 8192
+      model_max_completion_tokens: {}

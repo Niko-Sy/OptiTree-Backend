@@ -69,6 +69,16 @@ func NewMessageID() string {
 	return NewID("msg")
 }
 
+// NewAgentSessionID 生成 Agent 会话 ID
+func NewAgentSessionID() string {
+	return NewID("asess")
+}
+
+// NewAgentToolCallID 生成 Agent 工具调用记录 ID
+func NewAgentToolCallID() string {
+	return NewID("atool")
+}
+
 // RandomToken 生成 N 字节的随机十六进制 token
 func RandomToken(n int) (string, error) {
 	b := make([]byte, n)

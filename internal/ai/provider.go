@@ -10,6 +10,11 @@ type AIProvider interface {
 	// ChatStream streams the AI reply token by token via onChunk callbacks.
 	// Returns the total tokens consumed and the actual model name used.
 	ChatStream(ctx context.Context, req ChatRequest, onChunk func(chunk string)) (tokensUsed int, modelUsed string, err error)
+	// ChatWithTools performs a non-streaming call that can return both text reply and tool calls.
+	ChatWithTools(ctx context.Context, req AgentChatRequest) (*AgentChatResponse, error)
+	// ChatStreamWithTools streams reply text and accumulates tool calls from delta chunks.
+	// Returns final text, reasoning content, tool calls, token usage, and model name.
+	ChatStreamWithTools(ctx context.Context, req AgentChatRequest, onChunk func(chunk string)) (reply string, reasoningContent string, toolCalls []ToolCall, tokensUsed int, modelUsed string, err error)
 }
 
 // GenerateConfig holds per-request LLM parameters.
@@ -49,8 +54,11 @@ type ChatRequest struct {
 }
 
 type ChatHistoryMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role             string     `json:"role"`
+	Content          string     `json:"content"`
+	ReasoningContent string     `json:"reasoningContent,omitempty"`
+	ToolCalls        []ToolCall `json:"toolCalls,omitempty"`
+	ToolCallID       string     `json:"toolCallId,omitempty"`
 }
 
 // ChatResponse is the synchronous AI reply.

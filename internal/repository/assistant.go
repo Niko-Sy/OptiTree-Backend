@@ -93,7 +93,9 @@ func (r *AIChatMessageRepository) Create(message *model.AIChatMessage) error {
 }
 
 func (r *AIChatMessageRepository) ListByConversationBefore(conversationID string, before *MessageCursor, limit int) ([]model.AIChatMessage, bool, error) {
-	q := r.db.Model(&model.AIChatMessage{}).Where("conversation_id = ?", strings.TrimSpace(conversationID))
+	q := r.db.Model(&model.AIChatMessage{}).
+		Where("conversation_id = ?", strings.TrimSpace(conversationID)).
+		Where("role IN ?", []string{"user", "assistant", "system"})
 	if before != nil {
 		q = q.Where("(created_at < ?) OR (created_at = ? AND id < ?)", before.CreatedAt.UTC(), before.CreatedAt.UTC(), strings.TrimSpace(before.ID))
 	}

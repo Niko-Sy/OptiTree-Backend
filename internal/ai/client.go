@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	contextChunkNodeThreshold = 400
-	contextChunkSize          = 400
-	maxHistoryMessages        = 20
+	contextChunkNodeThreshold      = 400
+	contextChunkSize               = 400
+	maxHistoryMessages             = 20
+	defaultMiMoMaxCompletionTokens = 8192
 )
 
 // Client implements AIProvider using an OpenAI-compatible chat completions API.
@@ -35,42 +36,74 @@ type Client struct {
 	httpClient *http.Client
 	// streamClient has no global timeout; context cancellation controls streaming calls.
 	streamClient *http.Client
+	// maxCompletionTokens controls request-level max_completion_tokens.
+	// nil = use provider defaults; 0 = disable field; >0 = explicitly set.
+	maxCompletionTokens *int
+	// modelMaxCompletionTokens overrides max tokens by exact model name (case-insensitive).
+	modelMaxCompletionTokens map[string]int
+}
+
+type ClientOptions struct {
+	MaxCompletionTokens *int
+	ModelMaxCompletion  map[string]int
 }
 
 // NewClient creates a new OpenAI-compatible AI client.
 // chatModel is used exclusively for Chat/ChatStream; pass "" to fall back to defaultModel.
 // apiKey may be empty for services that do not require auth (e.g. local Ollama).
 func NewClient(endpoint, apiKey, defaultModel, chatModel string, timeout time.Duration) *Client {
+	return NewClientWithOptions(endpoint, apiKey, defaultModel, chatModel, timeout, ClientOptions{})
+}
+
+func NewClientWithOptions(endpoint, apiKey, defaultModel, chatModel string, timeout time.Duration, opts ClientOptions) *Client {
 	if timeout <= 0 {
 		timeout = 120 * time.Second
 	}
+	var maxCompletionTokens *int
+	if opts.MaxCompletionTokens != nil {
+		v := *opts.MaxCompletionTokens
+		maxCompletionTokens = &v
+	}
+
 	return &Client{
-		endpoint:     strings.TrimRight(endpoint, "/"),
-		apiKey:       apiKey,
-		defaultModel: defaultModel,
-		chatModel:    chatModel,
-		httpClient:   &http.Client{Timeout: timeout},
-		streamClient: &http.Client{Timeout: 0}, // no deadline; rely on context cancellation
+		endpoint:                 strings.TrimRight(endpoint, "/"),
+		apiKey:                   apiKey,
+		defaultModel:             defaultModel,
+		chatModel:                chatModel,
+		httpClient:               &http.Client{Timeout: timeout},
+		streamClient:             &http.Client{Timeout: 0}, // no deadline; rely on context cancellation
+		maxCompletionTokens:      maxCompletionTokens,
+		modelMaxCompletionTokens: normalizeModelMaxCompletion(opts.ModelMaxCompletion),
 	}
 }
 
 // --- OpenAI wire types ---
 
 type oaiRequest struct {
-	Model       string   `json:"model"`
-	Messages    []oaiMsg `json:"messages"`
-	Temperature float64  `json:"temperature"`
+	Model               string       `json:"model"`
+	Messages            []oaiMsg     `json:"messages"`
+	Temperature         float64      `json:"temperature"`
+	MaxCompletionTokens *int         `json:"max_completion_tokens,omitempty"`
+	Tools               []OAIToolDef `json:"tools,omitempty"`
+	ToolChoice          interface{}  `json:"tool_choice,omitempty"`
 }
 
 type oaiMsg struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role             string        `json:"role"`
+	Content          string        `json:"content,omitempty"`
+	ReasoningContent string        `json:"reasoning_content,omitempty"`
+	ToolCalls        []oaiToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string        `json:"tool_call_id,omitempty"`
 }
 
 type oaiResponse struct {
 	Choices []struct {
-		Message oaiMsg `json:"message"`
+		Message      oaiMsg  `json:"message"`
+		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
+	Usage *struct {
+		TotalTokens int `json:"total_tokens"`
+	} `json:"usage,omitempty"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
@@ -83,9 +116,10 @@ func (c *Client) complete(ctx context.Context, model string, messages []oaiMsg) 
 	}
 
 	body, err := json.Marshal(oaiRequest{
-		Model:       model,
-		Messages:    messages,
-		Temperature: 0.3,
+		Model:               model,
+		Messages:            messages,
+		Temperature:         0.3,
+		MaxCompletionTokens: c.maxCompletionTokensFor(model),
 	})
 	if err != nil {
 		return "", fmt.Errorf("ai: marshal request: %w", err)
@@ -97,9 +131,7 @@ func (c *Client) complete(ctx context.Context, model string, messages []oaiMsg) 
 		return "", fmt.Errorf("ai: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
+	c.applyAuthHeader(req, model)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -160,6 +192,70 @@ func (c *Client) chatModelFor(override string) string {
 		return normalizeModelName(c.chatModel, c.defaultModel)
 	}
 	return normalizeModelName(c.defaultModel, c.defaultModel)
+}
+
+func (c *Client) applyAuthHeader(req *http.Request, model string) {
+	if req == nil || strings.TrimSpace(c.apiKey) == "" {
+		return
+	}
+	if isMiMoProvider(c.endpoint, model) {
+		req.Header.Set("api-key", c.apiKey)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+}
+
+func (c *Client) maxCompletionTokensFor(model string) *int {
+	modelKey := strings.ToLower(strings.TrimSpace(model))
+	if modelKey != "" {
+		if v, ok := c.modelMaxCompletionTokens[modelKey]; ok {
+			if v <= 0 {
+				return nil
+			}
+			vv := v
+			return &vv
+		}
+	}
+
+	if c.maxCompletionTokens != nil {
+		if *c.maxCompletionTokens <= 0 {
+			return nil
+		}
+		v := *c.maxCompletionTokens
+		return &v
+	}
+
+	if !isMiMoProvider(c.endpoint, model) {
+		return nil
+	}
+	v := defaultMiMoMaxCompletionTokens
+	return &v
+}
+
+func normalizeModelMaxCompletion(in map[string]int) map[string]int {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(in))
+	for model, v := range in {
+		key := strings.ToLower(strings.TrimSpace(model))
+		if key == "" {
+			continue
+		}
+		out[key] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func isMiMoProvider(endpoint, model string) bool {
+	haystack := strings.ToLower(strings.TrimSpace(endpoint) + " " + strings.TrimSpace(model))
+	if haystack == "" {
+		return false
+	}
+	return strings.Contains(haystack, "mimo") || strings.Contains(haystack, "minimax")
 }
 
 // extractJSON finds the first complete JSON object in s, tolerating markdown code fences.
@@ -224,16 +320,21 @@ Use an empty array for suggestions if none are needed.
 // ─── Streaming types ──────────────────────────────────────────────────────────
 
 type oaiStreamRequest struct {
-	Model       string   `json:"model"`
-	Messages    []oaiMsg `json:"messages"`
-	Temperature float64  `json:"temperature"`
-	Stream      bool     `json:"stream"`
+	Model               string       `json:"model"`
+	Messages            []oaiMsg     `json:"messages"`
+	Temperature         float64      `json:"temperature"`
+	Stream              bool         `json:"stream"`
+	MaxCompletionTokens *int         `json:"max_completion_tokens,omitempty"`
+	Tools               []OAIToolDef `json:"tools,omitempty"`
+	ToolChoice          interface{}  `json:"tool_choice,omitempty"`
 }
 
 type oaiStreamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content          string                   `json:"content"`
+			ReasoningContent string                   `json:"reasoning_content,omitempty"`
+			ToolCalls        []oaiStreamToolCallDelta `json:"tool_calls,omitempty"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -252,10 +353,11 @@ func (c *Client) completeStream(ctx context.Context, model string, messages []oa
 	}
 
 	body, err := json.Marshal(oaiStreamRequest{
-		Model:       model,
-		Messages:    messages,
-		Temperature: 0.7,
-		Stream:      true,
+		Model:               model,
+		Messages:            messages,
+		Temperature:         0.7,
+		Stream:              true,
+		MaxCompletionTokens: c.maxCompletionTokensFor(model),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("ai: marshal stream request: %w", err)
@@ -268,9 +370,7 @@ func (c *Client) completeStream(ctx context.Context, model string, messages []oa
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
+	c.applyAuthHeader(req, model)
 
 	resp, err := c.streamClient.Do(req)
 	if err != nil {
@@ -427,16 +527,78 @@ func historyToOAIMessages(history []ChatHistoryMessage) []oaiMsg {
 	messages := make([]oaiMsg, 0, len(history))
 	for _, h := range history {
 		role := strings.ToLower(strings.TrimSpace(h.Role))
-		if role != "user" && role != "assistant" {
-			continue
+
+		switch role {
+		case "user":
+			content := strings.TrimSpace(h.Content)
+			if content == "" {
+				continue
+			}
+			messages = append(messages, oaiMsg{Role: role, Content: content})
+		case "assistant":
+			content := strings.TrimSpace(h.Content)
+			reasoning := strings.TrimSpace(h.ReasoningContent)
+			toolCalls := historyToolCallsToOAIToolCalls(h.ToolCalls)
+			if content == "" && reasoning == "" && len(toolCalls) == 0 {
+				continue
+			}
+			messages = append(messages, oaiMsg{
+				Role:             role,
+				Content:          content,
+				ReasoningContent: reasoning,
+				ToolCalls:        toolCalls,
+			})
+		case "tool":
+			content := strings.TrimSpace(h.Content)
+			toolCallID := strings.TrimSpace(h.ToolCallID)
+			if content == "" || toolCallID == "" {
+				continue
+			}
+			messages = append(messages, oaiMsg{Role: role, Content: content, ToolCallID: toolCallID})
 		}
-		content := strings.TrimSpace(h.Content)
-		if content == "" {
-			continue
-		}
-		messages = append(messages, oaiMsg{Role: role, Content: content})
 	}
 	return messages
+}
+
+func historyToolCallsToOAIToolCalls(calls []ToolCall) []oaiToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+
+	out := make([]oaiToolCall, 0, len(calls))
+	for i, call := range calls {
+		name := strings.TrimSpace(call.Name)
+		if name == "" {
+			continue
+		}
+
+		id := strings.TrimSpace(call.ID)
+		if id == "" {
+			id = fmt.Sprintf("history_call_%d", i+1)
+		}
+
+		item := oaiToolCall{ID: id, Type: "function"}
+		item.Function.Name = name
+		item.Function.Arguments = normalizeToolArgumentsJSON(call.Arguments)
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func normalizeToolArgumentsJSON(args json.RawMessage) string {
+	raw := bytes.TrimSpace(args)
+	if len(raw) == 0 || !json.Valid(raw) {
+		return "{}"
+	}
+
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, raw); err != nil {
+		return string(raw)
+	}
+	return compact.String()
 }
 
 func buildChunkedGraphPayload(contextData interface{}, graphType string) (map[string]interface{}, bool) {

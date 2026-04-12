@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,8 +19,10 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	agentcore "optitree-backend/internal/agent"
 	"optitree-backend/internal/ai"
 	"optitree-backend/internal/config"
+	"optitree-backend/internal/graph_ops"
 	"optitree-backend/internal/handler"
 	"optitree-backend/internal/middleware"
 	"optitree-backend/internal/repository"
@@ -27,6 +30,111 @@ import (
 	"optitree-backend/pkg/jwt"
 	applogger "optitree-backend/pkg/logger"
 )
+
+func buildAIProvider(aiCfg config.AIConfig) (ai.AIProvider, error) {
+	timeout := aiCfg.Timeout
+
+	if len(aiCfg.Providers) == 0 {
+		return ai.NewClientWithOptions(
+			aiCfg.Endpoint,
+			aiCfg.APIKey,
+			aiCfg.DefaultModel,
+			aiCfg.ChatModel,
+			timeout,
+			ai.ClientOptions{
+				MaxCompletionTokens: aiCfg.MaxCompletionTokens,
+				ModelMaxCompletion:  aiCfg.ModelMaxCompletion,
+			},
+		), nil
+	}
+
+	providers := make(map[string]ai.AIProvider, len(aiCfg.Providers))
+	modelPrefixes := make(map[string][]string, len(aiCfg.Providers))
+	for providerName, providerCfg := range aiCfg.Providers {
+		key := strings.ToLower(strings.TrimSpace(providerName))
+		if key == "" {
+			continue
+		}
+
+		endpoint := strings.TrimSpace(providerCfg.Endpoint)
+		if endpoint == "" {
+			return nil, fmt.Errorf("ai: provider %s endpoint is empty", providerName)
+		}
+
+		defaultModel := strings.TrimSpace(providerCfg.DefaultModel)
+		if defaultModel == "" {
+			defaultModel = strings.TrimSpace(aiCfg.DefaultModel)
+		}
+
+		chatModel := strings.TrimSpace(providerCfg.ChatModel)
+		if chatModel == "" {
+			chatModel = strings.TrimSpace(aiCfg.ChatModel)
+		}
+
+		apiKey := providerCfg.APIKey
+		if strings.TrimSpace(apiKey) == "" {
+			apiKey = aiCfg.APIKey
+		}
+
+		maxTokens := providerCfg.MaxCompletionTokens
+		if maxTokens == nil {
+			maxTokens = aiCfg.MaxCompletionTokens
+		}
+
+		providers[key] = ai.NewClientWithOptions(
+			endpoint,
+			apiKey,
+			defaultModel,
+			chatModel,
+			timeout,
+			ai.ClientOptions{
+				MaxCompletionTokens: maxTokens,
+				ModelMaxCompletion:  mergeModelMaxCompletion(aiCfg.ModelMaxCompletion, providerCfg.ModelMaxCompletion),
+			},
+		)
+
+		if len(providerCfg.ModelPrefixes) > 0 {
+			modelPrefixes[key] = append([]string(nil), providerCfg.ModelPrefixes...)
+		}
+	}
+
+	if len(providers) == 0 {
+		return nil, fmt.Errorf("ai: no valid providers configured")
+	}
+
+	return ai.NewRoutedProvider(ai.RoutedProviderConfig{
+		DefaultProvider: aiCfg.DefaultProvider,
+		Providers:       providers,
+		ModelPrefixes:   modelPrefixes,
+	})
+}
+
+func mergeModelMaxCompletion(global map[string]int, local map[string]int) map[string]int {
+	if len(global) == 0 && len(local) == 0 {
+		return nil
+	}
+
+	out := make(map[string]int, len(global)+len(local))
+	for model, value := range global {
+		key := strings.TrimSpace(model)
+		if key == "" {
+			continue
+		}
+		out[key] = value
+	}
+	for model, value := range local {
+		key := strings.TrimSpace(model)
+		if key == "" {
+			continue
+		}
+		out[key] = value
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
 
 func main() {
 	// 日志初始化（控制台）
@@ -105,6 +213,8 @@ func main() {
 	docRepo := repository.NewDocumentRepository(db)
 	aiConversationRepo := repository.NewAIConversationRepository(db)
 	aiChatMessageRepo := repository.NewAIChatMessageRepository(db)
+	agentSessionRepo := repository.NewAgentSessionRepository(db)
+	agentToolCallRepo := repository.NewAgentToolCallRepository(db)
 	notificationRepo := repository.NewNotificationRepository(db)
 	auditRepo := repository.NewAuditLogRepository(db)
 
@@ -116,7 +226,10 @@ func main() {
 		cfg.Storage.AllowedImageTypes,
 		cfg.Storage.AllowedDocTypes,
 	)
-	aiClient := ai.NewClient(cfg.AI.Endpoint, cfg.AI.APIKey, cfg.AI.DefaultModel, cfg.AI.ChatModel, cfg.AI.Timeout)
+	aiClient, err := buildAIProvider(cfg.AI)
+	if err != nil {
+		log.Fatal().Err(err).Msg("初始化 AI Provider 失败")
+	}
 	taskProgressHub := service.NewTaskProgressHub()
 	cachePolicy := service.CachePolicy{
 		Enabled:               cfg.Cache.Enabled,
@@ -173,6 +286,26 @@ func main() {
 		ftSvc,
 		kgSvc,
 	)
+	graphExecutor := graph_ops.NewExecutor(graphRepo, projectRepo, auditRepo, db, rdb)
+	hybridEngine := graph_ops.NewHybridEngine(graphRepo, projectRepo, graphExecutor)
+	agentSessionMgr := agentcore.NewAgentSessionManager(cfg.Agent.SessionTTL)
+	safetyCtrl := agentcore.NewSafetyController(cfg.Agent)
+	agentSvc := agentcore.NewAgentService(
+		aiClient,
+		graphExecutor,
+		hybridEngine,
+		agentSessionMgr,
+		safetyCtrl,
+		memberRepo,
+		aiConversationRepo,
+		aiChatMessageRepo,
+		agentSessionRepo,
+		agentToolCallRepo,
+		ftSvc,
+		kgSvc,
+		cfg.Agent,
+	)
+	go agentSessionMgr.StartCleanup(context.Background())
 	if err := aiTaskSvc.StartFaultTreeDispatcher(context.Background()); err != nil {
 		log.Fatal().Err(err).Msg("启动 AI 故障树调度器失败")
 	}
@@ -191,8 +324,9 @@ func main() {
 	versionH := handler.NewVersionHandler(versionSvc)
 	docH := handler.NewDocumentHandler(docSvc)
 	aiTaskH := handler.NewAITaskHandler(aiTaskSvc)
-	assistantH := handler.NewAssistantHandler(assistantSvc)
+	assistantH := handler.NewAssistantHandler(assistantSvc, cfg.AI)
 	aiTaskWSH := handler.NewAITaskWSHandler(taskProgressHub, jwtManager, rdb, memberRepo)
+	agentH := handler.NewAgentHandler(agentSvc, agentSessionMgr)
 	memberH := handler.NewMemberHandler(memberSvc)
 	notificationH := handler.NewNotificationHandler(notificationSvc, memberSvc)
 	teamH := handler.NewTeamHandler(teamSvc)
@@ -345,7 +479,15 @@ func main() {
 			assistant.GET("/conversations/:conversationId/messages", assistantH.GetMessageHistory)
 			assistant.POST("/conversations/:conversationId/messages", assistantH.SendMessage)
 			assistant.POST("/conversations/:conversationId/messages/stream", assistantH.SendMessageStream)
+			assistant.POST("/conversations/:conversationId/agent/stream", agentH.AgentStream)
 			assistant.DELETE("/conversations/:conversationId", assistantH.DeleteConversation)
+		}
+
+		agentGroup := authed.Group("/agent")
+		{
+			agentGroup.POST("/sessions/:sessionId/confirm", agentH.AgentConfirm)
+			agentGroup.POST("/sessions/:sessionId/cancel", agentH.AgentCancel)
+			agentGroup.GET("/sessions/:sessionId/status", agentH.AgentStatus)
 		}
 
 		// 团队总览

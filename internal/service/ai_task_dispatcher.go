@@ -233,14 +233,22 @@ func (s *AITaskService) releaseDelayedProducerTasks(ctx context.Context) error {
 		if remErr != nil || removed == 0 {
 			continue
 		}
-		_ = s.rdb.XAdd(ctx, &redis.XAddArgs{
+		entryID, addErr := s.rdb.XAdd(ctx, &redis.XAddArgs{
 			Stream: s.producerStream,
 			MaxLen: s.queueMaxLen,
 			Approx: true,
 			Values: map[string]interface{}{
 				"payload": payloadText,
 			},
-		}).Err()
+		}).Result()
+		if addErr != nil {
+			continue
+		}
+
+		taskID := parseQueueMessageTaskID(payloadText)
+		if taskID != "" {
+			s.recordTaskStreamEntry(ctx, taskID, aiTaskStreamSourceProducer, entryID)
+		}
 	}
 	return nil
 }
@@ -250,20 +258,40 @@ func (s *AITaskService) requeueDelayedProducerPayload(ctx context.Context, paylo
 		return nil
 	}
 	if delayMS <= 0 {
-		return s.rdb.XAdd(ctx, &redis.XAddArgs{
+		entryID, err := s.rdb.XAdd(ctx, &redis.XAddArgs{
 			Stream: s.producerStream,
 			MaxLen: s.queueMaxLen,
 			Approx: true,
 			Values: map[string]interface{}{
 				"payload": payloadText,
 			},
-		}).Err()
+		}).Result()
+		if err != nil {
+			return err
+		}
+
+		taskID := parseQueueMessageTaskID(payloadText)
+		if taskID != "" {
+			s.recordTaskStreamEntry(ctx, taskID, aiTaskStreamSourceProducer, entryID)
+		}
+		return nil
 	}
 	retryAt := time.Now().UnixMilli() + delayMS
 	return s.rdb.ZAdd(ctx, s.producerDelayedZSet, redis.Z{
 		Score:  float64(retryAt),
 		Member: payloadText,
 	}).Err()
+}
+
+func parseQueueMessageTaskID(payloadText string) string {
+	if strings.TrimSpace(payloadText) == "" {
+		return ""
+	}
+	var payload AITaskQueueMessage
+	if err := json.Unmarshal([]byte(payloadText), &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.TaskID)
 }
 
 func (s *AITaskService) tryAcquireProjectLock(ctx context.Context, projectID, taskID string) (bool, error) {

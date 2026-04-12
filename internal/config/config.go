@@ -17,6 +17,7 @@ type Config struct {
 	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
 	AI        AIConfig        `mapstructure:"ai"`
 	AITask    AITaskConfig    `mapstructure:"ai_task"`
+	Agent     AgentConfig     `mapstructure:"agent"`
 	Log       LogConfig       `mapstructure:"log"`
 }
 
@@ -29,13 +30,50 @@ type LogConfig struct {
 }
 
 type AIConfig struct {
+	// Legacy single-provider settings (kept for backward compatibility).
 	Endpoint     string `mapstructure:"endpoint"`
 	APIKey       string `mapstructure:"api_key"`
 	DefaultModel string `mapstructure:"default_model"`
 	// ChatModel is the model used exclusively for AI chat (POST /ai/chat and /ai/chat/stream).
 	// Defaults to DefaultModel when empty.
-	ChatModel string        `mapstructure:"chat_model"`
-	Timeout   time.Duration `mapstructure:"timeout"`
+	ChatModel string `mapstructure:"chat_model"`
+
+	// MaxCompletionTokens controls request-level max_completion_tokens.
+	// nil = use provider defaults; 0 = disable the field; >0 = explicitly set.
+	MaxCompletionTokens *int           `mapstructure:"max_completion_tokens"`
+	ModelMaxCompletion  map[string]int `mapstructure:"model_max_completion_tokens"`
+
+	// Multi-provider settings (qwen/mimo, etc.).
+	DefaultProvider string                      `mapstructure:"default_provider"`
+	Providers       map[string]AIProviderConfig `mapstructure:"providers"`
+	Models          []AIModelConfig             `mapstructure:"models"`
+
+	Timeout time.Duration `mapstructure:"timeout"`
+}
+
+type AIModelConfig struct {
+	// Value is the model token sent by clients (e.g. "qwen3.5-flash" or "mimo:mimo-thinking").
+	Value string `mapstructure:"value"`
+	// Model is an alias for Value in config.
+	Model string `mapstructure:"model"`
+	Label string `mapstructure:"label"`
+	// Provider can be used to auto-prefix model values for routing (qwen/mimo).
+	Provider    string `mapstructure:"provider"`
+	Recommended bool   `mapstructure:"recommended"`
+}
+
+type AIProviderConfig struct {
+	Endpoint     string `mapstructure:"endpoint"`
+	APIKey       string `mapstructure:"api_key"`
+	DefaultModel string `mapstructure:"default_model"`
+	ChatModel    string `mapstructure:"chat_model"`
+
+	// ModelPrefixes are used by the router to select this provider by requested model name.
+	ModelPrefixes []string `mapstructure:"model_prefixes"`
+
+	// nil = fallback to global/default behavior; 0 = disable; >0 = force set.
+	MaxCompletionTokens *int           `mapstructure:"max_completion_tokens"`
+	ModelMaxCompletion  map[string]int `mapstructure:"model_max_completion_tokens"`
 }
 
 // AITaskConfig holds queue and callback settings for async AI generation tasks.
@@ -55,6 +93,20 @@ type AITaskConfig struct {
 	ProjectLockTTL      time.Duration `mapstructure:"project_lock_ttl"`
 	CallbackDedupeTTL   time.Duration `mapstructure:"callback_dedupe_ttl"`
 	SnapshotTTL         time.Duration `mapstructure:"snapshot_ttl"`
+}
+
+// AgentConfig controls mixed agent execution behavior.
+type AgentConfig struct {
+	Enabled              bool          `mapstructure:"enabled"`
+	MaxRounds            int           `mapstructure:"max_rounds"`
+	MaxToolCalls         int           `mapstructure:"max_tool_calls"`
+	MaxNodesPerSession   int           `mapstructure:"max_nodes_per_session"`
+	ConfirmTimeout       time.Duration `mapstructure:"confirm_timeout"`
+	PreviewTimeout       time.Duration `mapstructure:"preview_timeout"`
+	SessionTTL           time.Duration `mapstructure:"session_ttl"`
+	ToolCallRateLimit    int           `mapstructure:"tool_call_rate_limit"`
+	EnableFallbackParser bool          `mapstructure:"enable_fallback_parser"`
+	AgentModel           string        `mapstructure:"agent_model"`
 }
 
 type ServerConfig struct {

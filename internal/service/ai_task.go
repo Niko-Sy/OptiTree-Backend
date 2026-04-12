@@ -29,6 +29,11 @@ var (
 	ErrAITaskCallbackProjectMismatch = errors.New("回调 projectId 与任务不一致")
 )
 
+const (
+	aiTaskStreamSourceWorker   = "worker"
+	aiTaskStreamSourceProducer = "producer"
+)
+
 type AITaskService struct {
 	taskRepo       *repository.AITaskRepository
 	docRepo        *repository.DocumentRepository
@@ -390,7 +395,7 @@ func (s *AITaskService) enqueueTask(ctx context.Context, msg AITaskQueueMessage)
 		return fmt.Errorf("序列化任务消息失败: %w", err)
 	}
 
-	_, err = s.rdb.XAdd(ctx, &redis.XAddArgs{
+	entryID, err := s.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: s.queueStream,
 		MaxLen: s.queueMaxLen,
 		Approx: true,
@@ -405,6 +410,7 @@ func (s *AITaskService) enqueueTask(ctx context.Context, msg AITaskQueueMessage)
 	if err != nil {
 		return fmt.Errorf("写入 Redis Stream 失败: %w", err)
 	}
+	s.recordTaskStreamEntry(ctx, msg.TaskID, aiTaskStreamSourceWorker, entryID)
 	return nil
 }
 
@@ -414,7 +420,7 @@ func (s *AITaskService) enqueueFaultTreeProducerTask(ctx context.Context, msg AI
 		return fmt.Errorf("序列化生产任务失败: %w", err)
 	}
 
-	_, err = s.rdb.XAdd(ctx, &redis.XAddArgs{
+	entryID, err := s.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: s.producerStream,
 		MaxLen: s.queueMaxLen,
 		Approx: true,
@@ -428,7 +434,95 @@ func (s *AITaskService) enqueueFaultTreeProducerTask(ctx context.Context, msg AI
 	if err != nil {
 		return fmt.Errorf("写入生产接入流失败: %w", err)
 	}
+	s.recordTaskStreamEntry(ctx, msg.TaskID, aiTaskStreamSourceProducer, entryID)
 	return nil
+}
+
+func (s *AITaskService) taskStreamEntryKey(taskID, source string) string {
+	tid := strings.TrimSpace(taskID)
+	if tid == "" {
+		return ""
+	}
+
+	switch strings.TrimSpace(source) {
+	case aiTaskStreamSourceWorker:
+		return constant.RedisKeyAITaskWorkerStreamEntries + tid
+	case aiTaskStreamSourceProducer:
+		return constant.RedisKeyAITaskProducerStreamEntries + tid
+	default:
+		return ""
+	}
+}
+
+func (s *AITaskService) recordTaskStreamEntry(ctx context.Context, taskID, source, entryID string) {
+	if s.rdb == nil {
+		return
+	}
+	tid := strings.TrimSpace(taskID)
+	entry := strings.TrimSpace(entryID)
+	if tid == "" || entry == "" {
+		return
+	}
+
+	key := s.taskStreamEntryKey(tid, source)
+	if key == "" {
+		return
+	}
+
+	if err := s.rdb.SAdd(ctx, key, entry).Err(); err != nil {
+		log.Warn().Err(err).Str("taskId", tid).Str("streamSource", source).Str("entryId", entry).Msg("记录 stream entry 失败")
+		return
+	}
+	if err := s.rdb.Expire(ctx, key, s.snapshotTTL).Err(); err != nil {
+		log.Warn().Err(err).Str("taskId", tid).Str("streamSource", source).Msg("设置 stream entry 跟踪 TTL 失败")
+	}
+}
+
+func (s *AITaskService) clearTaskStreamEntries(ctx context.Context, taskID string) {
+	if s.rdb == nil {
+		return
+	}
+	tid := strings.TrimSpace(taskID)
+	if tid == "" {
+		return
+	}
+
+	targets := []struct {
+		key    string
+		stream string
+		source string
+	}{
+		{key: s.taskStreamEntryKey(tid, aiTaskStreamSourceWorker), stream: s.queueStream, source: aiTaskStreamSourceWorker},
+		{key: s.taskStreamEntryKey(tid, aiTaskStreamSourceProducer), stream: s.producerStream, source: aiTaskStreamSourceProducer},
+	}
+
+	for _, target := range targets {
+		if target.key == "" || strings.TrimSpace(target.stream) == "" {
+			continue
+		}
+
+		entryIDs, err := s.rdb.SMembers(ctx, target.key).Result()
+		if err != nil && err != redis.Nil {
+			log.Warn().Err(err).Str("taskId", tid).Str("streamSource", target.source).Msg("读取 stream entry 跟踪失败")
+			continue
+		}
+
+		if len(entryIDs) > 0 {
+			if err := s.rdb.XDel(ctx, target.stream, entryIDs...).Err(); err != nil {
+				log.Warn().Err(err).
+					Str("taskId", tid).
+					Str("stream", target.stream).
+					Str("streamSource", target.source).
+					Int("entryCount", len(entryIDs)).
+					Msg("清理 stream entry 失败")
+				continue
+			}
+		}
+
+		if err := s.rdb.Del(ctx, target.key).Err(); err != nil {
+			log.Warn().Err(err).Str("taskId", tid).Str("streamSource", target.source).Msg("删除 stream entry 跟踪 key 失败")
+		}
+	}
 }
 
 // Generate Fault Tree
@@ -696,6 +790,7 @@ func (s *AITaskService) HandleTaskCallback(ctx context.Context, input TaskCallba
 	case constant.AITaskStatusCompleted:
 		if task.Status == constant.AITaskStatusCompleted {
 			s.releaseProjectLock(ctx, projectID, taskID)
+			s.clearTaskStreamEntries(ctx, taskID)
 			return nil
 		}
 		if stage == "" {
@@ -704,10 +799,12 @@ func (s *AITaskService) HandleTaskCallback(ctx context.Context, input TaskCallba
 		if stageLabel == "" {
 			stageLabel = "生成完成"
 		}
-		if err := s.persistGeneratedGraph(ctx, task, input.Result); err != nil {
+		normalizedResult := normalizeTaskResultPayload(task.Type, input.Result)
+		if err := s.persistGeneratedGraph(ctx, task, normalizedResult); err != nil {
 			errMsg := "保存生成结果失败: " + err.Error()
 			_ = s.taskRepo.SetFailed(taskID, errMsg)
 			s.releaseProjectLock(ctx, projectID, taskID)
+			s.clearTaskStreamEntries(ctx, taskID)
 			_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
 			s.cacheStatus(ctx, taskID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
 			s.publishTaskEvent(TaskProgressEvent{
@@ -723,11 +820,12 @@ func (s *AITaskService) HandleTaskCallback(ctx context.Context, input TaskCallba
 			return err
 		}
 
-		resultJSON, _ := json.Marshal(input.Result)
+		resultJSON, _ := json.Marshal(normalizedResult)
 		if err := s.taskRepo.SetCompleted(taskID, resultJSON); err != nil {
 			return err
 		}
 		s.releaseProjectLock(ctx, projectID, taskID)
+		s.clearTaskStreamEntries(ctx, taskID)
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationCompleted)
 		s.cacheStatus(ctx, taskID, constant.AITaskStatusCompleted, 100, stage, stageLabel)
 		s.publishTaskEvent(TaskProgressEvent{
@@ -739,7 +837,7 @@ func (s *AITaskService) HandleTaskCallback(ctx context.Context, input TaskCallba
 			Progress:      100,
 			Stage:         stage,
 			StageLabel:    stageLabel,
-			Result:        extractResultSummary(task.Type, input.Result),
+			Result:        extractResultSummary(task.Type, normalizedResult),
 		})
 		return nil
 
@@ -758,6 +856,7 @@ func (s *AITaskService) HandleTaskCallback(ctx context.Context, input TaskCallba
 			return err
 		}
 		s.releaseProjectLock(ctx, projectID, taskID)
+		s.clearTaskStreamEntries(ctx, taskID)
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
 		s.cacheStatus(ctx, taskID, status, progress, stage, stageLabel)
 		eventName := "task.failed"
@@ -815,7 +914,8 @@ func (s *AITaskService) persistGeneratedGraph(ctx context.Context, task *model.A
 }
 
 func parseFaultTreeResult(raw map[string]interface{}) (*ai.FaultTreeResult, error) {
-	b, err := json.Marshal(raw)
+	normalized := normalizeFaultTreeResultPayload(raw)
+	b, err := json.Marshal(normalized)
 	if err != nil {
 		return nil, err
 	}
@@ -830,7 +930,8 @@ func parseFaultTreeResult(raw map[string]interface{}) (*ai.FaultTreeResult, erro
 }
 
 func parseKnowledgeGraphResult(raw map[string]interface{}) (*ai.KnowledgeGraphResult, error) {
-	b, err := json.Marshal(raw)
+	normalized := normalizeKnowledgeGraphResultPayload(raw)
+	b, err := json.Marshal(normalized)
 	if err != nil {
 		return nil, err
 	}
@@ -850,11 +951,144 @@ func parseKnowledgeGraphResult(raw map[string]interface{}) (*ai.KnowledgeGraphRe
 	return &result, nil
 }
 
-func extractResultSummary(taskType string, raw map[string]interface{}) map[string]interface{} {
-	summary := strings.TrimSpace(fmt.Sprintf("%v", raw["summary"]))
-	if summary == "" || summary == "<nil>" {
-		summary = "生成完成"
+func normalizeTaskResultPayload(taskType string, raw map[string]interface{}) map[string]interface{} {
+	switch strings.TrimSpace(taskType) {
+	case constant.AITaskTypeGenerateFaultTree:
+		return normalizeFaultTreeResultPayload(raw)
+	case constant.AITaskTypeGenerateKnowledgeGraph:
+		return normalizeKnowledgeGraphResultPayload(raw)
+	default:
+		return cloneAnyMap(raw)
 	}
+}
+
+func normalizeFaultTreeResultPayload(raw map[string]interface{}) map[string]interface{} {
+	normalized := cloneAnyMap(raw)
+
+	faultTree := toAnyMap(raw["faultTree"])
+	if _, ok := normalized["nodes"]; !ok {
+		if nodes, exists := faultTree["nodes"]; exists {
+			normalized["nodes"] = nodes
+		}
+	}
+	if _, ok := normalized["edges"]; !ok {
+		if edges, exists := faultTree["edges"]; exists {
+			normalized["edges"] = edges
+		}
+	}
+
+	if _, ok := normalized["accuracy"]; !ok {
+		if accuracy, exists := faultTree["accuracy"]; exists {
+			normalized["accuracy"] = accuracy
+		}
+	}
+	if _, ok := normalized["accuracy"]; !ok {
+		summaryMap := toAnyMap(raw["summary"])
+		qualityMetrics := toAnyMap(summaryMap["qualityMetrics"])
+		if accuracy, exists := qualityMetrics["accuracy"]; exists {
+			normalized["accuracy"] = accuracy
+		} else if score, exists := qualityMetrics["score"]; exists {
+			normalized["accuracy"] = score
+		}
+	}
+
+	normalized["summary"] = normalizeSummaryText(normalized["summary"])
+	return normalized
+}
+
+func normalizeKnowledgeGraphResultPayload(raw map[string]interface{}) map[string]interface{} {
+	normalized := cloneAnyMap(raw)
+	graph := toAnyMap(raw["knowledgeGraph"])
+
+	if _, ok := normalized["nodes"]; !ok {
+		if nodes, exists := raw["rfNodes"]; exists {
+			normalized["nodes"] = nodes
+		} else if nodes, exists := graph["nodes"]; exists {
+			normalized["nodes"] = nodes
+		} else if rfNodes, exists := graph["rfNodes"]; exists {
+			normalized["nodes"] = rfNodes
+		}
+	}
+	if _, ok := normalized["edges"]; !ok {
+		if edges, exists := raw["rfEdges"]; exists {
+			normalized["edges"] = edges
+		} else if edges, exists := graph["edges"]; exists {
+			normalized["edges"] = edges
+		} else if rfEdges, exists := graph["rfEdges"]; exists {
+			normalized["edges"] = rfEdges
+		}
+	}
+
+	normalized["summary"] = normalizeSummaryText(normalized["summary"])
+	if toInt(normalized["entityCount"]) == 0 {
+		normalized["entityCount"] = sliceLength(normalized["nodes"])
+	}
+	if toInt(normalized["relationCount"]) == 0 {
+		normalized["relationCount"] = sliceLength(normalized["edges"])
+	}
+
+	return normalized
+}
+
+func cloneAnyMap(raw map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{})
+	if raw == nil {
+		return out
+	}
+	for k, v := range raw {
+		out[k] = v
+	}
+	return out
+}
+
+func toAnyMap(value interface{}) map[string]interface{} {
+	if value == nil {
+		return map[string]interface{}{}
+	}
+	if m, ok := value.(map[string]interface{}); ok {
+		return m
+	}
+	return map[string]interface{}{}
+}
+
+func sliceLength(value interface{}) int {
+	switch t := value.(type) {
+	case []interface{}:
+		return len(t)
+	case []map[string]interface{}:
+		return len(t)
+	default:
+		return 0
+	}
+}
+
+func normalizeSummaryText(value interface{}) string {
+	switch t := value.(type) {
+	case string:
+		text := strings.TrimSpace(t)
+		if text != "" {
+			return text
+		}
+	case map[string]interface{}:
+		for _, key := range []string{"text", "summary", "message", "phase"} {
+			if candidate, ok := t[key].(string); ok {
+				text := strings.TrimSpace(candidate)
+				if text != "" {
+					return text
+				}
+			}
+		}
+	}
+
+	text := strings.TrimSpace(fmt.Sprintf("%v", value))
+	if text == "" || text == "<nil>" || text == "map[]" {
+		return "生成完成"
+	}
+	return text
+}
+
+func extractResultSummary(taskType string, raw map[string]interface{}) map[string]interface{} {
+	summary := normalizeSummaryText(raw["summary"])
 	if taskType == constant.AITaskTypeGenerateFaultTree {
 		return map[string]interface{}{
 			"summary":  summary,
@@ -865,9 +1099,15 @@ func extractResultSummary(taskType string, raw map[string]interface{}) map[strin
 	if entityCount == 0 {
 		entityCount = toInt(raw["entity_count"])
 	}
+	if entityCount == 0 {
+		entityCount = sliceLength(raw["nodes"])
+	}
 	relationCount := toInt(raw["relationCount"])
 	if relationCount == 0 {
 		relationCount = toInt(raw["relation_count"])
+	}
+	if relationCount == 0 {
+		relationCount = sliceLength(raw["edges"])
 	}
 	return map[string]interface{}{
 		"summary":       summary,

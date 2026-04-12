@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"optitree-backend/internal/config"
 	"optitree-backend/internal/constant"
 	"optitree-backend/internal/middleware"
 	"optitree-backend/internal/service"
@@ -21,23 +23,183 @@ import (
 
 type AssistantHandler struct {
 	assistantService *service.AssistantService
+	aiConfig         config.AIConfig
 }
 
 const assistantStreamHeartbeatInterval = 10 * time.Second
 
-func NewAssistantHandler(assistantService *service.AssistantService) *AssistantHandler {
-	return &AssistantHandler{assistantService: assistantService}
+func NewAssistantHandler(assistantService *service.AssistantService, aiConfig config.AIConfig) *AssistantHandler {
+	return &AssistantHandler{assistantService: assistantService, aiConfig: aiConfig}
 }
 
 func (h *AssistantHandler) GetModels(c *gin.Context) {
+	items := buildAssistantModelItems(h.aiConfig)
+	list := make([]gin.H, 0, len(items))
+	for _, item := range items {
+		entry := gin.H{
+			"value": item.Value,
+			"label": item.Label,
+		}
+		if item.Provider != "" {
+			entry["provider"] = item.Provider
+		}
+		if item.Recommended {
+			entry["recommended"] = true
+		}
+		list = append(list, entry)
+	}
+
 	util.Success(c, gin.H{
-		"list": []gin.H{
-			{"value": "qwen3.5-flash", "label": "通义千问-3.5-Flash（推荐）", "recommended": true},
-			{"value": "qwen-plus", "label": "通义千问-Plus"},
-			{"value": "qwen-turbo", "label": "通义千问-Turbo（快速）"},
-			{"value": "deepseek-v3", "label": "DeepSeek-V3"},
-		},
+		"list": list,
 	})
+}
+
+type assistantModelItem struct {
+	Value       string
+	Label       string
+	Provider    string
+	Recommended bool
+}
+
+func buildAssistantModelItems(aiCfg config.AIConfig) []assistantModelItem {
+	fromConfig := buildAssistantModelItemsFromConfig(aiCfg)
+	if len(fromConfig) > 0 {
+		return fromConfig
+	}
+	return buildAssistantModelItemsFromProviders(aiCfg)
+}
+
+func buildAssistantModelItemsFromConfig(aiCfg config.AIConfig) []assistantModelItem {
+	if len(aiCfg.Models) == 0 {
+		return nil
+	}
+
+	out := make([]assistantModelItem, 0, len(aiCfg.Models))
+	seen := make(map[string]struct{}, len(aiCfg.Models))
+	for _, m := range aiCfg.Models {
+		provider := strings.ToLower(strings.TrimSpace(m.Provider))
+		value := strings.TrimSpace(m.Value)
+		if value == "" {
+			value = strings.TrimSpace(m.Model)
+		}
+		if value == "" {
+			continue
+		}
+
+		if provider != "" {
+			lower := strings.ToLower(value)
+			if !strings.HasPrefix(lower, provider+":") && !strings.HasPrefix(lower, provider+"/") {
+				value = provider + ":" + value
+			}
+		}
+
+		key := strings.ToLower(strings.TrimSpace(value))
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		label := strings.TrimSpace(m.Label)
+		if label == "" {
+			label = value
+		}
+		out = append(out, assistantModelItem{
+			Value:       value,
+			Label:       label,
+			Provider:    provider,
+			Recommended: m.Recommended,
+		})
+	}
+	return out
+}
+
+func buildAssistantModelItemsFromProviders(aiCfg config.AIConfig) []assistantModelItem {
+	if len(aiCfg.Providers) == 0 {
+		fallbackModel := strings.TrimSpace(aiCfg.ChatModel)
+		if fallbackModel == "" {
+			fallbackModel = strings.TrimSpace(aiCfg.DefaultModel)
+		}
+		if fallbackModel == "" {
+			return []assistantModelItem{}
+		}
+		return []assistantModelItem{{
+			Value:       fallbackModel,
+			Label:       fallbackModel,
+			Recommended: true,
+		}}
+	}
+
+	normalizedProviders := make(map[string]config.AIProviderConfig, len(aiCfg.Providers))
+	for rawKey, providerCfg := range aiCfg.Providers {
+		key := strings.ToLower(strings.TrimSpace(rawKey))
+		if key == "" {
+			continue
+		}
+		normalizedProviders[key] = providerCfg
+	}
+	if len(normalizedProviders) == 0 {
+		return []assistantModelItem{}
+	}
+
+	defaultProvider := strings.ToLower(strings.TrimSpace(aiCfg.DefaultProvider))
+	providerKeys := make([]string, 0, len(normalizedProviders))
+	for provider := range normalizedProviders {
+		providerKeys = append(providerKeys, strings.ToLower(strings.TrimSpace(provider)))
+	}
+	sort.Strings(providerKeys)
+	if defaultProvider == "" {
+		if _, ok := normalizedProviders["qwen"]; ok {
+			defaultProvider = "qwen"
+		} else {
+			defaultProvider = providerKeys[0]
+		}
+	}
+
+	out := make([]assistantModelItem, 0, len(providerKeys)*2)
+	seen := make(map[string]struct{}, len(providerKeys)*2)
+	for _, provider := range providerKeys {
+		cfg := normalizedProviders[provider]
+		preferredModel := strings.TrimSpace(cfg.ChatModel)
+		if preferredModel == "" {
+			preferredModel = strings.TrimSpace(cfg.DefaultModel)
+		}
+		candidates := make([]string, 0, 2+len(cfg.ModelMaxCompletion))
+		if s := strings.TrimSpace(cfg.ChatModel); s != "" {
+			candidates = append(candidates, s)
+		}
+		if s := strings.TrimSpace(cfg.DefaultModel); s != "" {
+			candidates = append(candidates, s)
+		}
+		for model := range cfg.ModelMaxCompletion {
+			model = strings.TrimSpace(model)
+			if model != "" {
+				candidates = append(candidates, model)
+			}
+		}
+
+		for _, model := range candidates {
+			value := model
+			if provider != "" && provider != defaultProvider {
+				value = provider + ":" + model
+			}
+			key := strings.ToLower(strings.TrimSpace(value))
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, assistantModelItem{
+				Value:       value,
+				Label:       fmt.Sprintf("%s - %s", strings.ToUpper(provider), model),
+				Provider:    provider,
+				Recommended: provider == defaultProvider && model == preferredModel,
+			})
+		}
+	}
+
+	if len(out) == 0 {
+		return []assistantModelItem{}
+	}
+	return out
 }
 
 type createConversationRequest struct {
