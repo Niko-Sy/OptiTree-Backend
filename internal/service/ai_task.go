@@ -277,7 +277,7 @@ func (s *AITaskService) createTask(
 	taskType, modelName, userID string,
 	projectID *string,
 	idempotencyKey string,
-) (*model.AITask, error) {
+) (*model.AITask, bool, error) {
 	now := time.Now().UTC()
 	task := &model.AITask{
 		ID:           util.NewAITaskID(),
@@ -298,10 +298,44 @@ func (s *AITaskService) createTask(
 		task.IdempotencyKey = &v
 	}
 	if err := s.taskRepo.Create(task); err != nil {
-		return nil, err
+		if task.IdempotencyKey != nil && isAITaskIdempotencyConflict(err) {
+			existing, findErr := s.taskRepo.FindByIdempotencyKey(*task.IdempotencyKey)
+			if findErr != nil {
+				return nil, false, findErr
+			}
+			if existing != nil {
+				s.cacheStatus(ctx, existing.ID, existing.Status, existing.Progress, existing.Stage, existing.StageLabel)
+				return existing, false, nil
+			}
+		}
+		return nil, false, err
 	}
 	s.cacheStatus(ctx, task.ID, task.Status, task.Progress, task.Stage, task.StageLabel)
-	return task, nil
+	return task, true, nil
+}
+
+func isAITaskIdempotencyConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "uq_ai_tasks_idempotency_key") {
+		return true
+	}
+	return strings.Contains(msg, "duplicate key value") && strings.Contains(msg, "idempotency_key")
+}
+
+func projectGenerationStatusFromTaskStatus(taskStatus string) string {
+	switch strings.TrimSpace(taskStatus) {
+	case constant.AITaskStatusCompleted:
+		return constant.ProjectGenerationCompleted
+	case constant.AITaskStatusFailed, constant.AITaskStatusDead:
+		return constant.ProjectGenerationFailed
+	case constant.AITaskStatusProcessing, constant.AITaskStatusRetrying:
+		return constant.ProjectGenerationRunning
+	default:
+		return constant.ProjectGenerationPending
+	}
 }
 
 func (s *AITaskService) collectTaskDocuments(docIDs []string) ([]AITaskQueueDocument, error) {
@@ -556,10 +590,14 @@ func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFau
 	}
 	projectID := project.ID
 	idem := buildIdempotencyKey(constant.AITaskTypeGenerateFaultTree, input.UserID, &projectID, input.TopEvent, input.DocIDs, cfg)
-	task, err := s.createTask(ctx, constant.AITaskTypeGenerateFaultTree, modelName, input.UserID, &projectID, idem)
+	task, created, err := s.createTask(ctx, constant.AITaskTypeGenerateFaultTree, modelName, input.UserID, &projectID, idem)
 	if err != nil {
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
 		return nil, err
+	}
+	if !created {
+		_ = s.setProjectGenerationStatus(projectID, projectGenerationStatusFromTaskStatus(task.Status))
+		return &GenerateFaultTreeOutput{TaskID: task.ID, Status: task.Status, ProjectID: projectID}, nil
 	}
 
 	documents, err := s.collectTaskDocuments(input.DocIDs)
@@ -637,10 +675,14 @@ func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input Genera
 	}
 	projectID := project.ID
 	idem := buildIdempotencyKey(constant.AITaskTypeGenerateKnowledgeGraph, input.UserID, &projectID, "", input.DocIDs, cfg)
-	task, err := s.createTask(ctx, constant.AITaskTypeGenerateKnowledgeGraph, modelName, input.UserID, &projectID, idem)
+	task, created, err := s.createTask(ctx, constant.AITaskTypeGenerateKnowledgeGraph, modelName, input.UserID, &projectID, idem)
 	if err != nil {
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
 		return nil, err
+	}
+	if !created {
+		_ = s.setProjectGenerationStatus(projectID, projectGenerationStatusFromTaskStatus(task.Status))
+		return &GenerateKnowledgeGraphOutput{TaskID: task.ID, Status: task.Status, ProjectID: projectID}, nil
 	}
 
 	documents, err := s.collectTaskDocuments(input.DocIDs)
@@ -723,6 +765,11 @@ func (s *AITaskService) HandleTaskCallback(ctx context.Context, input TaskCallba
 	}
 
 	if isAITaskTerminalStatus(task.Status) {
+		if task.Status == constant.AITaskStatusCompleted && status == constant.AITaskStatusCompleted {
+			s.releaseProjectLock(ctx, projectID, taskID)
+			s.clearTaskStreamEntries(ctx, taskID)
+			return nil
+		}
 		if !(task.Status == constant.AITaskStatusFailed && status == constant.AITaskStatusDead) {
 			return nil
 		}
@@ -788,11 +835,6 @@ func (s *AITaskService) HandleTaskCallback(ctx context.Context, input TaskCallba
 		return nil
 
 	case constant.AITaskStatusCompleted:
-		if task.Status == constant.AITaskStatusCompleted {
-			s.releaseProjectLock(ctx, projectID, taskID)
-			s.clearTaskStreamEntries(ctx, taskID)
-			return nil
-		}
 		if stage == "" {
 			stage = "completed"
 		}
@@ -822,11 +864,16 @@ func (s *AITaskService) HandleTaskCallback(ctx context.Context, input TaskCallba
 
 		resultJSON, _ := json.Marshal(normalizedResult)
 		if err := s.taskRepo.SetCompleted(taskID, resultJSON); err != nil {
+			s.releaseProjectLock(ctx, projectID, taskID)
+			s.clearTaskStreamEntries(ctx, taskID)
 			return err
 		}
 		s.releaseProjectLock(ctx, projectID, taskID)
 		s.clearTaskStreamEntries(ctx, taskID)
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationCompleted)
+		if task.Type == constant.AITaskTypeGenerateFaultTree && s.projectService != nil {
+			s.projectService.invalidateProjectListCachesByProject(ctx, projectID)
+		}
 		s.cacheStatus(ctx, taskID, constant.AITaskStatusCompleted, 100, stage, stageLabel)
 		s.publishTaskEvent(TaskProgressEvent{
 			Event:         "task.completed",

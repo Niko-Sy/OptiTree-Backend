@@ -32,6 +32,20 @@ func (r *AITaskRepository) FindByID(id string) (*model.AITask, error) {
 	return &task, err
 }
 
+func (r *AITaskRepository) FindByIdempotencyKey(key string) (*model.AITask, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, nil
+	}
+
+	var task model.AITask
+	err := r.db.Where("idempotency_key = ?", key).First(&task).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	return &task, err
+}
+
 func (r *AITaskRepository) FindLatestByProjectAndType(projectID, taskType string) (*model.AITask, error) {
 	var task model.AITask
 	err := r.db.Where("project_id = ? AND type = ?", projectID, taskType).
