@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -52,32 +54,34 @@ type AgentSession struct {
 	createdAt time.Time
 	expiresAt time.Time
 
-	mu            sync.RWMutex
-	state         string
-	toolCallCount int
-	serverOps     int
-	clientOps     int
-	hybridOps     int
-	tokensUsed    int
+	mu                sync.RWMutex
+	state             string
+	recentReadContext bool
+	toolCallCount     int
+	serverOps         int
+	clientOps         int
+	hybridOps         int
+	tokensUsed        int
 }
 
 // SessionSnapshot is a thread-safe view used by status APIs.
 type SessionSnapshot struct {
-	SessionID      string    `json:"sessionId"`
-	ConversationID string    `json:"conversationId"`
-	ProjectID      string    `json:"projectId"`
-	UserID         string    `json:"userId"`
-	GraphType      string    `json:"graphType"`
-	State          string    `json:"state"`
-	PendingCallID  string    `json:"pendingCallId,omitempty"`
-	PendingTool    string    `json:"pendingTool,omitempty"`
-	ToolCallCount  int       `json:"toolCallCount"`
-	ServerOps      int       `json:"serverOps"`
-	ClientOps      int       `json:"clientOps"`
-	HybridOps      int       `json:"hybridOps"`
-	TokensUsed     int       `json:"tokensUsed"`
-	CreatedAt      time.Time `json:"createdAt"`
-	ExpiresAt      time.Time `json:"expiresAt"`
+	SessionID          string    `json:"sessionId"`
+	ConversationID     string    `json:"conversationId"`
+	ProjectID          string    `json:"projectId"`
+	UserID             string    `json:"userId"`
+	GraphType          string    `json:"graphType"`
+	State              string    `json:"state"`
+	PendingCallID      string    `json:"pendingCallId,omitempty"`
+	PendingTool        string    `json:"pendingTool,omitempty"`
+	PendingArgsSummary string    `json:"pendingArgsSummary,omitempty"`
+	ToolCallCount      int       `json:"toolCallCount"`
+	ServerOps          int       `json:"serverOps"`
+	ClientOps          int       `json:"clientOps"`
+	HybridOps          int       `json:"hybridOps"`
+	TokensUsed         int       `json:"tokensUsed"`
+	CreatedAt          time.Time `json:"createdAt"`
+	ExpiresAt          time.Time `json:"expiresAt"`
 }
 
 func NewAgentSession(id, conversationID, projectID, userID, graphType string, ttl time.Duration) *AgentSession {
@@ -92,7 +96,7 @@ func NewAgentSession(id, conversationID, projectID, userID, graphType string, tt
 		UserID:         strings.TrimSpace(userID),
 		GraphType:      strings.TrimSpace(graphType),
 		state:          StateRunning,
-		confirmCh:      make(chan ConfirmSignal),
+		confirmCh:      make(chan ConfirmSignal, 8),
 		cancelCh:       make(chan struct{}),
 		createdAt:      now,
 		expiresAt:      now.Add(ttl),
@@ -106,21 +110,22 @@ func (s *AgentSession) Snapshot() SessionSnapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return SessionSnapshot{
-		SessionID:      s.ID,
-		ConversationID: s.ConversationID,
-		ProjectID:      s.ProjectID,
-		UserID:         s.UserID,
-		GraphType:      s.GraphType,
-		State:          s.state,
-		PendingCallID:  s.PendingCallID,
-		PendingTool:    s.PendingTool,
-		ToolCallCount:  s.toolCallCount,
-		ServerOps:      s.serverOps,
-		ClientOps:      s.clientOps,
-		HybridOps:      s.hybridOps,
-		TokensUsed:     s.tokensUsed,
-		CreatedAt:      s.createdAt,
-		ExpiresAt:      s.expiresAt,
+		SessionID:          s.ID,
+		ConversationID:     s.ConversationID,
+		ProjectID:          s.ProjectID,
+		UserID:             s.UserID,
+		GraphType:          s.GraphType,
+		State:              s.state,
+		PendingCallID:      s.PendingCallID,
+		PendingTool:        s.PendingTool,
+		PendingArgsSummary: summarizePendingArgs(s.PendingArgs),
+		ToolCallCount:      s.toolCallCount,
+		ServerOps:          s.serverOps,
+		ClientOps:          s.clientOps,
+		HybridOps:          s.hybridOps,
+		TokensUsed:         s.tokensUsed,
+		CreatedAt:          s.createdAt,
+		ExpiresAt:          s.expiresAt,
 	}
 }
 
@@ -141,7 +146,11 @@ func (s *AgentSession) SetPending(callID, toolName string, args json.RawMessage)
 	defer s.mu.Unlock()
 	s.PendingCallID = strings.TrimSpace(callID)
 	s.PendingTool = strings.TrimSpace(toolName)
-	s.PendingArgs = args
+	if len(args) == 0 {
+		s.PendingArgs = nil
+		return
+	}
+	s.PendingArgs = append(json.RawMessage(nil), args...)
 }
 
 func (s *AgentSession) ClearPending() {
@@ -184,6 +193,18 @@ func (s *AgentSession) AddTokens(tokens int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tokensUsed += tokens
+}
+
+func (s *AgentSession) SetRecentReadContext(value bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recentReadContext = value
+}
+
+func (s *AgentSession) HasRecentReadContext() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.recentReadContext
 }
 
 func (s *AgentSession) MarkCancelled() {
@@ -248,8 +269,24 @@ func (m *AgentSessionManager) Confirm(sessionID string, signal ConfirmSignal) er
 	if !ok {
 		return ErrSessionNotFound
 	}
-	if session.State() == StateCancelled || session.State() == StateDone {
+	snap := session.Snapshot()
+	if snap.State == StateCancelled || snap.State == StateDone {
 		return ErrSessionClosed
+	}
+	if snap.State != StatePausedForConfirm && snap.State != StatePausedForPreview {
+		return ErrSessionNotWaiting
+	}
+
+	pendingCallID := strings.TrimSpace(snap.PendingCallID)
+	signalCallID := strings.TrimSpace(signal.CallID)
+	if pendingCallID != "" {
+		if signalCallID == "" {
+			signal.CallID = pendingCallID
+			signalCallID = pendingCallID
+		}
+		if signalCallID != pendingCallID {
+			return ErrSessionNotWaiting
+		}
 	}
 
 	select {
@@ -259,6 +296,47 @@ func (m *AgentSessionManager) Confirm(sessionID string, signal ConfirmSignal) er
 		return nil
 	default:
 		return ErrSessionNotWaiting
+	}
+}
+
+func summarizePendingArgs(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return ""
+	}
+	if !json.Valid([]byte(trimmed)) {
+		if len(trimmed) > 120 {
+			return fmt.Sprintf("invalid_json(len=%d)", len(trimmed))
+		}
+		return "invalid_json"
+	}
+
+	var payload interface{}
+	if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
+		return fmt.Sprintf("json(len=%d)", len(trimmed))
+	}
+	switch v := payload.(type) {
+	case map[string]interface{}:
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			k := strings.TrimSpace(key)
+			if k == "" {
+				continue
+			}
+			keys = append(keys, k)
+		}
+		if len(keys) == 0 {
+			return "json_object(keys=0)"
+		}
+		sort.Strings(keys)
+		if len(keys) > 6 {
+			keys = keys[:6]
+		}
+		return fmt.Sprintf("json_object(keys=%s)", strings.Join(keys, ","))
+	case []interface{}:
+		return fmt.Sprintf("json_array(size=%d)", len(v))
+	default:
+		return "json_scalar"
 	}
 }
 

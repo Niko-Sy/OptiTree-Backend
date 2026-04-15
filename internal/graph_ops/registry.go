@@ -2,6 +2,8 @@ package graph_ops
 
 import (
 	"encoding/json"
+	"fmt"
+	"sort"
 	"strings"
 
 	"optitree-backend/internal/ai"
@@ -19,8 +21,14 @@ type ToolDefinition struct {
 	Name             string          `json:"name"`
 	Description      string          `json:"description"`
 	Tier             ExecutionTier   `json:"tier"`
+	ReadOnly         bool            `json:"readOnly"`
+	MutatesGraph     bool            `json:"mutatesGraph"`
+	RequiresRead     bool            `json:"requiresRead"`
+	Experimental     bool            `json:"experimental"`
+	ProductionReady  bool            `json:"productionReady"`
 	RequireConfirm   bool            `json:"requireConfirm"`
 	ConfirmThreshold int             `json:"confirmThreshold,omitempty"`
+	PromptExample    string          `json:"promptExample,omitempty"`
 	Parameters       json.RawMessage `json:"parameters"`
 	GraphTypes       []string        `json:"graphTypes,omitempty"`
 }
@@ -31,7 +39,10 @@ var toolRegistry = []ToolDefinition{
 		Name:           "update_node",
 		Description:    "Update node basic attributes such as name, description, and investigate method",
 		Tier:           TierServer,
+		MutatesGraph:   true,
+		RequiresRead:   true,
 		RequireConfirm: false,
+		PromptExample:  `{"nodeId":"n1","name":"修正后的节点名称"}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -48,12 +59,15 @@ var toolRegistry = []ToolDefinition{
 		Name:           "update_gate",
 		Description:    "Change gate type of a gate node",
 		Tier:           TierServer,
+		MutatesGraph:   true,
+		RequiresRead:   true,
 		RequireConfirm: false,
+		PromptExample:  `{"nodeId":"g1","gateType":"OR"}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"nodeId":   map[string]interface{}{"type": "string"},
-				"gateType": map[string]interface{}{"type": "string", "enum": []string{"AND", "OR", "VOTE"}},
+				"gateType": map[string]interface{}{"type": "string", "enum": []string{"AND", "OR", "NOT"}},
 			},
 			"required": []string{"nodeId", "gateType"},
 		}),
@@ -63,7 +77,10 @@ var toolRegistry = []ToolDefinition{
 		Name:           "add_node",
 		Description:    "Add a new event node (top/mid/basic) and attach to a valid parent",
 		Tier:           TierServer,
+		MutatesGraph:   true,
+		RequiresRead:   true,
 		RequireConfirm: false,
+		PromptExample:  `{"name":"泵失效","nodeType":"basicEvent","parentId":"g1"}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -80,11 +97,14 @@ var toolRegistry = []ToolDefinition{
 		Name:           "add_gate",
 		Description:    "Insert a gate node and rewire children under it",
 		Tier:           TierServer,
+		MutatesGraph:   true,
+		RequiresRead:   true,
 		RequireConfirm: false,
+		PromptExample:  `{"gateType":"AND","parentId":"p1","childIds":["c1","c2"]}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
-				"gateType": map[string]interface{}{"type": "string", "enum": []string{"AND", "OR", "VOTE"}},
+				"gateType": map[string]interface{}{"type": "string", "enum": []string{"AND", "OR", "NOT"}},
 				"parentId": map[string]interface{}{"type": "string"},
 				"childIds": map[string]interface{}{
 					"type":  "array",
@@ -99,7 +119,10 @@ var toolRegistry = []ToolDefinition{
 		Name:           "delete_node",
 		Description:    "Delete a node and optionally delete all descendants",
 		Tier:           TierServer,
+		MutatesGraph:   true,
+		RequiresRead:   true,
 		RequireConfirm: true,
+		PromptExample:  `{"nodeId":"n1","deleteChildren":false}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -114,7 +137,10 @@ var toolRegistry = []ToolDefinition{
 		Name:           "move_node",
 		Description:    "Change the parent node of a node",
 		Tier:           TierServer,
+		MutatesGraph:   true,
+		RequiresRead:   true,
 		RequireConfirm: false,
+		PromptExample:  `{"nodeId":"n1","newParentId":"g2"}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -129,8 +155,11 @@ var toolRegistry = []ToolDefinition{
 		Name:             "batch_operations",
 		Description:      "Execute multiple server operations atomically",
 		Tier:             TierServer,
+		MutatesGraph:     true,
+		RequiresRead:     true,
 		RequireConfirm:   true,
 		ConfirmThreshold: 5,
+		PromptExample:    `{"operations":[{"tool":"update_node","args":{"nodeId":"n1","name":"新名称"}}]}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -154,7 +183,9 @@ var toolRegistry = []ToolDefinition{
 		Name:           "get_graph_snapshot",
 		Description:    "Read full fault-tree snapshot (nodes and edges) for reasoning and verification",
 		Tier:           TierServer,
+		ReadOnly:       true,
 		RequireConfirm: false,
+		PromptExample:  `{}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -168,7 +199,9 @@ var toolRegistry = []ToolDefinition{
 		Name:           "get_node_detail",
 		Description:    "Read one node detail with incoming/outgoing relations",
 		Tier:           TierServer,
+		ReadOnly:       true,
 		RequireConfirm: false,
+		PromptExample:  `{"nodeId":"n1"}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -182,7 +215,9 @@ var toolRegistry = []ToolDefinition{
 		Name:           "get_subtree",
 		Description:    "Read subtree rooted at a node for focused analysis",
 		Tier:           TierServer,
+		ReadOnly:       true,
 		RequireConfirm: false,
+		PromptExample:  `{"rootNodeId":"n1","maxDepth":3}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -195,9 +230,11 @@ var toolRegistry = []ToolDefinition{
 	},
 	{
 		Name:           "check_gate_semantics",
-		Description:    "Check gate semantics (AND/OR/VOTE validity and child cardinality)",
+		Description:    "Check gate semantics (AND/OR/NOT validity and child cardinality)",
 		Tier:           TierServer,
+		ReadOnly:       true,
 		RequireConfirm: false,
+		PromptExample:  `{"nodeId":"g1"}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -210,7 +247,9 @@ var toolRegistry = []ToolDefinition{
 		Name:           "validate_fta_constraints",
 		Description:    "Validate IEC61025-oriented fault-tree constraints and return issues",
 		Tier:           TierServer,
+		ReadOnly:       true,
 		RequireConfirm: false,
+		PromptExample:  `{}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type":       "object",
 			"properties": map[string]interface{}{},
@@ -221,6 +260,8 @@ var toolRegistry = []ToolDefinition{
 	// Tier 2 - Client tools.
 	{
 		Name: "highlight_nodes", Description: "Highlight nodes on canvas", Tier: TierClient,
+		ReadOnly:      true,
+		PromptExample: `{"nodeIds":["n1","n2"],"color":"#ff9800"}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -233,6 +274,8 @@ var toolRegistry = []ToolDefinition{
 	},
 	{
 		Name: "locate_node", Description: "Focus viewport to a node", Tier: TierClient,
+		ReadOnly:      true,
+		PromptExample: `{"nodeId":"n1"}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object", "properties": map[string]interface{}{"nodeId": map[string]interface{}{"type": "string"}}, "required": []string{"nodeId"},
 		}),
@@ -240,26 +283,36 @@ var toolRegistry = []ToolDefinition{
 	},
 	{
 		Name: "expand_subtree", Description: "Expand a node subtree", Tier: TierClient,
-		Parameters: mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{"nodeId": map[string]interface{}{"type": "string"}}, "required": []string{"nodeId"}}),
-		GraphTypes: []string{"faultTree", "knowledgeGraph"},
+		ReadOnly:      true,
+		PromptExample: `{"nodeId":"n1"}`,
+		Parameters:    mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{"nodeId": map[string]interface{}{"type": "string"}}, "required": []string{"nodeId"}}),
+		GraphTypes:    []string{"faultTree", "knowledgeGraph"},
 	},
 	{
 		Name: "collapse_subtree", Description: "Collapse a node subtree", Tier: TierClient,
-		Parameters: mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{"nodeId": map[string]interface{}{"type": "string"}}, "required": []string{"nodeId"}}),
-		GraphTypes: []string{"faultTree", "knowledgeGraph"},
+		ReadOnly:      true,
+		PromptExample: `{"nodeId":"n1"}`,
+		Parameters:    mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{"nodeId": map[string]interface{}{"type": "string"}}, "required": []string{"nodeId"}}),
+		GraphTypes:    []string{"faultTree", "knowledgeGraph"},
 	},
 	{
 		Name: "show_node_detail", Description: "Open node detail panel", Tier: TierClient,
-		Parameters: mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{"nodeId": map[string]interface{}{"type": "string"}}, "required": []string{"nodeId"}}),
-		GraphTypes: []string{"faultTree", "knowledgeGraph"},
+		ReadOnly:      true,
+		PromptExample: `{"nodeId":"n1"}`,
+		Parameters:    mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{"nodeId": map[string]interface{}{"type": "string"}}, "required": []string{"nodeId"}}),
+		GraphTypes:    []string{"faultTree", "knowledgeGraph"},
 	},
 	{
 		Name: "preview_layout", Description: "Preview an alternate layout without persisting", Tier: TierClient,
-		Parameters: mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{"layout": map[string]interface{}{"type": "object"}}}),
-		GraphTypes: []string{"faultTree", "knowledgeGraph"},
+		ReadOnly:      true,
+		PromptExample: `{"layout":{"mode":"hierarchical"}}`,
+		Parameters:    mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{"layout": map[string]interface{}{"type": "object"}}}),
+		GraphTypes:    []string{"faultTree", "knowledgeGraph"},
 	},
 	{
 		Name: "annotate_node", Description: "Attach temporary annotation on node", Tier: TierClient,
+		ReadOnly:      true,
+		PromptExample: `{"nodeId":"n1","text":"建议补充边界条件"}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -274,23 +327,36 @@ var toolRegistry = []ToolDefinition{
 	// Tier 3 - Hybrid tools.
 	{
 		Name: "suggest_batch_label_fix", Description: "Suggest batch label cleanup operations", Tier: TierHybrid,
-		Parameters: mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}),
-		GraphTypes: []string{"faultTree"},
+		Experimental:    true,
+		ProductionReady: true,
+		RequiresRead:    true,
+		PromptExample:   `{}`,
+		Parameters:      mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}),
+		GraphTypes:      []string{"faultTree"},
 	},
 	{
 		Name: "suggest_gate_corrections", Description: "Suggest gate corrections based on topology hints", Tier: TierHybrid,
-		Parameters: mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}),
-		GraphTypes: []string{"faultTree"},
+		Experimental:  true,
+		RequiresRead:  true,
+		PromptExample: `{}`,
+		Parameters:    mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}),
+		GraphTypes:    []string{"faultTree"},
 	},
 	{
 		Name: "suggest_layout_optimization", Description: "Suggest layout optimization preview", Tier: TierHybrid,
-		Parameters: mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}),
-		GraphTypes: []string{"faultTree"},
+		Experimental:  true,
+		RequiresRead:  true,
+		PromptExample: `{}`,
+		Parameters:    mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}),
+		GraphTypes:    []string{"faultTree"},
 	},
 	{
 		Name: "suggest_node_merge", Description: "Suggest duplicate node merge candidates", Tier: TierHybrid,
-		Parameters: mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}),
-		GraphTypes: []string{"faultTree"},
+		Experimental:  true,
+		RequiresRead:  true,
+		PromptExample: `{}`,
+		Parameters:    mustJSON(map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}),
+		GraphTypes:    []string{"faultTree"},
 	},
 }
 
@@ -322,6 +388,81 @@ func GetToolsForGraphType(graphType string) []ToolDefinition {
 		}
 	}
 	return out
+}
+
+func FilterToolsForMode(graphType string, readOnly bool, includeExperimental bool) []ToolDefinition {
+	defs := GetToolsForGraphType(graphType)
+	out := make([]ToolDefinition, 0, len(defs))
+	for _, def := range defs {
+		if def.Experimental && !includeExperimental && !def.ProductionReady {
+			continue
+		}
+
+		if readOnly {
+			if def.MutatesGraph {
+				continue
+			}
+			if def.Tier == TierHybrid {
+				continue
+			}
+			if strings.EqualFold(def.Name, "annotate_node") || strings.EqualFold(def.Name, "preview_layout") {
+				continue
+			}
+		}
+
+		out = append(out, def)
+	}
+	return out
+}
+
+func BuildToolPromptGuide(defs []ToolDefinition) string {
+	if len(defs) == 0 {
+		return "No tool is available for this turn."
+	}
+
+	lines := make([]string, 0, len(defs)+2)
+	lines = append(lines,
+		"Use only tools listed below; names and parameters are authoritative.",
+		"Prefer read -> validate -> mutate -> validate for graph edits.",
+	)
+
+	for _, def := range defs {
+		required := requiredParamNames(def.Parameters)
+		requiredHint := "none"
+		if len(required) > 0 {
+			requiredHint = strings.Join(required, ",")
+		}
+		flags := make([]string, 0, 4)
+		if def.ReadOnly {
+			flags = append(flags, "read_only")
+		}
+		if def.MutatesGraph {
+			flags = append(flags, "mutates_graph")
+		}
+		if def.RequiresRead {
+			flags = append(flags, "requires_read")
+		}
+		if def.RequireConfirm {
+			flags = append(flags, "requires_confirm")
+		}
+		if def.Experimental {
+			flags = append(flags, "experimental")
+		}
+		if def.ProductionReady {
+			flags = append(flags, "production_ready")
+		}
+		if len(flags) == 0 {
+			flags = append(flags, "none")
+		}
+
+		line := fmt.Sprintf("- %s | tier=%s | required=[%s] | flags=[%s] | %s", def.Name, def.Tier, requiredHint, strings.Join(flags, ","), strings.TrimSpace(def.Description))
+		lines = append(lines, line)
+		if sample := strings.TrimSpace(def.PromptExample); sample != "" {
+			lines = append(lines, fmt.Sprintf("  example: %s", sample))
+		}
+	}
+
+	return strings.Join(lines, "\n")
 }
 
 func ToOAITools(defs []ToolDefinition) []ai.OAIToolDef {
@@ -359,10 +500,38 @@ func ToolSupportsGraphType(def *ToolDefinition, graphType string) bool {
 }
 
 func ToolMutatesGraph(toolName string) bool {
-	switch strings.ToLower(strings.TrimSpace(toolName)) {
-	case "update_node", "update_gate", "add_node", "add_gate", "delete_node", "move_node", "batch_operations":
-		return true
-	default:
+	def, ok := GetTool(toolName)
+	if !ok {
 		return false
 	}
+	return def.MutatesGraph
+}
+
+func requiredParamNames(schemaRaw json.RawMessage) []string {
+	if len(schemaRaw) == 0 {
+		return nil
+	}
+
+	var schema map[string]interface{}
+	if err := json.Unmarshal(schemaRaw, &schema); err != nil {
+		return nil
+	}
+	required, ok := schema["required"].([]interface{})
+	if !ok || len(required) == 0 {
+		return nil
+	}
+
+	out := make([]string, 0, len(required))
+	for _, item := range required {
+		s := strings.TrimSpace(fmt.Sprintf("%v", item))
+		if s == "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return out
 }

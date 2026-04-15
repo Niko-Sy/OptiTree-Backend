@@ -31,8 +31,23 @@ type GraphPatch struct {
 }
 
 type ExecuteResult struct {
-	Summary string     `json:"summary"`
-	Patch   GraphPatch `json:"patch"`
+	Summary      string     `json:"summary"`
+	Patch        GraphPatch `json:"patch"`
+	ChangedNodes int        `json:"changedNodes,omitempty"`
+	ChangedEdges int        `json:"changedEdges,omitempty"`
+}
+
+type PlannedOperation struct {
+	ToolName string          `json:"toolName"`
+	Args     json.RawMessage `json:"args"`
+}
+
+type PlannedPatchSet struct {
+	Operations   []PlannedOperation `json:"operations"`
+	Patch        GraphPatch         `json:"patch"`
+	Summary      []string           `json:"summary"`
+	ChangedNodes int                `json:"changedNodes"`
+	ChangedEdges int                `json:"changedEdges"`
 }
 
 type Executor struct {
@@ -63,6 +78,7 @@ type operationResult struct {
 	summary      string
 	patch        GraphPatch
 	changedNodes int
+	changedEdges int
 }
 
 type ftaConstraintIssue struct {
@@ -83,38 +99,22 @@ func (e *Executor) Execute(ctx context.Context, projectID, graphType, toolName s
 		return nil, fmt.Errorf("%w: %s", ErrExecutorUnsupportedGraph, graphType)
 	}
 
-	if err := ValidateParameters(toolName, args); err != nil {
-		return nil, err
-	}
-
 	nodes, edges, err := e.graphRepo.GetFaultTreeGraph(projectID)
 	if err != nil {
 		return nil, err
 	}
 	state := newFaultTreeState(nodes, edges)
 
-	opResult, err := e.applyOperation(state, projectID, toolName, args)
+	plan, err := e.PlanFaultTreeOperation(state, projectID, toolName, args)
 	if err != nil {
 		return nil, err
 	}
 
-	if operationHasGraphChanges(opResult) {
-		if err := enforceFaultTreeMutationSafety(state); err != nil {
-			return nil, err
-		}
-		if err := e.persistFaultTree(ctx, projectID, toolName, opResult.summary, state.nodes, state.edges); err != nil {
-			return nil, err
-		}
-
-		if e.rdb != nil {
-			_ = e.rdb.Del(ctx, constant.RedisKeyGraphFT+projectID).Err()
-		}
+	result, _, _, _, err := e.applyPlannedPatchSet(ctx, projectID, graphType, toolName, state, plan, -1)
+	if err != nil {
+		return nil, err
 	}
-
-	return &ExecuteResult{
-		Summary: opResult.summary,
-		Patch:   opResult.patch,
-	}, nil
+	return result, nil
 }
 
 func (e *Executor) ExecuteFaultTreeSnapshot(
@@ -132,26 +132,167 @@ func (e *Executor) ExecuteFaultTreeSnapshot(
 		return nil, nil, nil, expectedRevision, fmt.Errorf("%w: missing projectID/toolName", ErrInvalidParameters)
 	}
 
-	if err := ValidateParameters(toolName, args); err != nil {
-		return nil, nil, nil, expectedRevision, err
-	}
-
 	state := newFaultTreeState(baseNodes, baseEdges)
-	opResult, err := e.applyOperation(state, projectID, toolName, args)
+	plan, err := e.PlanFaultTreeOperation(state, projectID, toolName, args)
 	if err != nil {
 		return nil, nil, nil, expectedRevision, err
 	}
 
+	result, nextNodes, nextEdges, nextRevision, err := e.applyPlannedPatchSet(
+		ctx,
+		projectID,
+		"faultTree",
+		toolName,
+		state,
+		plan,
+		expectedRevision,
+	)
+	if err != nil {
+		return nil, nil, nil, expectedRevision, err
+	}
+
+	return result, nextNodes, nextEdges, nextRevision, nil
+}
+
+func (e *Executor) PlanFaultTreeOperation(state *faultTreeState, projectID, toolName string, args json.RawMessage) (*PlannedPatchSet, error) {
+	if state == nil {
+		return nil, fmt.Errorf("%w: state is nil", ErrInvalidParameters)
+	}
+	toolName = strings.TrimSpace(toolName)
+	projectID = strings.TrimSpace(projectID)
+	if toolName == "" {
+		return nil, fmt.Errorf("%w: toolName is required", ErrInvalidParameters)
+	}
+	if err := ValidateParameters(toolName, args); err != nil {
+		return nil, err
+	}
+
+	opResult, err := e.applyOperation(state, projectID, toolName, args)
+	if err != nil {
+		return nil, err
+	}
+	if opResult == nil {
+		opResult = &operationResult{summary: "", patch: GraphPatch{}}
+	}
+
+	changedNodes := opResult.changedNodes
+	changedEdges := opResult.changedEdges
+	if changedNodes == 0 && changedEdges == 0 {
+		changedNodes, changedEdges = patchChangedCounts(opResult.patch)
+	}
+
+	summary := strings.TrimSpace(opResult.summary)
+	plan := &PlannedPatchSet{
+		Operations:   expandPlannedOperations(toolName, args),
+		Patch:        opResult.patch,
+		Summary:      make([]string, 0, 1),
+		ChangedNodes: changedNodes,
+		ChangedEdges: changedEdges,
+	}
+	if summary != "" {
+		plan.Summary = append(plan.Summary, summary)
+	}
+	return plan, nil
+}
+
+func (e *Executor) ApplyPatchSet(ctx context.Context, projectID, graphType string, plan *PlannedPatchSet) (*ExecuteResult, error) {
+	projectID = strings.TrimSpace(projectID)
+	graphType = strings.TrimSpace(graphType)
+	if projectID == "" || graphType == "" {
+		return nil, fmt.Errorf("%w: missing projectID/graphType", ErrInvalidParameters)
+	}
+	if graphType != "faultTree" {
+		return nil, fmt.Errorf("%w: %s", ErrExecutorUnsupportedGraph, graphType)
+	}
+	if plan == nil || len(plan.Operations) == 0 {
+		return nil, fmt.Errorf("%w: operations is required", ErrInvalidParameters)
+	}
+
+	nodes, edges, err := e.graphRepo.GetFaultTreeGraph(projectID)
+	if err != nil {
+		return nil, err
+	}
+	state := newFaultTreeState(nodes, edges)
+
+	mergedPlan := &PlannedPatchSet{
+		Operations:   make([]PlannedOperation, 0, len(plan.Operations)),
+		Summary:      make([]string, 0, len(plan.Operations)),
+		Patch:        GraphPatch{},
+		ChangedNodes: 0,
+		ChangedEdges: 0,
+	}
+
+	for _, op := range plan.Operations {
+		opPlan, err := e.PlanFaultTreeOperation(state, projectID, op.ToolName, op.Args)
+		if err != nil {
+			return nil, err
+		}
+		mergedPlan.Operations = append(mergedPlan.Operations, PlannedOperation{
+			ToolName: strings.TrimSpace(op.ToolName),
+			Args:     cloneJSONRaw(op.Args),
+		})
+		mergedPlan.Summary = append(mergedPlan.Summary, opPlan.Summary...)
+		mergedPlan.Patch = mergePatch(mergedPlan.Patch, opPlan.Patch)
+		mergedPlan.ChangedNodes += opPlan.ChangedNodes
+		mergedPlan.ChangedEdges += opPlan.ChangedEdges
+	}
+
+	result, _, _, _, err := e.applyPlannedPatchSet(ctx, projectID, graphType, "batch_operations", state, mergedPlan, -1)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (e *Executor) applyPlannedPatchSet(
+	ctx context.Context,
+	projectID,
+	graphType,
+	auditToolName string,
+	state *faultTreeState,
+	plan *PlannedPatchSet,
+	expectedRevision int,
+) (*ExecuteResult, []model.FaultTreeNode, []model.FaultTreeEdge, int, error) {
+	if graphType != "faultTree" {
+		return nil, nil, nil, expectedRevision, fmt.Errorf("%w: %s", ErrExecutorUnsupportedGraph, graphType)
+	}
+	if state == nil {
+		return nil, nil, nil, expectedRevision, fmt.Errorf("%w: state is nil", ErrInvalidParameters)
+	}
+	if plan == nil {
+		plan = &PlannedPatchSet{}
+	}
+
+	summary := strings.TrimSpace(strings.Join(plan.Summary, "；"))
+	if summary == "" {
+		if len(plan.Operations) > 1 {
+			summary = fmt.Sprintf("已执行 %d 个批量操作", len(plan.Operations))
+		} else if len(plan.Operations) == 1 {
+			summary = fmt.Sprintf("已执行 %s", strings.TrimSpace(plan.Operations[0].ToolName))
+		} else {
+			summary = "无变更"
+		}
+	}
+
+	result := &ExecuteResult{
+		Summary:      summary,
+		Patch:        plan.Patch,
+		ChangedNodes: plan.ChangedNodes,
+		ChangedEdges: plan.ChangedEdges,
+	}
+
 	nextRevision := expectedRevision
-	if operationHasGraphChanges(opResult) {
+	if plannedPatchHasGraphChanges(plan) {
 		if err := enforceFaultTreeMutationSafety(state); err != nil {
 			return nil, nil, nil, expectedRevision, err
 		}
+
+		var err error
 		nextRevision, err = e.persistFaultTreeWithExpectedRevision(
 			ctx,
 			projectID,
-			toolName,
-			opResult.summary,
+			strings.TrimSpace(auditToolName),
+			summary,
 			state.nodes,
 			state.edges,
 			expectedRevision,
@@ -165,10 +306,7 @@ func (e *Executor) ExecuteFaultTreeSnapshot(
 		}
 	}
 
-	return &ExecuteResult{
-		Summary: opResult.summary,
-		Patch:   opResult.patch,
-	}, append([]model.FaultTreeNode(nil), state.nodes...), append([]model.FaultTreeEdge(nil), state.edges...), nextRevision, nil
+	return result, append([]model.FaultTreeNode(nil), state.nodes...), append([]model.FaultTreeEdge(nil), state.edges...), nextRevision, nil
 }
 
 func (e *Executor) persistFaultTree(ctx context.Context, projectID, toolName, summary string, nodes []model.FaultTreeNode, edges []model.FaultTreeEdge) error {
@@ -358,7 +496,7 @@ func (e *Executor) applyUpdateGate(state *faultTreeState, args json.RawMessage) 
 	}
 	gateType := strings.ToUpper(strings.TrimSpace(req.GateType))
 	if !isValidGateType(gateType) {
-		return nil, fmt.Errorf("%w: gateType must be AND|OR|VOTE", ErrInvalidParameters)
+		return nil, fmt.Errorf("%w: gateType must be AND|OR|NOT", ErrInvalidParameters)
 	}
 
 	node, ok := state.getNode(req.NodeID)
@@ -469,7 +607,8 @@ func (e *Executor) applyAddNode(state *faultTreeState, args json.RawMessage) (*o
 		summary = fmt.Sprintf("已新增节点 %s 并连接到父节点 %s", newNode.ID, parentID)
 	}
 
-	return &operationResult{summary: summary, patch: patch, changedNodes: 1}, nil
+	_, changedEdges := patchChangedCounts(patch)
+	return &operationResult{summary: summary, patch: patch, changedNodes: 1, changedEdges: changedEdges}, nil
 }
 
 func (e *Executor) applyAddGate(state *faultTreeState, args json.RawMessage) (*operationResult, error) {
@@ -536,8 +675,15 @@ func (e *Executor) applyAddGate(state *faultTreeState, args json.RawMessage) (*o
 		childSet[cid] = struct{}{}
 		orderedChildren = append(orderedChildren, cid)
 	}
-	if len(orderedChildren) < 2 {
-		return nil, fmt.Errorf("%w: add_gate requires at least 2 valid childIds", ErrInvalidParameters)
+	if gateType == "NOT" {
+		if len(orderedChildren) == 0 {
+			return nil, fmt.Errorf("%w: add_gate requires at least 1 valid childIds for NOT gate", ErrInvalidParameters)
+		}
+		if len(orderedChildren) > 1 {
+			return nil, fmt.Errorf("%w: NOT gate supports at most 1 child", ErrInvalidParameters)
+		}
+	} else if len(orderedChildren) < 2 {
+		return nil, fmt.Errorf("%w: add_gate requires at least 2 valid childIds for AND/OR gates", ErrInvalidParameters)
 	}
 
 	gateNode := model.FaultTreeNode{
@@ -576,10 +722,12 @@ func (e *Executor) applyAddGate(state *faultTreeState, args json.RawMessage) (*o
 		}
 	}
 
+	_, changedEdges := patchChangedCounts(patch)
 	return &operationResult{
 		summary:      fmt.Sprintf("已新增逻辑门 %s，并将 %d 个子节点从 %s 重连到该逻辑门", gateNode.ID, len(orderedChildren), parentID),
 		patch:        patch,
 		changedNodes: 1,
+		changedEdges: changedEdges,
 	}, nil
 }
 
@@ -638,10 +786,12 @@ func (e *Executor) applyDeleteNode(state *faultTreeState, args json.RawMessage) 
 		}
 	}
 
+	_, changedEdges := patchChangedCounts(patch)
 	return &operationResult{
 		summary:      fmt.Sprintf("已安全删除 %d 个节点", len(deletedNodes)),
 		patch:        patch,
 		changedNodes: len(deletedNodes),
+		changedEdges: changedEdges,
 	}, nil
 }
 
@@ -703,10 +853,12 @@ func (e *Executor) applyMoveNode(state *faultTreeState, args json.RawMessage) (*
 		patch.UpsertEdges = append(patch.UpsertEdges, faultTreeEdgePatch(newEdge))
 	}
 
+	_, changedEdges := patchChangedCounts(patch)
 	return &operationResult{
 		summary:      fmt.Sprintf("已移动节点 %s 到父节点 %s", nodeID, newParentID),
 		patch:        patch,
 		changedNodes: 1,
+		changedEdges: changedEdges,
 	}, nil
 }
 
@@ -725,8 +877,8 @@ func (e *Executor) applyBatchOperations(state *faultTreeState, projectID string,
 	}
 
 	merged := GraphPatch{}
-	summaries := make([]string, 0, len(req.Operations))
-	changed := 0
+	changedNodes := 0
+	changedEdges := 0
 
 	for _, op := range req.Operations {
 		if strings.EqualFold(strings.TrimSpace(op.Tool), "batch_operations") {
@@ -740,15 +892,16 @@ func (e *Executor) applyBatchOperations(state *faultTreeState, projectID string,
 		if err != nil {
 			return nil, err
 		}
-		changed += res.changedNodes
-		summaries = append(summaries, res.summary)
+		changedNodes += res.changedNodes
+		changedEdges += res.changedEdges
 		merged = mergePatch(merged, res.patch)
 	}
 
 	return &operationResult{
 		summary:      fmt.Sprintf("已执行 %d 个批量操作", len(req.Operations)),
 		patch:        merged,
-		changedNodes: changed,
+		changedNodes: changedNodes,
+		changedEdges: changedEdges,
 	}, nil
 }
 
@@ -963,21 +1116,39 @@ func (e *Executor) applyCheckGateSemantics(state *faultTreeState, args json.RawM
 			return
 		}
 
-		if node.GateType == nil || !isValidGateType(strings.TrimSpace(*node.GateType)) {
+		gateType := ""
+		if node.GateType != nil {
+			gateType = strings.ToUpper(strings.TrimSpace(*node.GateType))
+		}
+		if !isValidGateType(gateType) {
 			issues = append(issues, map[string]interface{}{
 				"nodeId":  node.ID,
 				"level":   "error",
 				"code":    "INVALID_GATE_TYPE",
-				"message": "gateType 为空或非法，必须为 AND/OR/VOTE",
+				"message": "gateType 为空或非法，必须为 AND/OR/NOT",
 			})
+			return
 		}
 
-		if childCount[node.ID] < 2 {
+		count := childCount[node.ID]
+		if gateType == "NOT" {
+			if count > 1 {
+				issues = append(issues, map[string]interface{}{
+					"nodeId":  node.ID,
+					"level":   "warning",
+					"code":    "NOT_GATE_CHILD_COUNT_TOO_HIGH",
+					"message": "NOT gate 子节点数量不能超过 1",
+				})
+			}
+			return
+		}
+
+		if count < 2 {
 			issues = append(issues, map[string]interface{}{
 				"nodeId":  node.ID,
 				"level":   "warning",
 				"code":    "GATE_CHILD_COUNT_TOO_LOW",
-				"message": "gate 子节点数量建议不少于 2",
+				"message": "AND/OR gate 子节点数量建议不少于 2",
 			})
 		}
 	}
@@ -1107,11 +1278,24 @@ func evaluateFTAConstraintIssues(state *faultTreeState) []ftaConstraintIssue {
 		}
 
 		if nodeType == "gate" {
-			if node.GateType == nil || !isValidGateType(strings.TrimSpace(*node.GateType)) {
-				issues = append(issues, ftaConstraintIssue{NodeID: nodeID, Level: "error", Code: "INVALID_GATE_TYPE", Message: "gateType 必须为 AND/OR/VOTE"})
+			gateType := ""
+			if node.GateType != nil {
+				gateType = strings.ToUpper(strings.TrimSpace(*node.GateType))
 			}
+			if !isValidGateType(gateType) {
+				issues = append(issues, ftaConstraintIssue{NodeID: nodeID, Level: "error", Code: "INVALID_GATE_TYPE", Message: "gateType 必须为 AND/OR/NOT"})
+				continue
+			}
+
+			if gateType == "NOT" {
+				if outDegree[nodeID] > 1 {
+					issues = append(issues, ftaConstraintIssue{NodeID: nodeID, Level: "warning", Code: "NOT_GATE_CHILD_COUNT_TOO_HIGH", Message: "NOT gate 子节点数量不能超过 1"})
+				}
+				continue
+			}
+
 			if outDegree[nodeID] < 2 {
-				issues = append(issues, ftaConstraintIssue{NodeID: nodeID, Level: "warning", Code: "GATE_CHILD_COUNT_TOO_LOW", Message: "gate 子节点数量建议不少于 2"})
+				issues = append(issues, ftaConstraintIssue{NodeID: nodeID, Level: "warning", Code: "GATE_CHILD_COUNT_TOO_LOW", Message: "AND/OR gate 子节点数量建议不少于 2"})
 			}
 		}
 	}
@@ -1158,7 +1342,7 @@ func isBlockingMutationIssue(issue ftaConstraintIssue) bool {
 		return true
 	}
 	switch strings.TrimSpace(issue.Code) {
-	case "BASIC_EVENT_HAS_CHILDREN", "GATE_CHILD_COUNT_TOO_LOW":
+	case "BASIC_EVENT_HAS_CHILDREN", "GATE_CHILD_COUNT_TOO_LOW", "NOT_GATE_CHILD_COUNT_TOO_HIGH":
 		return true
 	default:
 		return false
@@ -1172,7 +1356,67 @@ func operationHasGraphChanges(op *operationResult) bool {
 	if op.changedNodes > 0 {
 		return true
 	}
+	if op.changedEdges > 0 {
+		return true
+	}
 	return len(op.patch.UpsertNodes) > 0 || len(op.patch.DeleteNodes) > 0 || len(op.patch.UpsertEdges) > 0 || len(op.patch.DeleteEdges) > 0
+}
+
+func plannedPatchHasGraphChanges(plan *PlannedPatchSet) bool {
+	if plan == nil {
+		return false
+	}
+	if plan.ChangedNodes > 0 || plan.ChangedEdges > 0 {
+		return true
+	}
+	return len(plan.Patch.UpsertNodes) > 0 || len(plan.Patch.DeleteNodes) > 0 || len(plan.Patch.UpsertEdges) > 0 || len(plan.Patch.DeleteEdges) > 0
+}
+
+func patchChangedCounts(patch GraphPatch) (int, int) {
+	changedNodes := len(patch.UpsertNodes) + len(patch.DeleteNodes)
+	changedEdges := len(patch.UpsertEdges) + len(patch.DeleteEdges)
+	return changedNodes, changedEdges
+}
+
+func cloneJSONRaw(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	cloned := append(json.RawMessage(nil), raw...)
+	if !json.Valid(cloned) {
+		return json.RawMessage(`{}`)
+	}
+	return cloned
+}
+
+func expandPlannedOperations(toolName string, args json.RawMessage) []PlannedOperation {
+	name := strings.TrimSpace(toolName)
+	if !strings.EqualFold(name, "batch_operations") {
+		return []PlannedOperation{{ToolName: name, Args: cloneJSONRaw(args)}}
+	}
+
+	var payload struct {
+		Operations []struct {
+			Tool string          `json:"tool"`
+			Args json.RawMessage `json:"args"`
+		} `json:"operations"`
+	}
+	if err := json.Unmarshal(args, &payload); err != nil || len(payload.Operations) == 0 {
+		return []PlannedOperation{{ToolName: name, Args: cloneJSONRaw(args)}}
+	}
+
+	out := make([]PlannedOperation, 0, len(payload.Operations))
+	for _, op := range payload.Operations {
+		subTool := strings.TrimSpace(op.Tool)
+		if subTool == "" {
+			continue
+		}
+		out = append(out, PlannedOperation{ToolName: subTool, Args: cloneJSONRaw(op.Args)})
+	}
+	if len(out) == 0 {
+		return []PlannedOperation{{ToolName: name, Args: cloneJSONRaw(args)}}
+	}
+	return out
 }
 
 func encodeReadToolPayload(payload map[string]interface{}) string {

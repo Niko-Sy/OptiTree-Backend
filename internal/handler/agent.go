@@ -71,7 +71,13 @@ func (h *AgentHandler) AgentStream(c *gin.Context) {
 		util.Fail(c, constant.CodeServerError, err.Error())
 		return
 	}
-	defer h.sessionMgr.Remove(sessionID)
+	keepSession := false
+	defer func() {
+		if keepSession {
+			return
+		}
+		h.sessionMgr.Remove(sessionID)
+	}()
 
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -149,6 +155,10 @@ func (h *AgentHandler) AgentStream(c *gin.Context) {
 		MaxToolRounds:  maxToolRounds,
 	}, writeEvent)
 	if err != nil {
+		snap := session.Snapshot()
+		if errors.Is(err, context.Canceled) && (snap.State == agentcore.StatePausedForConfirm || snap.State == agentcore.StatePausedForPreview) {
+			keepSession = true
+		}
 		if out != nil {
 			_ = writeEvent(map[string]interface{}{
 				"type":               "done",
@@ -179,6 +189,11 @@ func (h *AgentHandler) AgentStream(c *gin.Context) {
 	if out == nil {
 		_ = writeEvent(map[string]interface{}{"type": "done", "sessionId": sessionID})
 		return
+	}
+
+	snap := session.Snapshot()
+	if snap.State == agentcore.StatePausedForConfirm || snap.State == agentcore.StatePausedForPreview {
+		keepSession = true
 	}
 	_ = writeEvent(map[string]interface{}{
 		"type":               "done",
@@ -261,7 +276,16 @@ func (h *AgentHandler) AgentStatus(c *gin.Context) {
 			util.FailForbidden(c)
 			return
 		}
-		util.Success(c, gin.H{"session": session.Snapshot(), "source": "memory"})
+		snap := session.Snapshot()
+		canConfirm := snap.State == agentcore.StatePausedForConfirm || snap.State == agentcore.StatePausedForPreview
+		util.Success(c, gin.H{
+			"session":     snap,
+			"source":      "memory",
+			"canConfirm":  canConfirm,
+			"canResume":   canConfirm,
+			"pendingTool": snap.PendingTool,
+			"expiresAt":   snap.ExpiresAt,
+		})
 		return
 	}
 
@@ -277,7 +301,53 @@ func (h *AgentHandler) AgentStatus(c *gin.Context) {
 		}
 		return
 	}
-	util.Success(c, gin.H{"session": persisted.Session, "source": "db"})
+	util.Success(c, gin.H{
+		"session":        persisted.Session,
+		"runtimeSummary": persisted.RuntimeSummary,
+		"source":         "db",
+		"canConfirm":     persisted.CanConfirm,
+		"canResume":      persisted.CanResume,
+	})
+}
+
+func (h *AgentHandler) AgentResume(c *gin.Context) {
+	sessionID := c.Param("sessionId")
+	if session, ok := h.sessionMgr.Get(sessionID); ok && session != nil {
+		if session.UserID != middleware.GetUserID(c) {
+			util.FailForbidden(c)
+			return
+		}
+		snap := session.Snapshot()
+		canConfirm := snap.State == agentcore.StatePausedForConfirm || snap.State == agentcore.StatePausedForPreview
+		util.Success(c, gin.H{
+			"session":    snap,
+			"source":     "memory",
+			"canConfirm": canConfirm,
+			"canResume":  canConfirm,
+		})
+		return
+	}
+
+	persisted, err := h.agentService.GetPersistedSessionStatus(sessionID, middleware.GetUserID(c))
+	if err != nil {
+		switch {
+		case errors.Is(err, agentcore.ErrSessionNotFound):
+			util.Fail(c, constant.CodeAgentSessionNotFound, constant.MsgAgentSessionNotFound)
+		case errors.Is(err, agentcore.ErrAgentPermissionDenied):
+			util.FailForbidden(c)
+		default:
+			util.FailServerError(c)
+		}
+		return
+	}
+
+	util.Success(c, gin.H{
+		"session":        persisted.Session,
+		"runtimeSummary": persisted.RuntimeSummary,
+		"source":         "db",
+		"canConfirm":     persisted.CanConfirm,
+		"canResume":      persisted.CanResume,
+	})
 }
 
 func (h *AgentHandler) handleSessionError(c *gin.Context, err error) {

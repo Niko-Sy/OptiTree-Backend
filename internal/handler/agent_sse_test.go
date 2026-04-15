@@ -12,6 +12,7 @@ import (
 
 	agentcore "optitree-backend/internal/agent"
 	"optitree-backend/internal/middleware"
+	"optitree-backend/internal/model"
 
 	"github.com/gin-gonic/gin"
 )
@@ -183,6 +184,8 @@ func TestAgentConfirm_AcceptsContinueRounds(t *testing.T) {
 	if err := mgr.Create(session); err != nil {
 		t.Fatalf("create session failed: %v", err)
 	}
+	session.SetPending("iter_limit_10_10", "iteration_limit_continue", nil)
+	session.SetState(agentcore.StatePausedForConfirm)
 
 	received := make(chan agentcore.ConfirmSignal, 1)
 	go func() {
@@ -257,6 +260,120 @@ func TestAgentStream_PassesSnapshotOptions(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d, body=%s", w.Code, w.Body.String())
 	}
+}
+
+func TestAgentStatus_ReturnsMemoryPendingFlags(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	mgr := agentcore.NewAgentSessionManager(time.Minute)
+	session := mgr.NewSession("s_status_mem", "c1", "p1", "user_1", "faultTree")
+	if err := mgr.Create(session); err != nil {
+		t.Fatalf("create session failed: %v", err)
+	}
+	session.SetPending("call_1", "update_node", []byte(`{"nodeId":"n1"}`))
+	session.SetState(agentcore.StatePausedForConfirm)
+
+	h := NewAgentHandler(&fakeAgentService{enabled: true}, mgr)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set(middleware.ContextKeyUserID, "user_1")
+		c.Next()
+	})
+	r.GET("/agent/sessions/:sessionId/status", h.AgentStatus)
+
+	req := httptest.NewRequest(http.MethodGet, "/agent/sessions/s_status_mem/status", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+
+	data := unwrapResponseData(t, w.Body.String())
+	if source, _ := data["source"].(string); source != "memory" {
+		t.Fatalf("expected source=memory, got %v", data["source"])
+	}
+	if canConfirm, _ := data["canConfirm"].(bool); !canConfirm {
+		t.Fatalf("expected canConfirm=true, got %v", data["canConfirm"])
+	}
+	if canResume, _ := data["canResume"].(bool); !canResume {
+		t.Fatalf("expected canResume=true, got %v", data["canResume"])
+	}
+}
+
+func TestAgentResume_ReturnsDBRuntimeWhenMemoryMissing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	expiresAt := time.Now().UTC().Add(time.Minute)
+
+	svc := &fakeAgentService{
+		enabled: true,
+		persistedOut: &agentcore.PersistedSessionStatus{
+			Session: &model.AgentSession{ID: "s_resume_db", UserID: "user_1", State: agentcore.StatePausedForConfirm},
+			RuntimeSummary: &agentcore.PersistedRuntimeSummary{
+				WaitType:              "confirm",
+				WaitStatus:            "waiting",
+				PendingCallID:         "call_db_1",
+				PendingTool:           "update_node",
+				PendingTier:           "server",
+				PendingArgsSummary:    "json_object(keys=nodeId)",
+				PendingPreviewSummary: "json_object(keys=ops)",
+				LastEventSeq:          3,
+				ExpiresAt:             &expiresAt,
+			},
+			CanConfirm: false,
+			CanResume:  true,
+		},
+	}
+
+	h := NewAgentHandler(svc, agentcore.NewAgentSessionManager(time.Minute))
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set(middleware.ContextKeyUserID, "user_1")
+		c.Next()
+	})
+	r.POST("/agent/sessions/:sessionId/resume", h.AgentResume)
+
+	req := httptest.NewRequest(http.MethodPost, "/agent/sessions/s_resume_db/resume", strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+
+	data := unwrapResponseData(t, w.Body.String())
+	if source, _ := data["source"].(string); source != "db" {
+		t.Fatalf("expected source=db, got %v", data["source"])
+	}
+	if canConfirm, _ := data["canConfirm"].(bool); canConfirm {
+		t.Fatalf("expected canConfirm=false for db fallback, got %v", data["canConfirm"])
+	}
+	if canResume, _ := data["canResume"].(bool); !canResume {
+		t.Fatalf("expected canResume=true, got %v", data["canResume"])
+	}
+	runtimeSummary, ok := data["runtimeSummary"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected runtimeSummary object, got %T", data["runtimeSummary"])
+	}
+	if waitStatus, _ := runtimeSummary["waitStatus"].(string); waitStatus != "waiting" {
+		t.Fatalf("expected runtimeSummary.waitStatus=waiting, got %v", runtimeSummary["waitStatus"])
+	}
+}
+
+func unwrapResponseData(t *testing.T, raw string) map[string]interface{} {
+	t.Helper()
+
+	var envelope map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		t.Fatalf("unmarshal response failed: %v, raw=%s", err, raw)
+	}
+	data, ok := envelope["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("response data field missing or invalid, raw=%s", raw)
+	}
+	return data
 }
 
 func parseSSEEventTypes(raw string) ([]string, error) {

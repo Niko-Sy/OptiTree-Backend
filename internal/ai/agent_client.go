@@ -23,9 +23,9 @@ func (c *Client) ChatWithTools(ctx context.Context, req AgentChatRequest) (*Agen
 	messages := buildAgentMessages(req)
 	modelUsed := c.chatModelFor(req.Model)
 
-	resp, err := c.completeWithTools(ctx, modelUsed, messages, req.Tools, normalizeToolChoice(req.ToolChoice))
+	resp, err := c.completeWithTools(ctx, modelUsed, messages, req.Tools, normalizeToolChoice(req.ToolChoice), req.Temperature)
 	if err != nil {
-		if len(req.Tools) == 0 || !shouldFallbackToTextToolCall(err) {
+		if !req.EnableFallbackParser || len(req.Tools) == 0 || !shouldFallbackToTextToolCall(err) {
 			return nil, err
 		}
 
@@ -51,10 +51,14 @@ func (c *Client) ChatWithTools(ctx context.Context, req AgentChatRequest) (*Agen
 	toolCalls := convertOAIToolCalls(first.ToolCalls)
 	reply := strings.TrimSpace(first.Content)
 	if len(toolCalls) == 0 && reply != "" {
-		fallbackCalls, cleanReply := ParseFallbackToolCalls(reply)
-		if len(fallbackCalls) > 0 {
-			toolCalls = fallbackCalls
-			reply = cleanReply
+		if req.EnableFallbackParser {
+			fallbackCalls, cleanReply := ParseFallbackToolCalls(reply)
+			if len(fallbackCalls) > 0 {
+				toolCalls = fallbackCalls
+				reply = cleanReply
+			}
+		} else {
+			reply = stripFallbackFunctionCallLines(reply)
 		}
 	}
 
@@ -81,9 +85,9 @@ func (c *Client) ChatStreamWithTools(ctx context.Context, req AgentChatRequest, 
 	messages := buildAgentMessages(req)
 	modelUsed := c.chatModelFor(req.Model)
 
-	reply, reasoningContent, toolCalls, tokensUsed, err := c.completeStreamWithTools(ctx, modelUsed, messages, req.Tools, normalizeToolChoice(req.ToolChoice), onChunk)
+	reply, reasoningContent, toolCalls, tokensUsed, err := c.completeStreamWithTools(ctx, modelUsed, messages, req.Tools, normalizeToolChoice(req.ToolChoice), req.Temperature, onChunk)
 	if err != nil {
-		if len(req.Tools) == 0 || !shouldFallbackToTextToolCall(err) {
+		if !req.EnableFallbackParser || len(req.Tools) == 0 || !shouldFallbackToTextToolCall(err) {
 			return "", "", nil, tokensUsed, modelUsed, err
 		}
 
@@ -101,6 +105,18 @@ func (c *Client) ChatStreamWithTools(ctx context.Context, req AgentChatRequest, 
 		return strings.TrimSpace(cleanReply), "", fallbackCalls, tokensUsed, modelUsed, nil
 	}
 
+	if len(toolCalls) == 0 && reply != "" {
+		if req.EnableFallbackParser {
+			fallbackCalls, cleanReply := ParseFallbackToolCalls(reply)
+			if len(fallbackCalls) > 0 {
+				toolCalls = fallbackCalls
+				reply = strings.TrimSpace(cleanReply)
+			}
+		} else {
+			reply = strings.TrimSpace(stripFallbackFunctionCallLines(reply))
+		}
+	}
+
 	return reply, reasoningContent, toolCalls, tokensUsed, modelUsed, nil
 }
 
@@ -110,6 +126,7 @@ func (c *Client) completeWithTools(
 	messages []oaiMsg,
 	tools []OAIToolDef,
 	toolChoice interface{},
+	temperature *float64,
 ) (*oaiResponse, error) {
 	if c.endpoint == "" {
 		return nil, fmt.Errorf("ai: endpoint not configured")
@@ -123,7 +140,7 @@ func (c *Client) completeWithTools(
 	body, err := json.Marshal(oaiRequest{
 		Model:               model,
 		Messages:            messages,
-		Temperature:         0.3,
+		Temperature:         resolveToolTemperature(temperature, 0.3),
 		MaxCompletionTokens: c.maxCompletionTokensFor(model),
 		Tools:               tools,
 		ToolChoice:          toolChoice,
@@ -170,6 +187,7 @@ func (c *Client) completeStreamWithTools(
 	messages []oaiMsg,
 	tools []OAIToolDef,
 	toolChoice interface{},
+	temperature *float64,
 	onChunk func(string),
 ) (string, string, []ToolCall, int, error) {
 	if c.endpoint == "" {
@@ -184,7 +202,7 @@ func (c *Client) completeStreamWithTools(
 	body, err := json.Marshal(oaiStreamRequest{
 		Model:               model,
 		Messages:            messages,
-		Temperature:         0.7,
+		Temperature:         resolveToolTemperature(temperature, 0.7),
 		Stream:              true,
 		MaxCompletionTokens: c.maxCompletionTokensFor(model),
 		Tools:               tools,
@@ -327,14 +345,6 @@ func (c *Client) completeStreamWithTools(
 	}
 
 	reply := strings.TrimSpace(replyBuilder.String())
-	if len(toolCalls) == 0 && reply != "" {
-		fallbackCalls, cleanReply := ParseFallbackToolCalls(reply)
-		if len(fallbackCalls) > 0 {
-			toolCalls = fallbackCalls
-			reply = cleanReply
-		}
-	}
-
 	return reply, strings.TrimSpace(reasoningBuilder.String()), toolCalls, tokensUsed, nil
 }
 
@@ -397,9 +407,12 @@ func buildAgentMessages(req AgentChatRequest) []oaiMsg {
 		graphTypeName = "knowledge graph"
 	}
 
-	fullContextJSON, contextMode := buildAgentFullContextJSON(req.ContextData)
+	fullContextJSON, contextMode := buildAgentFullContextJSON(req.GraphType, req.ContextData)
 	schemaHint := graphSchemaHint(req.GraphType)
 	sys := buildAgentSystemPrompt(req.GraphType, graphTypeName)
+	if guide := strings.TrimSpace(req.ToolGuide); guide != "" {
+		sys = strings.TrimSpace(sys) + "\n\n# Runtime Tool Guide\n" + guide
+	}
 	usr := buildUserPrompt(req.GraphType, schemaHint, contextMode, fullContextJSON, req.Message)
 
 	messages := []oaiMsg{{Role: "system", Content: sys}}
@@ -408,9 +421,23 @@ func buildAgentMessages(req AgentChatRequest) []oaiMsg {
 	return messages
 }
 
-func buildAgentFullContextJSON(contextData interface{}) (string, string) {
+func buildAgentFullContextJSON(graphType string, contextData interface{}) (string, string) {
 	if contextData == nil {
 		return "null", "none"
+	}
+
+	if chunkedPayload, ok := buildChunkedGraphPayload(contextData, graphType); ok {
+		raw, err := json.Marshal(chunkedPayload)
+		if err == nil {
+			return string(raw), "chunked"
+		}
+	}
+
+	if summaryPayload, ok := buildAgentSummaryContextPayload(graphType, contextData); ok {
+		raw, err := json.Marshal(summaryPayload)
+		if err == nil {
+			return string(raw), "summary"
+		}
 	}
 
 	raw, err := json.Marshal(contextData)
@@ -490,13 +517,8 @@ func buildAgentSystemPrompt(graphType string, graphTypeName string) string {
 	Use mutation tools for actual edits.
 	Never claim a structural change succeeded unless a tool result in this run confirms it.
 
-	If graph tools are available, typical useful tools may include:
-
-	* snapshot / overview tools: e.g. get_graph_snapshot
-	* node / subtree inspection tools: e.g. get_node_detail, get_subtree
-	* semantic validation tools: e.g. check_gate_semantics, validate_fta_constraints
-	* mutation tools: e.g. add_node, update_node, delete_node, add_edge, delete_edge, change_gate_type, restructure_subtree
-	Names may vary. Use whatever tools are actually available in the runtime.
+	Tool names and parameter contracts are not fixed in this prompt.
+	Always follow the Runtime Tool Guide attached by the caller and use only names listed there.
 
 	# Tool-use policy
 
@@ -694,4 +716,77 @@ func buildFallbackMessages(messages []oaiMsg, tools []OAIToolDef) []oaiMsg {
 	out = append(out, oaiMsg{Role: "system", Content: fallbackInstruction})
 	out = append(out, messages...)
 	return out
+}
+
+func resolveToolTemperature(value *float64, defaultValue float64) float64 {
+	if value == nil {
+		return defaultValue
+	}
+	t := *value
+	if t < 0 {
+		return 0
+	}
+	if t > 2 {
+		return 2
+	}
+	return t
+}
+
+func stripFallbackFunctionCallLines(raw string) string {
+	normalized := strings.ReplaceAll(raw, "\r\n", "\n")
+	lines := strings.Split(normalized, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "FUNCTION_CALL:") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+func buildAgentSummaryContextPayload(graphType string, contextData interface{}) (map[string]interface{}, bool) {
+	raw, err := json.Marshal(contextData)
+	if err != nil {
+		return nil, false
+	}
+
+	var obj map[string]interface{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, false
+	}
+
+	nodesField, edgesField, nodes, edges, ok := extractGraphArrays(obj, graphType)
+	if !ok {
+		return nil, false
+	}
+	if len(nodes) <= 180 && len(edges) <= 280 {
+		return nil, false
+	}
+
+	nodeSample := 120
+	if len(nodes) < nodeSample {
+		nodeSample = len(nodes)
+	}
+	edgeSample := 160
+	if len(edges) < edgeSample {
+		edgeSample = len(edges)
+	}
+
+	chunkNodes := [][]map[string]interface{}{nodes[:nodeSample]}
+	chunkEdges := [][]map[string]interface{}{edges[:edgeSample]}
+	summaryHeader := buildChunkSummaryHeader(graphType, nodes, edges, chunkNodes, chunkEdges, nil)
+
+	return map[string]interface{}{
+		"contextMode":   "summary",
+		"graphType":     graphType,
+		"nodesField":    nodesField,
+		"edgesField":    edgesField,
+		"nodeCount":     len(nodes),
+		"edgeCount":     len(edges),
+		"summaryHeader": summaryHeader,
+		"nodeSamples":   nodes[:nodeSample],
+		"edgeSamples":   edges[:edgeSample],
+		"note":          "Context is summarized due to graph size; use read tools before mutation.",
+	}, true
 }

@@ -12,6 +12,8 @@ func TestAgentSessionManager_ConfirmFlow(t *testing.T) {
 	if err := mgr.Create(session); err != nil {
 		t.Fatalf("create session failed: %v", err)
 	}
+	session.SetPending("call_1", "update_node", []byte(`{"nodeId":"n1"}`))
+	session.SetState(StatePausedForConfirm)
 
 	received := make(chan ConfirmSignal, 1)
 	go func() {
@@ -94,6 +96,8 @@ func TestAgentSessionManager_ConfirmFlow_WithContinueRounds(t *testing.T) {
 	if err := mgr.Create(session); err != nil {
 		t.Fatalf("create session failed: %v", err)
 	}
+	session.SetPending("iter_limit_10_10", "iteration_limit_continue", nil)
+	session.SetState(StatePausedForConfirm)
 
 	received := make(chan ConfirmSignal, 1)
 	go func() {

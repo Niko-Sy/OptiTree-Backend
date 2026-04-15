@@ -49,3 +49,23 @@ type AgentToolCall struct {
 func (AgentToolCall) TableName() string {
 	return "agent_tool_calls"
 }
+
+// AgentSessionRuntime stores resumable pending state for a session.
+type AgentSessionRuntime struct {
+	SessionID      string         `gorm:"primaryKey;column:session_id;size:32" json:"sessionId"`
+	PendingCallID  *string        `gorm:"column:pending_call_id;size:64" json:"pendingCallId,omitempty"`
+	PendingTool    *string        `gorm:"column:pending_tool_name;size:64" json:"pendingTool,omitempty"`
+	PendingTier    *string        `gorm:"column:pending_tier;size:16" json:"pendingTier,omitempty"`
+	PendingArgs    datatypes.JSON `gorm:"column:pending_args;type:jsonb" json:"pendingArgs,omitempty"`
+	PendingPreview datatypes.JSON `gorm:"column:pending_preview;type:jsonb" json:"pendingPreview,omitempty"`
+	WaitType       string         `gorm:"column:wait_type;size:20;not null;default:'none'" json:"waitType"`
+	WaitStatus     string         `gorm:"column:wait_status;size:20;not null;default:'cleared'" json:"waitStatus"`
+	LastEventSeq   int64          `gorm:"column:last_event_seq;not null;default:0" json:"lastEventSeq"`
+	ExpiresAt      *time.Time     `gorm:"column:expires_at" json:"expiresAt,omitempty"`
+	CreatedAt      time.Time      `gorm:"column:created_at;not null;autoCreateTime" json:"createdAt"`
+	UpdatedAt      time.Time      `gorm:"column:updated_at;not null;autoUpdateTime" json:"updatedAt"`
+}
+
+func (AgentSessionRuntime) TableName() string {
+	return "agent_session_runtime"
+}

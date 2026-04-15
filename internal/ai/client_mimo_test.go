@@ -103,12 +103,14 @@ func TestCompleteStreamWithTools_CollectsReasoningContent(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL+"/minimax", "mimo-key", "mimo-v1", "", time.Second)
+	var temperature *float64
 	reply, reasoning, calls, tokens, err := client.completeStreamWithTools(
 		context.Background(),
 		"mimo-v1",
 		[]oaiMsg{{Role: "user", Content: "hi"}},
 		nil,
 		nil,
+		temperature,
 		func(string) {},
 	)
 	if err != nil {

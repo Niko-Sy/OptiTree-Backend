@@ -12,6 +12,7 @@ func TestBuildAgentMessages_FaultTreeIncludesIECAndToolchainRules(t *testing.T) 
 			GraphType: "faultTree",
 			Message:   "请检查并修复故障树逻辑",
 		},
+		ToolGuide: "- get_graph_snapshot | tier=server | required=[none] | flags=[read_only]",
 	}
 
 	messages := buildAgentMessages(req)
@@ -25,7 +26,8 @@ func TestBuildAgentMessages_FaultTreeIncludesIECAndToolchainRules(t *testing.T) 
 		"Top Event",
 		"Basic Event",
 		"Toolchain-first",
-		"get_graph_snapshot",
+		"Runtime Tool Guide",
+		"get_graph_snapshot | tier=server",
 		"do NOT ask the user to resend raw nodes/edges",
 	}
 	for _, check := range checks {
@@ -57,7 +59,7 @@ func TestBuildAgentMessages_KnowledgeGraphNotPollutedByFTA(t *testing.T) {
 	}
 }
 
-func TestBuildAgentMessages_UsesFullContextModeForLargeGraphs(t *testing.T) {
+func TestBuildAgentMessages_UsesChunkedContextModeForLargeGraphs(t *testing.T) {
 	nodes := make([]map[string]interface{}, 0, 450)
 	for i := 0; i < 450; i++ {
 		nodes = append(nodes, map[string]interface{}{
@@ -84,10 +86,10 @@ func TestBuildAgentMessages_UsesFullContextModeForLargeGraphs(t *testing.T) {
 	}
 	userMsg := messages[len(messages)-1].Content
 
-	if !strings.Contains(userMsg, "Context mode: full") {
-		t.Fatalf("expected agent context mode to be full, got user prompt: %s", userMsg)
+	if !strings.Contains(userMsg, "Context mode: chunked") {
+		t.Fatalf("expected agent context mode to be chunked, got user prompt: %s", userMsg)
 	}
-	if strings.Contains(userMsg, "Context mode: chunked") {
-		t.Fatalf("agent should not use chunked context mode: %s", userMsg)
+	if strings.Contains(userMsg, "Context mode: full") {
+		t.Fatalf("large graph should not use full context mode: %s", userMsg)
 	}
 }

@@ -18,8 +18,11 @@ type ToolCallResult struct {
 // AgentChatRequest extends ChatRequest with tool definitions for Agent mode.
 type AgentChatRequest struct {
 	ChatRequest
-	Tools      []OAIToolDef `json:"tools,omitempty"`
-	ToolChoice string       `json:"toolChoice,omitempty"` // "auto" | "none"
+	Tools                []OAIToolDef `json:"tools,omitempty"`
+	ToolChoice           string       `json:"toolChoice,omitempty"` // "auto" | "none"
+	ToolGuide            string       `json:"toolGuide,omitempty"`
+	Temperature          *float64     `json:"temperature,omitempty"`
+	EnableFallbackParser bool         `json:"enableFallbackParser,omitempty"`
 }
 
 // AgentChatResponse is the response from ChatWithTools.

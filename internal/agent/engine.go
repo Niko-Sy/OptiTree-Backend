@@ -80,6 +80,7 @@ type AgentService struct {
 	conversationRepo  *repository.AIConversationRepository
 	chatMessageRepo   *repository.AIChatMessageRepository
 	agentSessionRepo  *repository.AgentSessionRepository
+	agentRuntimeRepo  *repository.AgentSessionRuntimeRepository
 	agentToolCallRepo *repository.AgentToolCallRepository
 	ftService         *service.FaultTreeService
 	kgService         *service.KnowledgeGraphService
@@ -87,7 +88,23 @@ type AgentService struct {
 }
 
 type PersistedSessionStatus struct {
-	Session *model.AgentSession `json:"session"`
+	Session        *model.AgentSession      `json:"session"`
+	RuntimeSummary *PersistedRuntimeSummary `json:"runtimeSummary,omitempty"`
+	CanConfirm     bool                     `json:"canConfirm"`
+	CanResume      bool                     `json:"canResume"`
+}
+
+type PersistedRuntimeSummary struct {
+	WaitType              string     `json:"waitType"`
+	WaitStatus            string     `json:"waitStatus"`
+	PendingCallID         string     `json:"pendingCallId,omitempty"`
+	PendingTool           string     `json:"pendingTool,omitempty"`
+	PendingTier           string     `json:"pendingTier,omitempty"`
+	PendingArgsSummary    string     `json:"pendingArgsSummary,omitempty"`
+	PendingPreviewSummary string     `json:"pendingPreviewSummary,omitempty"`
+	LastEventSeq          int64      `json:"lastEventSeq"`
+	ExpiresAt             *time.Time `json:"expiresAt,omitempty"`
+	UpdatedAt             time.Time  `json:"updatedAt,omitempty"`
 }
 
 func NewAgentService(
@@ -100,6 +117,7 @@ func NewAgentService(
 	conversationRepo *repository.AIConversationRepository,
 	chatMessageRepo *repository.AIChatMessageRepository,
 	agentSessionRepo *repository.AgentSessionRepository,
+	agentRuntimeRepo *repository.AgentSessionRuntimeRepository,
 	agentToolCallRepo *repository.AgentToolCallRepository,
 	ftService *service.FaultTreeService,
 	kgService *service.KnowledgeGraphService,
@@ -115,6 +133,7 @@ func NewAgentService(
 		conversationRepo:  conversationRepo,
 		chatMessageRepo:   chatMessageRepo,
 		agentSessionRepo:  agentSessionRepo,
+		agentRuntimeRepo:  agentRuntimeRepo,
 		agentToolCallRepo: agentToolCallRepo,
 		ftService:         ftService,
 		kgService:         kgService,
@@ -144,7 +163,62 @@ func (s *AgentService) GetPersistedSessionStatus(sessionID, userID string) (*Per
 		return nil, ErrAgentPermissionDenied
 	}
 
-	return &PersistedSessionStatus{Session: record}, nil
+	var runtime *model.AgentSessionRuntime
+	if s.agentRuntimeRepo != nil {
+		runtime, err = s.agentRuntimeRepo.FindBySessionID(sessionID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	status := &PersistedSessionStatus{Session: record}
+	if runtime != nil {
+		status.RuntimeSummary = buildPersistedRuntimeSummary(runtime)
+		status.CanResume = canResumeFromRuntime(runtime)
+	}
+
+	return status, nil
+}
+
+func buildPersistedRuntimeSummary(runtime *model.AgentSessionRuntime) *PersistedRuntimeSummary {
+	if runtime == nil {
+		return nil
+	}
+
+	summary := &PersistedRuntimeSummary{
+		WaitType:              strings.TrimSpace(runtime.WaitType),
+		WaitStatus:            strings.TrimSpace(runtime.WaitStatus),
+		PendingArgsSummary:    summarizePendingArgs(json.RawMessage(runtime.PendingArgs)),
+		PendingPreviewSummary: summarizePendingArgs(json.RawMessage(runtime.PendingPreview)),
+		LastEventSeq:          runtime.LastEventSeq,
+		ExpiresAt:             runtime.ExpiresAt,
+		UpdatedAt:             runtime.UpdatedAt,
+	}
+	if runtime.PendingCallID != nil {
+		summary.PendingCallID = strings.TrimSpace(*runtime.PendingCallID)
+	}
+	if runtime.PendingTool != nil {
+		summary.PendingTool = strings.TrimSpace(*runtime.PendingTool)
+	}
+	if runtime.PendingTier != nil {
+		summary.PendingTier = strings.TrimSpace(*runtime.PendingTier)
+	}
+	return summary
+}
+
+func canResumeFromRuntime(runtime *model.AgentSessionRuntime) bool {
+	if runtime == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(runtime.WaitStatus), "waiting") {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(runtime.WaitType)) {
+	case "confirm", "preview", "iteration":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *AgentService) RunStream(
@@ -188,6 +262,9 @@ func (s *AgentService) RunStream(
 	session.ConversationID = conversation.ID
 	session.SetState(StateRunning)
 
+	var runErr error
+	completed := false
+
 	modelSession := &model.AgentSession{
 		ID:             session.ID,
 		ConversationID: conversation.ID,
@@ -202,15 +279,50 @@ func (s *AgentService) RunStream(
 	}
 	defer func() {
 		snap := session.Snapshot()
-		now := time.Now().UTC()
+		finalState := snap.State
+		if finalState != StatePausedForConfirm && finalState != StatePausedForPreview {
+			switch {
+			case runErr == nil && completed:
+				finalState = StateDone
+			case errors.Is(runErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded):
+				finalState = "timeout"
+			case errors.Is(runErr, context.Canceled), errors.Is(runErr, ErrSessionClosed), errors.Is(ctx.Err(), context.Canceled):
+				finalState = StateCancelled
+			case runErr != nil:
+				finalState = "failed"
+			default:
+				finalState = "failed"
+			}
+			session.SetState(finalState)
+			snap = session.Snapshot()
+		}
+
 		modelSession.State = snap.State
 		modelSession.ToolCallCount = snap.ToolCallCount
 		modelSession.ServerOps = snap.ServerOps
 		modelSession.ClientOps = snap.ClientOps
 		modelSession.HybridOps = snap.HybridOps
 		modelSession.TokensUsed = snap.TokensUsed
-		modelSession.EndedAt = &now
+
+		if isTerminalSessionState(snap.State) {
+			now := time.Now().UTC()
+			if runErr != nil {
+				errText := strings.TrimSpace(runErr.Error())
+				modelSession.ErrorMessage = &errText
+			} else {
+				modelSession.ErrorMessage = nil
+			}
+			modelSession.EndedAt = &now
+		} else {
+			modelSession.ErrorMessage = nil
+			modelSession.EndedAt = nil
+		}
+
 		_ = s.agentSessionRepo.Update(nil, modelSession)
+
+		if s.agentRuntimeRepo != nil && finalState != StatePausedForConfirm && finalState != StatePausedForPreview {
+			_ = s.agentRuntimeRepo.ClearPending(session.ID, "cleared")
+		}
 		if s.safety != nil {
 			s.safety.ClearSession(session.ID)
 		}
@@ -294,8 +406,9 @@ func (s *AgentService) RunStream(
 		return nil, err
 	}
 
-	toolDefs := graph_ops.GetToolsForGraphType(conversation.Type)
+	toolDefs := graph_ops.FilterToolsForMode(conversation.Type, input.ReadOnly, false)
 	toolSchemas := graph_ops.ToOAITools(toolDefs)
+	toolGuide := graph_ops.BuildToolPromptGuide(toolDefs)
 	history := toChatHistory(historyMessages)
 	workingHistory := append([]ai.ChatHistoryMessage(nil), history...)
 
@@ -318,7 +431,6 @@ func (s *AgentService) RunStream(
 	finalReasoning := ""
 	modelUsed := ""
 	allToolSummaries := make([]string, 0)
-	var runErr error
 
 	for round := 0; ; round++ {
 		emitThinkingEvent(writeEvent, "round_start", round+1, fmt.Sprintf("第 %d 轮：正在规划下一步", round+1))
@@ -340,6 +452,7 @@ func (s *AgentService) RunStream(
 		}
 
 		if s.safety != nil {
+			s.safety.BeginRound(session.ID, round)
 			if err := s.safety.CheckRoundWithLimit(round, roundLimit); err != nil {
 				runErr = err
 				break
@@ -355,6 +468,8 @@ func (s *AgentService) RunStream(
 			roundErr       error
 		)
 
+		temperature := toolPlanningTemperature(round, len(toolSchemas) > 0)
+
 		if round == 0 {
 			var textBuilder strings.Builder
 			roundReply, roundReasoning, roundToolCalls, roundTokens, roundModelUsed, roundErr = s.provider.ChatStreamWithTools(ctx, ai.AgentChatRequest{
@@ -365,14 +480,16 @@ func (s *AgentService) RunStream(
 					Model:       strings.TrimSpace(input.Model),
 					History:     workingHistory,
 				},
-				Tools:      toolSchemas,
-				ToolChoice: "auto",
+				Tools:                toolSchemas,
+				ToolChoice:           "auto",
+				ToolGuide:            toolGuide,
+				Temperature:          &temperature,
+				EnableFallbackParser: s.cfg.EnableFallbackParser,
 			}, func(chunk string) {
 				if chunk == "" {
 					return
 				}
 				textBuilder.WriteString(chunk)
-				_ = writeEvent(map[string]interface{}{"type": "content", "content": chunk})
 			})
 			if strings.TrimSpace(roundReply) == "" {
 				roundReply = strings.TrimSpace(textBuilder.String())
@@ -386,8 +503,11 @@ func (s *AgentService) RunStream(
 					Model:       strings.TrimSpace(input.Model),
 					History:     workingHistory,
 				},
-				Tools:      toolSchemas,
-				ToolChoice: "auto",
+				Tools:                toolSchemas,
+				ToolChoice:           "auto",
+				ToolGuide:            toolGuide,
+				Temperature:          &temperature,
+				EnableFallbackParser: s.cfg.EnableFallbackParser,
 			})
 			if err != nil {
 				roundErr = err
@@ -401,6 +521,10 @@ func (s *AgentService) RunStream(
 					_ = writeEvent(map[string]interface{}{"type": "content", "content": roundReply})
 				}
 			}
+		}
+
+		if shouldEmitFirstRoundContent(round, roundErr, roundToolCalls, roundReply) {
+			_ = writeEvent(map[string]interface{}{"type": "content", "content": roundReply})
 		}
 
 		if roundTokens > 0 {
@@ -419,13 +543,13 @@ func (s *AgentService) RunStream(
 		if roundErr != nil {
 			emitThinkingEvent(writeEvent, "model_error", round+1, fmt.Sprintf("模型调用失败：%s", roundErr.Error()))
 			if strings.TrimSpace(finalReply) == "" && len(allToolSummaries) == 0 {
-				session.SetState(StateDone)
+				runErr = roundErr
 				return &AgentRunOutput{
 					ConversationID: conversation.ID,
 					SessionID:      session.ID,
 					UserMessageID:  userMessage.ID,
 					ModelUsed:      modelUsed,
-				}, roundErr
+				}, runErr
 			}
 			runErr = roundErr
 			break
@@ -508,7 +632,10 @@ func (s *AgentService) RunStream(
 		finalReply = "操作已完成"
 	}
 
-	session.SetState(StateDone)
+	if runErr == nil {
+		session.SetState(StateDone)
+		completed = true
+	}
 	snap := session.Snapshot()
 
 	assistantMessage := &model.AIChatMessage{
@@ -531,9 +658,11 @@ func (s *AgentService) RunStream(
 		assistantMessage.TokensUsed = &v
 	}
 	if err := s.chatMessageRepo.Create(assistantMessage); err != nil {
+		runErr = err
 		return nil, err
 	}
 	if err := s.conversationRepo.RecordMessageActivity(conversation.ID, assistantMessage.CreatedAt, ""); err != nil {
+		runErr = err
 		return nil, err
 	}
 
@@ -550,6 +679,72 @@ func (s *AgentService) RunStream(
 	}, runErr
 }
 
+func (s *AgentService) upsertRuntimePending(session *AgentSession, callID, toolName, tier string, args json.RawMessage, preview interface{}, waitType string, timeout time.Duration) error {
+	if s.agentRuntimeRepo == nil || session == nil {
+		return nil
+	}
+
+	sessionID := strings.TrimSpace(session.ID)
+	if sessionID == "" {
+		return nil
+	}
+
+	argsJSON := []byte("{}")
+	if len(args) > 0 && json.Valid(args) {
+		argsJSON = append([]byte(nil), args...)
+	}
+
+	previewJSON := []byte("{}")
+	if preview != nil {
+		raw, err := json.Marshal(preview)
+		if err == nil && json.Valid(raw) {
+			previewJSON = raw
+		}
+	}
+
+	var expiresAt *time.Time
+	if timeout > 0 {
+		t := time.Now().UTC().Add(timeout)
+		expiresAt = &t
+	}
+
+	callID = strings.TrimSpace(callID)
+	toolName = strings.TrimSpace(toolName)
+	tier = strings.TrimSpace(tier)
+	runtime := &model.AgentSessionRuntime{
+		SessionID:      sessionID,
+		PendingArgs:    datatypes.JSON(argsJSON),
+		PendingPreview: datatypes.JSON(previewJSON),
+		WaitType:       strings.TrimSpace(waitType),
+		WaitStatus:     "waiting",
+		ExpiresAt:      expiresAt,
+	}
+	if callID != "" {
+		runtime.PendingCallID = &callID
+	}
+	if toolName != "" {
+		runtime.PendingTool = &toolName
+	}
+	if tier != "" {
+		runtime.PendingTier = &tier
+	}
+	return s.agentRuntimeRepo.UpsertPending(runtime)
+}
+
+func (s *AgentService) clearRuntimePending(sessionID, waitStatus string) error {
+	if s.agentRuntimeRepo == nil {
+		return nil
+	}
+	return s.agentRuntimeRepo.ClearPending(strings.TrimSpace(sessionID), strings.TrimSpace(waitStatus))
+}
+
+func (s *AgentService) markRuntimeWaitStatus(sessionID, waitStatus string) error {
+	if s.agentRuntimeRepo == nil {
+		return nil
+	}
+	return s.agentRuntimeRepo.MarkWaitStatus(strings.TrimSpace(sessionID), strings.TrimSpace(waitStatus))
+}
+
 func (s *AgentService) requestIterationContinuation(
 	ctx context.Context,
 	session *AgentSession,
@@ -560,6 +755,7 @@ func (s *AgentService) requestIterationContinuation(
 	callID := fmt.Sprintf("iter_limit_%d_%d", roundLimit, round)
 	session.SetPending(callID, iterationLimitPendingTool, nil)
 	session.SetState(StatePausedForConfirm)
+	_ = s.upsertRuntimePending(session, callID, iterationLimitPendingTool, string(graph_ops.TierServer), nil, nil, "iteration", s.cfg.ConfirmTimeout)
 	_ = writeEvent(map[string]interface{}{
 		"type":                    "iteration_limit_reached",
 		"callId":                  callID,
@@ -569,13 +765,26 @@ func (s *AgentService) requestIterationContinuation(
 	})
 
 	signal, err := s.waitForConfirmation(ctx, session, s.cfg.ConfirmTimeout)
-	session.ClearPending()
-	session.SetState(StateRunning)
 	if err != nil {
+		if errors.Is(err, context.Canceled) && session.State() == StatePausedForConfirm {
+			_ = s.markRuntimeWaitStatus(session.ID, "waiting")
+			return 0, false, err
+		}
+		waitStatus := "rejected"
+		if errors.Is(err, ErrSessionConfirmTimeout) {
+			waitStatus = "timeout"
+		}
+		_ = s.clearRuntimePending(session.ID, waitStatus)
+		session.ClearPending()
+		session.SetState(StateRunning)
 		return 0, false, err
 	}
 
+	session.ClearPending()
+	session.SetState(StateRunning)
+
 	if !signal.Approved {
+		_ = s.clearRuntimePending(session.ID, "rejected")
 		_ = writeEvent(map[string]interface{}{
 			"type":      "iteration_stopped",
 			"callId":    callID,
@@ -584,6 +793,7 @@ func (s *AgentService) requestIterationContinuation(
 		})
 		return 0, false, nil
 	}
+	_ = s.clearRuntimePending(session.ID, "approved")
 
 	continueRounds = signal.ContinueRounds
 	if continueRounds <= 0 {
@@ -608,8 +818,17 @@ func (s *AgentService) executeRoundToolCalls(
 	toolCalls []ai.ToolCall,
 	writeEvent func(map[string]interface{}) bool,
 ) (summaries []string, toolResults []ai.ChatHistoryMessage, graphMutated bool, stopErr error) {
-	summaries = make([]string, 0, len(toolCalls))
-	toolResults = make([]ai.ChatHistoryMessage, 0, len(toolCalls))
+	summaries = make([]string, 0, len(toolCalls)+4)
+	toolResults = make([]ai.ChatHistoryMessage, 0, len(toolCalls)+4)
+	toolCalls = mergeRoundMutationCalls(toolCalls)
+
+	roundReadUsed := false
+	hadRecentRead := false
+	if session != nil {
+		hadRecentRead = session.HasRecentReadContext()
+		defer session.SetRecentReadContext(roundReadUsed)
+	}
+
 	for _, call := range toolCalls {
 		if strings.TrimSpace(call.ID) == "" {
 			call.ID = util.NewAgentToolCallID()
@@ -624,22 +843,6 @@ func (s *AgentService) executeRoundToolCalls(
 			toolResults = append(toolResults, buildToolResultHistoryMessage(call.ID, call.Name, toolStatusFailed, summary, nil, errMsg))
 			continue
 		}
-
-		if s.safety != nil {
-			if err := s.safety.CheckToolCall(session, call, estimateNodeMutation(call.Name)); err != nil {
-				errMsg := err.Error()
-				_ = writeEvent(map[string]interface{}{"type": "tool_call_error", "callId": call.ID, "tool": call.Name, "error": errMsg})
-				_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusFailed, false, errMsg, errMsg, nil))
-				summary := fmt.Sprintf("%s: %s", call.Name, errMsg)
-				summaries = append(summaries, summary)
-				toolResults = append(toolResults, buildToolResultHistoryMessage(call.ID, call.Name, toolStatusFailed, summary, nil, errMsg))
-				if isHardStopSafetyError(err) {
-					return summaries, toolResults, graphMutated, err
-				}
-				continue
-			}
-		}
-		session.IncToolCallCount()
 
 		def, ok := graph_ops.GetTool(call.Name)
 		if !ok {
@@ -671,52 +874,338 @@ func (s *AgentService) executeRoundToolCalls(
 			continue
 		}
 
-		toolRecord := &model.AgentToolCall{
-			ID:        util.NewAgentToolCallID(),
-			SessionID: session.ID,
-			CallID:    call.ID,
-			ToolName:  call.Name,
-			Tier:      string(def.Tier),
-			Arguments: datatypes.JSON(call.Arguments),
-			Status:    "running",
+		if def.Tier == graph_ops.TierServer && def.MutatesGraph && !readOnly && !roundReadUsed && !hadRecentRead {
+			autoReadCall := ai.ToolCall{ID: util.NewAgentToolCallID(), Name: "get_graph_snapshot", Arguments: json.RawMessage(`{}`)}
+			autoDef, ok := graph_ops.GetTool(autoReadCall.Name)
+			if ok {
+				if s.safety != nil {
+					if err := s.safety.CheckToolCall(session, autoReadCall, 0); err != nil {
+						errMsg := err.Error()
+						_ = writeEvent(buildToolCallResultEvent(autoReadCall.ID, autoReadCall.Name, toolStatusFailed, false, errMsg, errMsg, nil))
+						summaries = append(summaries, fmt.Sprintf("%s: %s", autoReadCall.Name, errMsg))
+						toolResults = append(toolResults, buildToolResultHistoryMessage(autoReadCall.ID, autoReadCall.Name, toolStatusFailed, errMsg, nil, errMsg))
+						if isHardStopSafetyError(err) {
+							return summaries, toolResults, graphMutated, err
+						}
+					}
+				}
+				session.IncToolCallCount()
+				outcome, status, err := s.runToolCallWithAudit(ctx, session, projectID, graphType, readOnly, runtimeSnapshot, autoReadCall, autoDef, writeEvent)
+				if err != nil {
+					return summaries, toolResults, graphMutated, err
+				}
+				roundReadUsed = true
+				autoSummary := strings.TrimSpace(outcome.Summary)
+				if autoSummary == "" {
+					autoSummary = "已自动读取图上下文"
+				}
+				autoSummary = "auto_read_context: " + autoSummary
+				summaries = append(summaries, autoSummary)
+				toolResults = append(toolResults, buildToolResultHistoryMessage(autoReadCall.ID, autoReadCall.Name, status, autoSummary, outcome.Patch, ""))
+			}
 		}
-		_ = s.agentToolCallRepo.Create(nil, toolRecord)
 
-		outcome, resultErr := s.dispatchToolCall(ctx, session, projectID, graphType, readOnly, runtimeSnapshot, call, def, writeEvent)
-		if resultErr != nil {
-			errMsg := resultErr.Error()
-			_ = s.agentToolCallRepo.UpdateStatus(toolRecord.ID, toolStatusFailed, nil, nil, &errMsg)
-			_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusFailed, false, errMsg, errMsg, nil))
-			summary := fmt.Sprintf("%s: %s", call.Name, errMsg)
-			summaries = append(summaries, summary)
-			toolResults = append(toolResults, buildToolResultHistoryMessage(call.ID, call.Name, toolStatusFailed, summary, nil, errMsg))
-			continue
+		if s.safety != nil {
+			if err := s.safety.CheckToolCall(session, call, 0); err != nil {
+				errMsg := err.Error()
+				_ = writeEvent(map[string]interface{}{"type": "tool_call_error", "callId": call.ID, "tool": call.Name, "error": errMsg})
+				_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusFailed, false, errMsg, errMsg, nil))
+				summary := fmt.Sprintf("%s: %s", call.Name, errMsg)
+				summaries = append(summaries, summary)
+				toolResults = append(toolResults, buildToolResultHistoryMessage(call.ID, call.Name, toolStatusFailed, summary, nil, errMsg))
+				if isHardStopSafetyError(err) {
+					return summaries, toolResults, graphMutated, err
+				}
+				continue
+			}
 		}
-		if outcome == nil {
-			outcome = &toolDispatchOutcome{Summary: "", Status: toolStatusSuccess}
+		session.IncToolCallCount()
+
+		outcome, finalStatus, err := s.runToolCallWithAudit(ctx, session, projectID, graphType, readOnly, runtimeSnapshot, call, def, writeEvent)
+		if err != nil {
+			return summaries, toolResults, graphMutated, err
 		}
 
-		finalStatus := normalizeToolFinalStatus(outcome.Status)
 		resultSummary := strings.TrimSpace(outcome.Summary)
-		resultPatch := outcome.Patch
 		if resultSummary == "" {
 			resultSummary = fmt.Sprintf("%s: %s", call.Name, finalStatus)
 		}
-
-		if hasGraphPatchChanges(resultPatch) {
+		if hasGraphPatchChanges(outcome.Patch) {
 			graphMutated = true
 		}
-
-		var patchRaw []byte
-		if resultPatch != nil {
-			patchRaw, _ = json.Marshal(resultPatch)
+		if def.Tier == graph_ops.TierServer && def.ReadOnly {
+			roundReadUsed = true
 		}
-		resCopy := resultSummary
-		_ = s.agentToolCallRepo.UpdateStatus(toolRecord.ID, finalStatus, &resCopy, patchRaw, nil)
+
 		summaries = append(summaries, resultSummary)
-		toolResults = append(toolResults, buildToolResultHistoryMessage(call.ID, call.Name, finalStatus, resultSummary, resultPatch, ""))
+		toolResults = append(toolResults, buildToolResultHistoryMessage(call.ID, call.Name, finalStatus, resultSummary, outcome.Patch, ""))
+
+		if def.Tier == graph_ops.TierServer && def.MutatesGraph && finalStatus == toolStatusSuccess {
+			if s.safety != nil {
+				changedUnits := outcome.ChangedNodes
+				if changedUnits <= 0 && outcome.ChangedEdges > 0 {
+					changedUnits = 1
+				}
+				if changedUnits <= 0 {
+					changedUnits = patchNodeMutationCount(outcome.Patch)
+				}
+				if err := s.safety.RecordMutation(session.ID, changedUnits); err != nil {
+					return summaries, toolResults, graphMutated, err
+				}
+			}
+
+			followups := []ai.ToolCall{{ID: util.NewAgentToolCallID(), Name: "validate_fta_constraints", Arguments: json.RawMessage(`{}`)}}
+			if shouldRunGateSemanticsFollowup(call) {
+				followups = append(followups, ai.ToolCall{ID: util.NewAgentToolCallID(), Name: "check_gate_semantics", Arguments: gateSemanticsArgsFromCall(call)})
+			}
+
+			for _, followCall := range followups {
+				followDef, ok := graph_ops.GetTool(followCall.Name)
+				if !ok || !graph_ops.ToolSupportsGraphType(followDef, graphType) {
+					continue
+				}
+				if err := graph_ops.ValidateParameters(followCall.Name, followCall.Arguments); err != nil {
+					continue
+				}
+
+				if s.safety != nil {
+					if err := s.safety.CheckToolCall(session, followCall, 0); err != nil {
+						errMsg := err.Error()
+						_ = writeEvent(buildToolCallResultEvent(followCall.ID, followCall.Name, toolStatusFailed, false, errMsg, errMsg, nil))
+						summaries = append(summaries, fmt.Sprintf("%s: %s", followCall.Name, errMsg))
+						toolResults = append(toolResults, buildToolResultHistoryMessage(followCall.ID, followCall.Name, toolStatusFailed, errMsg, nil, errMsg))
+						if isHardStopSafetyError(err) {
+							return summaries, toolResults, graphMutated, err
+						}
+						continue
+					}
+				}
+
+				session.IncToolCallCount()
+				followOutcome, followStatus, err := s.runToolCallWithAudit(ctx, session, projectID, graphType, readOnly, runtimeSnapshot, followCall, followDef, writeEvent)
+				if err != nil {
+					return summaries, toolResults, graphMutated, err
+				}
+				roundReadUsed = true
+				followSummary := strings.TrimSpace(followOutcome.Summary)
+				if followSummary == "" {
+					followSummary = fmt.Sprintf("%s: %s", followCall.Name, followStatus)
+				}
+				followSummary = followCall.Name + "(auto): " + followSummary
+				summaries = append(summaries, followSummary)
+				toolResults = append(toolResults, buildToolResultHistoryMessage(followCall.ID, followCall.Name, followStatus, followSummary, followOutcome.Patch, ""))
+			}
+		}
 	}
+
 	return summaries, toolResults, graphMutated, nil
+}
+
+func (s *AgentService) runToolCallWithAudit(
+	ctx context.Context,
+	session *AgentSession,
+	projectID, graphType string,
+	readOnly bool,
+	runtimeSnapshot *faultTreeRuntimeSnapshot,
+	call ai.ToolCall,
+	def *graph_ops.ToolDefinition,
+	writeEvent func(map[string]interface{}) bool,
+) (*toolDispatchOutcome, string, error) {
+	if def == nil {
+		return nil, toolStatusFailed, graph_ops.ErrUnknownTool
+	}
+
+	args := call.Arguments
+	if len(args) == 0 || !json.Valid(args) {
+		args = json.RawMessage(`{}`)
+	}
+
+	toolRecord := &model.AgentToolCall{
+		ID:        util.NewAgentToolCallID(),
+		SessionID: session.ID,
+		CallID:    call.ID,
+		ToolName:  call.Name,
+		Tier:      string(def.Tier),
+		Arguments: datatypes.JSON(args),
+		Status:    "running",
+	}
+	if err := s.agentToolCallRepo.Create(nil, toolRecord); err != nil {
+		return nil, toolStatusFailed, fmt.Errorf("create agent tool call audit failed: %w", err)
+	}
+
+	outcome, dispatchErr := s.dispatchToolCall(ctx, session, projectID, graphType, readOnly, runtimeSnapshot, call, def, writeEvent)
+	if dispatchErr != nil {
+		errMsg := dispatchErr.Error()
+		if err := s.agentToolCallRepo.UpdateStatus(toolRecord.ID, toolStatusFailed, nil, nil, &errMsg); err != nil {
+			return nil, toolStatusFailed, fmt.Errorf("update failed tool call status error: %v (origin=%w)", err, dispatchErr)
+		}
+		_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusFailed, false, errMsg, errMsg, nil))
+		return &toolDispatchOutcome{Summary: errMsg, Status: toolStatusFailed}, toolStatusFailed, nil
+	}
+
+	if outcome == nil {
+		outcome = &toolDispatchOutcome{Summary: "", Status: toolStatusSuccess}
+	}
+	finalStatus := normalizeToolFinalStatus(outcome.Status)
+
+	var patchRaw []byte
+	if outcome.Patch != nil {
+		patchRaw, _ = json.Marshal(outcome.Patch)
+	}
+	resultSummary := strings.TrimSpace(outcome.Summary)
+	if resultSummary == "" {
+		resultSummary = fmt.Sprintf("%s: %s", call.Name, finalStatus)
+	}
+	if err := s.agentToolCallRepo.UpdateStatus(toolRecord.ID, finalStatus, &resultSummary, patchRaw, nil); err != nil {
+		return nil, toolStatusFailed, fmt.Errorf("update tool call status failed: %w", err)
+	}
+	return outcome, finalStatus, nil
+}
+
+func mergeRoundMutationCalls(toolCalls []ai.ToolCall) []ai.ToolCall {
+	if len(toolCalls) <= 1 {
+		return toolCalls
+	}
+
+	out := make([]ai.ToolCall, 0, len(toolCalls))
+	for i := 0; i < len(toolCalls); {
+		if !isMergeableMutationTool(toolCalls[i].Name) {
+			out = append(out, toolCalls[i])
+			i++
+			continue
+		}
+
+		j := i
+		for j < len(toolCalls) && isMergeableMutationTool(toolCalls[j].Name) {
+			j++
+		}
+
+		segment := toolCalls[i:j]
+		merged, ok := mergeMutationSegment(segment)
+		if ok {
+			out = append(out, merged)
+		} else {
+			out = append(out, segment...)
+		}
+		i = j
+	}
+	return out
+}
+
+func isMergeableMutationTool(toolName string) bool {
+	def, ok := graph_ops.GetTool(toolName)
+	if !ok {
+		return false
+	}
+	if def.Tier != graph_ops.TierServer || !def.MutatesGraph {
+		return false
+	}
+	return !strings.EqualFold(def.Name, "batch_operations")
+}
+
+func mergeMutationSegment(segment []ai.ToolCall) (ai.ToolCall, bool) {
+	if len(segment) <= 1 {
+		return ai.ToolCall{}, false
+	}
+
+	batchOps := make([]map[string]interface{}, 0, len(segment))
+	for _, call := range segment {
+		argsObj := map[string]interface{}{}
+		if len(call.Arguments) > 0 {
+			if !json.Valid(call.Arguments) {
+				return ai.ToolCall{}, false
+			}
+			if err := json.Unmarshal(call.Arguments, &argsObj); err != nil {
+				return ai.ToolCall{}, false
+			}
+		}
+
+		batchOps = append(batchOps, map[string]interface{}{
+			"tool": strings.TrimSpace(call.Name),
+			"args": argsObj,
+		})
+	}
+
+	batchArgs, err := json.Marshal(map[string]interface{}{"operations": batchOps})
+	if err != nil {
+		return ai.ToolCall{}, false
+	}
+
+	mergedID := strings.TrimSpace(segment[0].ID)
+	if mergedID == "" {
+		mergedID = util.NewAgentToolCallID()
+	}
+
+	return ai.ToolCall{
+		ID:        mergedID,
+		Name:      "batch_operations",
+		Arguments: json.RawMessage(batchArgs),
+	}, true
+}
+
+func toolPlanningTemperature(round int, hasTools bool) float64 {
+	if round == 0 && hasTools {
+		return 0.1
+	}
+	return 0.3
+}
+
+func shouldEmitFirstRoundContent(round int, roundErr error, toolCalls []ai.ToolCall, reply string) bool {
+	return round == 0 && roundErr == nil && len(toolCalls) == 0 && strings.TrimSpace(reply) != ""
+}
+
+func isTerminalSessionState(state string) bool {
+	switch strings.TrimSpace(state) {
+	case StateDone, StateCancelled, "failed", "timeout":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldRunGateSemanticsFollowup(call ai.ToolCall) bool {
+	name := strings.ToLower(strings.TrimSpace(call.Name))
+	switch name {
+	case "update_gate", "add_gate":
+		return true
+	case "batch_operations":
+		var payload struct {
+			Operations []struct {
+				Tool string `json:"tool"`
+			} `json:"operations"`
+		}
+		if err := json.Unmarshal(call.Arguments, &payload); err != nil {
+			return false
+		}
+		for _, op := range payload.Operations {
+			switch strings.ToLower(strings.TrimSpace(op.Tool)) {
+			case "update_gate", "add_gate", "add_node", "delete_node", "move_node":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func gateSemanticsArgsFromCall(call ai.ToolCall) json.RawMessage {
+	if !strings.EqualFold(strings.TrimSpace(call.Name), "update_gate") {
+		return json.RawMessage(`{}`)
+	}
+	var payload struct {
+		NodeID string `json:"nodeId"`
+	}
+	if err := json.Unmarshal(call.Arguments, &payload); err != nil {
+		return json.RawMessage(`{}`)
+	}
+	payload.NodeID = strings.TrimSpace(payload.NodeID)
+	if payload.NodeID == "" {
+		return json.RawMessage(`{}`)
+	}
+	raw, err := json.Marshal(map[string]string{"nodeId": payload.NodeID})
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return json.RawMessage(raw)
 }
 
 func isHardStopSafetyError(err error) bool {
@@ -774,9 +1263,11 @@ func buildToolParameterHint(toolName string) string {
 }
 
 type toolDispatchOutcome struct {
-	Summary string
-	Patch   *graph_ops.GraphPatch
-	Status  string
+	Summary      string
+	Patch        *graph_ops.GraphPatch
+	Status       string
+	ChangedNodes int
+	ChangedEdges int
 }
 
 func normalizeToolFinalStatus(status string) string {
@@ -793,6 +1284,17 @@ func hasGraphPatchChanges(patch *graph_ops.GraphPatch) bool {
 		return false
 	}
 	return len(patch.UpsertNodes) > 0 || len(patch.DeleteNodes) > 0 || len(patch.UpsertEdges) > 0 || len(patch.DeleteEdges) > 0
+}
+
+func patchNodeMutationCount(patch *graph_ops.GraphPatch) int {
+	if patch == nil {
+		return 0
+	}
+	count := len(patch.UpsertNodes) + len(patch.DeleteNodes)
+	if count == 0 && (len(patch.UpsertEdges) > 0 || len(patch.DeleteEdges) > 0) {
+		return 1
+	}
+	return count
 }
 
 func buildToolCallResultEvent(callID, toolName, status string, success bool, summary, errMsg string, patch *graph_ops.GraphPatch) map[string]interface{} {
@@ -922,14 +1424,32 @@ func buildToolResultContent(toolName, status, summary string, patch *graph_ops.G
 		"status": normalizeToolFinalStatus(status),
 	}
 
-	if v := strings.TrimSpace(summary); v != "" {
+	if v := summarizeToolSummaryForHistory(summary); v != "" {
 		payload["summary"] = v
 	}
 	if v := strings.TrimSpace(errMsg); v != "" {
 		payload["error"] = v
 	}
 	if patch != nil {
-		payload["patch"] = patch
+		payload["changed"] = map[string]int{
+			"upsertNodes": len(patch.UpsertNodes),
+			"deleteNodes": len(patch.DeleteNodes),
+			"upsertEdges": len(patch.UpsertEdges),
+			"deleteEdges": len(patch.DeleteEdges),
+		}
+		affectedNodeIDs := make([]string, 0, len(patch.UpsertNodes)+len(patch.DeleteNodes))
+		for _, item := range patch.UpsertNodes {
+			if id, ok := item["id"].(string); ok && strings.TrimSpace(id) != "" {
+				affectedNodeIDs = append(affectedNodeIDs, strings.TrimSpace(id))
+			}
+		}
+		affectedNodeIDs = append(affectedNodeIDs, patch.DeleteNodes...)
+		if len(affectedNodeIDs) > 10 {
+			affectedNodeIDs = affectedNodeIDs[:10]
+		}
+		if len(affectedNodeIDs) > 0 {
+			payload["affectedNodeIds"] = affectedNodeIDs
+		}
 	}
 
 	raw, err := json.Marshal(payload)
@@ -941,6 +1461,45 @@ func buildToolResultContent(toolName, status, summary string, patch *graph_ops.G
 			"error":   strings.TrimSpace(errMsg),
 		})
 		return string(fallback)
+	}
+	return string(raw)
+}
+
+func summarizeToolSummaryForHistory(summary string) string {
+	v := strings.TrimSpace(summary)
+	if v == "" {
+		return ""
+	}
+
+	if !json.Valid([]byte(v)) {
+		if len([]rune(v)) <= 280 {
+			return v
+		}
+		runes := []rune(v)
+		return string(runes[:280]) + "..."
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(v), &payload); err != nil {
+		return v
+	}
+
+	compact := map[string]interface{}{}
+	for _, key := range []string{"tool", "status", "summary", "error", "nodeCount", "edgeCount", "issueCount", "returnedNodeCount", "returnedEdgeCount", "truncated"} {
+		if val, ok := payload[key]; ok {
+			compact[key] = val
+		}
+	}
+	if ids, ok := payload["parentNodeIds"]; ok {
+		compact["parentNodeIds"] = ids
+	}
+	if ids, ok := payload["childNodeIds"]; ok {
+		compact["childNodeIds"] = ids
+	}
+
+	raw, err := json.Marshal(compact)
+	if err != nil {
+		return v
 	}
 	return string(raw)
 }
@@ -985,6 +1544,7 @@ func (s *AgentService) dispatchToolCall(
 		if needConfirm {
 			session.SetPending(call.ID, call.Name, call.Arguments)
 			session.SetState(StatePausedForConfirm)
+			_ = s.upsertRuntimePending(session, call.ID, call.Name, string(def.Tier), call.Arguments, nil, "confirm", s.cfg.ConfirmTimeout)
 			_ = writeEvent(map[string]interface{}{
 				"type":   "confirm_required",
 				"callId": call.ID,
@@ -992,16 +1552,29 @@ func (s *AgentService) dispatchToolCall(
 				"args":   json.RawMessage(call.Arguments),
 			})
 			signal, err := s.waitForConfirmation(ctx, session, s.cfg.ConfirmTimeout)
-			session.ClearPending()
-			session.SetState(StateRunning)
 			if err != nil {
+				if errors.Is(err, context.Canceled) && session.State() == StatePausedForConfirm {
+					_ = s.markRuntimeWaitStatus(session.ID, "waiting")
+					return nil, err
+				}
+				waitStatus := "rejected"
+				if errors.Is(err, ErrSessionConfirmTimeout) {
+					waitStatus = "timeout"
+				}
+				_ = s.clearRuntimePending(session.ID, waitStatus)
+				session.ClearPending()
+				session.SetState(StateRunning)
 				return nil, err
 			}
+			session.ClearPending()
+			session.SetState(StateRunning)
 			if !signal.Approved {
+				_ = s.clearRuntimePending(session.ID, "rejected")
 				_ = writeEvent(map[string]interface{}{"type": "tool_call_cancelled", "callId": call.ID, "tool": call.Name})
 				_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusCancelled, false, "user_cancelled", "", nil))
 				return &toolDispatchOutcome{Summary: "user_cancelled", Status: toolStatusCancelled}, nil
 			}
+			_ = s.clearRuntimePending(session.ID, "approved")
 		}
 
 		_ = writeEvent(map[string]interface{}{"type": "tool_call_start", "callId": call.ID, "tool": call.Name})
@@ -1037,7 +1610,7 @@ func (s *AgentService) dispatchToolCall(
 		session.IncTierOps("server")
 		patchCopy := res.Patch
 		_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusSuccess, true, res.Summary, "", &patchCopy))
-		return &toolDispatchOutcome{Summary: res.Summary, Patch: &patchCopy, Status: toolStatusSuccess}, nil
+		return &toolDispatchOutcome{Summary: res.Summary, Patch: &patchCopy, Status: toolStatusSuccess, ChangedNodes: res.ChangedNodes, ChangedEdges: res.ChangedEdges}, nil
 	case graph_ops.TierHybrid:
 		if readOnly {
 			summary := fmt.Sprintf("%s skipped: read-only mode", call.Name)
@@ -1052,29 +1625,55 @@ func (s *AgentService) dispatchToolCall(
 
 		session.SetPending(call.ID, call.Name, call.Arguments)
 		session.SetState(StatePausedForPreview)
+		_ = s.upsertRuntimePending(session, call.ID, call.Name, string(def.Tier), call.Arguments, preview, "preview", s.cfg.PreviewTimeout)
 		_ = writeEvent(map[string]interface{}{"type": "preview_ready", "callId": call.ID, "tool": call.Name, "preview": preview})
 
 		signal, err := s.waitForConfirmation(ctx, session, s.cfg.PreviewTimeout)
-		session.ClearPending()
-		session.SetState(StateRunning)
 		if err != nil {
+			if errors.Is(err, context.Canceled) && session.State() == StatePausedForPreview {
+				_ = s.markRuntimeWaitStatus(session.ID, "waiting")
+				return nil, err
+			}
+			waitStatus := "rejected"
+			if errors.Is(err, ErrSessionConfirmTimeout) {
+				waitStatus = "timeout"
+			}
+			_ = s.clearRuntimePending(session.ID, waitStatus)
+			session.ClearPending()
+			session.SetState(StateRunning)
 			return nil, err
 		}
+		session.ClearPending()
+		session.SetState(StateRunning)
 		if !signal.Approved {
+			_ = s.clearRuntimePending(session.ID, "rejected")
 			_ = writeEvent(map[string]interface{}{"type": "preview_discarded", "callId": call.ID, "tool": call.Name})
 			_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusDiscarded, false, "preview_discarded", "", nil))
 			return &toolDispatchOutcome{Summary: "preview_discarded", Status: toolStatusDiscarded}, nil
 		}
+		_ = s.clearRuntimePending(session.ID, "approved")
 
 		res, err := s.hybridEngine.Commit(ctx, projectID, graphType, preview, signal.ApprovedOps)
 		if err != nil {
 			_ = writeEvent(map[string]interface{}{"type": "tool_call_error", "callId": call.ID, "tool": call.Name, "error": err.Error()})
 			return nil, err
 		}
+		if res == nil {
+			_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusClientOnly, true, "preview_only", "", nil))
+			return &toolDispatchOutcome{Summary: "preview_only", Status: toolStatusClientOnly}, nil
+		}
+		if !hasGraphPatchChanges(&res.Patch) {
+			summary := strings.TrimSpace(res.Summary)
+			if summary == "" {
+				summary = "preview_only"
+			}
+			_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusClientOnly, true, summary, "", nil))
+			return &toolDispatchOutcome{Summary: summary, Status: toolStatusClientOnly}, nil
+		}
 		session.IncTierOps("hybrid")
 		patchCopy := res.Patch
 		_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusSuccess, true, res.Summary, "", &patchCopy))
-		return &toolDispatchOutcome{Summary: res.Summary, Patch: &patchCopy, Status: toolStatusSuccess}, nil
+		return &toolDispatchOutcome{Summary: res.Summary, Patch: &patchCopy, Status: toolStatusSuccess, ChangedNodes: res.ChangedNodes, ChangedEdges: res.ChangedEdges}, nil
 	default:
 		return nil, graph_ops.ErrUnknownTool
 	}

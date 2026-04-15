@@ -214,6 +214,7 @@ func main() {
 	aiConversationRepo := repository.NewAIConversationRepository(db)
 	aiChatMessageRepo := repository.NewAIChatMessageRepository(db)
 	agentSessionRepo := repository.NewAgentSessionRepository(db)
+	agentRuntimeRepo := repository.NewAgentSessionRuntimeRepository(db)
 	agentToolCallRepo := repository.NewAgentToolCallRepository(db)
 	notificationRepo := repository.NewNotificationRepository(db)
 	auditRepo := repository.NewAuditLogRepository(db)
@@ -300,6 +301,7 @@ func main() {
 		aiConversationRepo,
 		aiChatMessageRepo,
 		agentSessionRepo,
+		agentRuntimeRepo,
 		agentToolCallRepo,
 		ftSvc,
 		kgSvc,
@@ -488,6 +490,7 @@ func main() {
 			agentGroup.POST("/sessions/:sessionId/confirm", agentH.AgentConfirm)
 			agentGroup.POST("/sessions/:sessionId/cancel", agentH.AgentCancel)
 			agentGroup.GET("/sessions/:sessionId/status", agentH.AgentStatus)
+			agentGroup.POST("/sessions/:sessionId/resume", agentH.AgentResume)
 		}
 
 		// 团队总览

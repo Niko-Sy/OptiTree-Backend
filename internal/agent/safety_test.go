@@ -35,6 +35,7 @@ func TestSafetyController_RateLimit(t *testing.T) {
 	s := NewSafetyController(config.AgentConfig{ToolCallRateLimit: 2, MaxToolCalls: 10})
 	session := NewAgentSession("sid-rate", "c1", "p1", "u1", "faultTree", time.Minute)
 	call := ai.ToolCall{Name: "update_node", Arguments: json.RawMessage(`{"nodeId":"n1"}`)}
+	s.BeginRound(session.ID, 0)
 
 	if err := s.CheckToolCall(session, call, 0); err != nil {
 		t.Fatalf("first call should pass, got %v", err)
@@ -44,6 +45,17 @@ func TestSafetyController_RateLimit(t *testing.T) {
 	}
 	if err := s.CheckToolCall(session, call, 0); !errors.Is(err, ErrAgentRateLimited) {
 		t.Fatalf("expected ErrAgentRateLimited, got %v", err)
+	}
+
+	s.BeginRound(session.ID, 1)
+	nextRoundCall := ai.ToolCall{Name: "update_node", Arguments: json.RawMessage(`{"nodeId":"n1","name":"round2"}`)}
+	if err := s.CheckToolCall(session, nextRoundCall, 0); err != nil {
+		t.Fatalf("new round should reset category quota, got %v", err)
+	}
+
+	readCall := ai.ToolCall{Name: "get_graph_snapshot", Arguments: json.RawMessage(`{}`)}
+	if err := s.CheckToolCall(session, readCall, 0); err != nil {
+		t.Fatalf("different category should have independent quota, got %v", err)
 	}
 }
 

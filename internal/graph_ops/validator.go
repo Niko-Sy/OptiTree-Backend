@@ -53,7 +53,7 @@ func ValidateParameters(toolName string, args json.RawMessage) error {
 			return fmt.Errorf("%w: nodeId is required", ErrInvalidParameters)
 		}
 		if !isValidGateType(strFrom(payload, "gateType")) {
-			return fmt.Errorf("%w: gateType must be AND|OR|VOTE", ErrInvalidParameters)
+			return fmt.Errorf("%w: gateType must be AND|OR|NOT", ErrInvalidParameters)
 		}
 	case "add_node":
 		if SanitizeStringParam(strFrom(payload, "name"), 60) == "" {
@@ -64,7 +64,7 @@ func ValidateParameters(toolName string, args json.RawMessage) error {
 		}
 	case "add_gate":
 		if !isValidGateType(strFrom(payload, "gateType")) {
-			return fmt.Errorf("%w: gateType must be AND|OR|VOTE", ErrInvalidParameters)
+			return fmt.Errorf("%w: gateType must be AND|OR|NOT", ErrInvalidParameters)
 		}
 		parentID := strFrom(payload, "parentId")
 		if parentID == "" {
@@ -313,7 +313,7 @@ func intFrom(m map[string]interface{}, key string) (int, bool) {
 
 func isValidGateType(raw string) bool {
 	switch strings.ToUpper(strings.TrimSpace(raw)) {
-	case "AND", "OR", "VOTE":
+	case "AND", "OR", "NOT":
 		return true
 	default:
 		return false
