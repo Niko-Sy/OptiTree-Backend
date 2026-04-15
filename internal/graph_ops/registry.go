@@ -10,17 +10,25 @@ import (
 )
 
 type ExecutionTier string
+type ToolKind string
 
 const (
 	TierServer ExecutionTier = "server"
 	TierClient ExecutionTier = "client"
 	TierHybrid ExecutionTier = "hybrid"
+
+	ToolKindReadContext   ToolKind = "read_context"
+	ToolKindValidate      ToolKind = "validate"
+	ToolKindMutate        ToolKind = "mutate"
+	ToolKindClientUI      ToolKind = "client_ui"
+	ToolKindHybridPreview ToolKind = "hybrid_preview"
 )
 
 type ToolDefinition struct {
 	Name             string          `json:"name"`
 	Description      string          `json:"description"`
 	Tier             ExecutionTier   `json:"tier"`
+	Kind             ToolKind        `json:"kind,omitempty"`
 	ReadOnly         bool            `json:"readOnly"`
 	MutatesGraph     bool            `json:"mutatesGraph"`
 	RequiresRead     bool            `json:"requiresRead"`
@@ -372,7 +380,7 @@ func GetTool(name string) (*ToolDefinition, bool) {
 	normalized := strings.ToLower(strings.TrimSpace(name))
 	for _, def := range toolRegistry {
 		if strings.EqualFold(def.Name, normalized) {
-			cpy := def
+			cpy := normalizeToolDefinition(def)
 			return &cpy, true
 		}
 	}
@@ -384,17 +392,17 @@ func GetToolsForGraphType(graphType string) []ToolDefinition {
 	out := make([]ToolDefinition, 0, len(toolRegistry))
 	for _, def := range toolRegistry {
 		if supportsGraphType(def.GraphTypes, normalized) {
-			out = append(out, def)
+			out = append(out, normalizeToolDefinition(def))
 		}
 	}
 	return out
 }
 
-func FilterToolsForMode(graphType string, readOnly bool, includeExperimental bool) []ToolDefinition {
+func FilterToolsForMode(graphType string, readOnly bool, includeHybridTools bool) []ToolDefinition {
 	defs := GetToolsForGraphType(graphType)
 	out := make([]ToolDefinition, 0, len(defs))
 	for _, def := range defs {
-		if def.Experimental && !includeExperimental && !def.ProductionReady {
+		if def.Tier == TierHybrid && !includeHybridTools {
 			continue
 		}
 
@@ -420,45 +428,56 @@ func BuildToolPromptGuide(defs []ToolDefinition) string {
 		return "No tool is available for this turn."
 	}
 
-	lines := make([]string, 0, len(defs)+2)
+	lines := make([]string, 0, len(defs)+8)
 	lines = append(lines,
 		"Use only tools listed below; names and parameters are authoritative.",
-		"Prefer read -> validate -> mutate -> validate for graph edits.",
+		"Contract order for graph edits: read_context -> validate -> mutate -> validate.",
 	)
 
+	order := []ToolKind{ToolKindReadContext, ToolKindValidate, ToolKindMutate, ToolKindClientUI, ToolKindHybridPreview}
+	grouped := make(map[ToolKind][]ToolDefinition, len(order))
 	for _, def := range defs {
-		required := requiredParamNames(def.Parameters)
-		requiredHint := "none"
-		if len(required) > 0 {
-			requiredHint = strings.Join(required, ",")
-		}
-		flags := make([]string, 0, 4)
-		if def.ReadOnly {
-			flags = append(flags, "read_only")
-		}
-		if def.MutatesGraph {
-			flags = append(flags, "mutates_graph")
-		}
-		if def.RequiresRead {
-			flags = append(flags, "requires_read")
-		}
-		if def.RequireConfirm {
-			flags = append(flags, "requires_confirm")
-		}
-		if def.Experimental {
-			flags = append(flags, "experimental")
-		}
-		if def.ProductionReady {
-			flags = append(flags, "production_ready")
-		}
-		if len(flags) == 0 {
-			flags = append(flags, "none")
-		}
+		def = normalizeToolDefinition(def)
+		grouped[def.Kind] = append(grouped[def.Kind], def)
+	}
 
-		line := fmt.Sprintf("- %s | tier=%s | required=[%s] | flags=[%s] | %s", def.Name, def.Tier, requiredHint, strings.Join(flags, ","), strings.TrimSpace(def.Description))
-		lines = append(lines, line)
-		if sample := strings.TrimSpace(def.PromptExample); sample != "" {
-			lines = append(lines, fmt.Sprintf("  example: %s", sample))
+	for _, kind := range order {
+		items := grouped[kind]
+		if len(items) == 0 {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("[%s]", kind))
+		for _, def := range items {
+			required := requiredParamNames(def.Parameters)
+			requiredHint := "none"
+			if len(required) > 0 {
+				requiredHint = strings.Join(required, ",")
+			}
+			flags := make([]string, 0, 4)
+			if def.ReadOnly {
+				flags = append(flags, "read_only")
+			}
+			if def.MutatesGraph {
+				flags = append(flags, "mutates_graph")
+			}
+			if def.RequiresRead {
+				flags = append(flags, "requires_read")
+			}
+			if def.RequireConfirm {
+				flags = append(flags, "requires_confirm")
+			}
+			if def.Experimental {
+				flags = append(flags, "experimental")
+			}
+			if def.ProductionReady {
+				flags = append(flags, "production_ready")
+			}
+			if len(flags) == 0 {
+				flags = append(flags, "none")
+			}
+
+			line := fmt.Sprintf("- %s | required=[%s] | flags=[%s] | %s", def.Name, requiredHint, strings.Join(flags, ","), strings.TrimSpace(def.Description))
+			lines = append(lines, line)
 		}
 	}
 
@@ -505,6 +524,38 @@ func ToolMutatesGraph(toolName string) bool {
 		return false
 	}
 	return def.MutatesGraph
+}
+
+func ToolIsReadContext(toolName string) bool {
+	def, ok := GetTool(toolName)
+	if !ok {
+		return false
+	}
+	return def.Kind == ToolKindReadContext
+}
+
+func normalizeToolDefinition(def ToolDefinition) ToolDefinition {
+	if def.Kind != "" {
+		return def
+	}
+	switch strings.ToLower(strings.TrimSpace(def.Name)) {
+	case "get_graph_snapshot", "get_node_detail", "get_subtree":
+		def.Kind = ToolKindReadContext
+	case "check_gate_semantics", "validate_fta_constraints":
+		def.Kind = ToolKindValidate
+	default:
+		switch def.Tier {
+		case TierHybrid:
+			def.Kind = ToolKindHybridPreview
+		case TierClient:
+			def.Kind = ToolKindClientUI
+		default:
+			if def.MutatesGraph {
+				def.Kind = ToolKindMutate
+			}
+		}
+	}
+	return def
 }
 
 func requiredParamNames(schemaRaw json.RawMessage) []string {

@@ -26,26 +26,29 @@ func TestFilterToolsForMode_ReadOnlyExcludesMutationAndHybrid(t *testing.T) {
 	}
 }
 
-func TestFilterToolsForMode_DefaultExposesOnlyProductionHybrid(t *testing.T) {
+func TestFilterToolsForMode_DefaultHidesHybridTools(t *testing.T) {
 	defs := graph_ops.FilterToolsForMode("faultTree", false, false)
 	if len(defs) == 0 {
 		t.Fatal("expected tool definitions")
 	}
 
-	hasProductionHybrid := false
 	for _, def := range defs {
-		if def.Tier != graph_ops.TierHybrid {
-			continue
-		}
-		if !def.ProductionReady {
-			t.Fatalf("default mode should not expose non-production hybrid tool: %s", def.Name)
-		}
-		if strings.EqualFold(def.Name, "suggest_batch_label_fix") {
-			hasProductionHybrid = true
+		if def.Tier == graph_ops.TierHybrid {
+			t.Fatalf("default mode should not expose hybrid tool: %s", def.Name)
 		}
 	}
+}
 
-	if !hasProductionHybrid {
-		t.Fatal("expected suggest_batch_label_fix to be exposed as production-ready hybrid tool")
+func TestFilterToolsForMode_CanIncludeHybridToolsExplicitly(t *testing.T) {
+	defs := graph_ops.FilterToolsForMode("faultTree", false, true)
+	hasHybrid := false
+	for _, def := range defs {
+		if def.Tier == graph_ops.TierHybrid {
+			hasHybrid = true
+			break
+		}
+	}
+	if !hasHybrid {
+		t.Fatal("expected hybrid tools when includeHybridTools=true")
 	}
 }

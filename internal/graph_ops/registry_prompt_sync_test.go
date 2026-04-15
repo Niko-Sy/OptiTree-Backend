@@ -33,6 +33,53 @@ func TestBuildToolPromptGuide_CoversRegistryAndNoLegacyTools(t *testing.T) {
 	}
 }
 
+func TestToolKindContractSeparatesReadContextAndValidation(t *testing.T) {
+	readContext := []string{"get_graph_snapshot", "get_node_detail", "get_subtree"}
+	for _, name := range readContext {
+		def, ok := GetTool(name)
+		if !ok {
+			t.Fatalf("missing tool %s", name)
+		}
+		if def.Kind != ToolKindReadContext {
+			t.Fatalf("%s kind=%s, want %s", name, def.Kind, ToolKindReadContext)
+		}
+		if !ToolIsReadContext(name) {
+			t.Fatalf("%s should satisfy read context precondition", name)
+		}
+	}
+
+	validateTools := []string{"validate_fta_constraints", "check_gate_semantics"}
+	for _, name := range validateTools {
+		def, ok := GetTool(name)
+		if !ok {
+			t.Fatalf("missing tool %s", name)
+		}
+		if def.Kind != ToolKindValidate {
+			t.Fatalf("%s kind=%s, want %s", name, def.Kind, ToolKindValidate)
+		}
+		if ToolIsReadContext(name) {
+			t.Fatalf("%s must not satisfy read context precondition", name)
+		}
+	}
+}
+
+func TestBuildToolPromptGuide_CompactKindSections(t *testing.T) {
+	defs := FilterToolsForMode("faultTree", false, false)
+	guide := BuildToolPromptGuide(defs)
+
+	for _, section := range []string{"[read_context]", "[validate]", "[mutate]", "[client_ui]"} {
+		if !strings.Contains(guide, section) {
+			t.Fatalf("expected compact guide section %s, got: %s", section, guide)
+		}
+	}
+	if strings.Contains(guide, "[hybrid_preview]") {
+		t.Fatalf("hybrid tools should be hidden by default: %s", guide)
+	}
+	if strings.Contains(guide, `"properties"`) || strings.Contains(guide, `"type":"object"`) {
+		t.Fatalf("prompt guide should not duplicate full JSON schema: %s", guide)
+	}
+}
+
 func TestGateTypeSchemaAndValidatorContract(t *testing.T) {
 	checkGateEnum := func(toolName string) {
 		t.Helper()

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -115,6 +116,7 @@ func TestNormalizeToolFinalStatus(t *testing.T) {
 		"cancelled":     toolStatusCancelled,
 		"discarded":     toolStatusDiscarded,
 		"client_only":   toolStatusClientOnly,
+		"pending":       toolStatusPending,
 		"unknown_value": toolStatusSuccess,
 	}
 
@@ -172,6 +174,70 @@ func TestBuildToolResultHistoryMessage(t *testing.T) {
 	}
 	if payload["error"] != "invalid target" {
 		t.Fatalf("unexpected error field: %#v", payload["error"])
+	}
+}
+
+func TestBuildToolResultHistoryMessage_RedactsRawReadPayload(t *testing.T) {
+	rawSummary := `{"nodes":[{"id":"n1","name":"泄露检查"},{"id":"n2","name":"子节点"}],"edges":[{"id":"e1","source":"n1","target":"n2"}],"issues":[{"code":"GATE_CHILD_COUNT_TOO_LOW","nodeId":"n1"}]}`
+	msg := buildToolResultHistoryMessage("call_read", "get_graph_snapshot", toolStatusSuccess, rawSummary, nil, "")
+
+	if strings.Contains(msg.Content, `"nodes"`) || strings.Contains(msg.Content, `"edges"`) || strings.Contains(msg.Content, "泄露检查") {
+		t.Fatalf("tool history should contain compact observation, not raw graph payload: %s", msg.Content)
+	}
+
+	var payload ToolObservationSummary
+	if err := json.Unmarshal([]byte(msg.Content), &payload); err != nil {
+		t.Fatalf("tool result content should be compact json: %v", err)
+	}
+	if payload.NodeCount != 2 || payload.EdgeCount != 1 || payload.IssueCount != 1 {
+		t.Fatalf("unexpected compact counts: %+v", payload)
+	}
+	if len(payload.IssueCodes) != 1 || payload.IssueCodes[0] != "GATE_CHILD_COUNT_TOO_LOW" {
+		t.Fatalf("unexpected issue codes: %+v", payload.IssueCodes)
+	}
+}
+
+func TestBuildAutoReadCallForMutation_TargetAware(t *testing.T) {
+	call := ai.ToolCall{
+		Name:      "update_node",
+		Arguments: json.RawMessage(`{"nodeId":"gate_1","name":"Gate"}`),
+	}
+	readCall := buildAutoReadCallForMutation(call)
+	if readCall.Name != "get_node_detail" {
+		t.Fatalf("expected targeted get_node_detail, got %s", readCall.Name)
+	}
+	if !strings.Contains(string(readCall.Arguments), `"gate_1"`) {
+		t.Fatalf("expected node id in auto read args, got %s", string(readCall.Arguments))
+	}
+
+	batchCall := ai.ToolCall{
+		Name:      "batch_operations",
+		Arguments: json.RawMessage(`{"operations":[{"tool":"move_node","args":{"newParentId":"gate_2"}}]}`),
+	}
+	readCall = buildAutoReadCallForMutation(batchCall)
+	if readCall.Name != "get_node_detail" || !strings.Contains(string(readCall.Arguments), `"gate_2"`) {
+		t.Fatalf("expected batch auto read to target gate_2, got %s %s", readCall.Name, string(readCall.Arguments))
+	}
+
+	untargeted := buildAutoReadCallForMutation(ai.ToolCall{Name: "add_node", Arguments: json.RawMessage(`{"name":"A"}`)})
+	if untargeted.Name != "get_graph_snapshot" {
+		t.Fatalf("expected fallback get_graph_snapshot, got %s", untargeted.Name)
+	}
+	if !strings.Contains(string(untargeted.Arguments), `"maxNodes":120`) || !strings.Contains(string(untargeted.Arguments), `"maxEdges":200`) {
+		t.Fatalf("expected bounded snapshot args, got %s", string(untargeted.Arguments))
+	}
+}
+
+func TestResolveAgentModel_PrefersInputThenConfig(t *testing.T) {
+	svc := &AgentService{cfg: config.AgentConfig{AgentModel: "agent-default"}}
+	if got := svc.resolveAgentModel(" user-model "); got != "user-model" {
+		t.Fatalf("expected explicit model to win, got %q", got)
+	}
+	if got := svc.resolveAgentModel(""); got != "agent-default" {
+		t.Fatalf("expected configured agent model, got %q", got)
+	}
+	if got := (*AgentService)(nil).resolveAgentModel(""); got != "" {
+		t.Fatalf("expected nil service to return empty provider default, got %q", got)
 	}
 }
 

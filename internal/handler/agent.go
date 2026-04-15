@@ -35,12 +35,14 @@ func NewAgentHandler(agentService agentServiceRuntime, sessionMgr *agentcore.Age
 }
 
 type agentStreamRequest struct {
-	Message        string          `json:"message" binding:"required,max=2000"`
-	Model          string          `json:"model"`
-	GraphSnapshot  json.RawMessage `json:"graphSnapshot"`
-	ClientRevision *int            `json:"clientRevision"`
-	ReadOnly       bool            `json:"readOnly"`
-	MaxToolRounds  *int            `json:"maxToolRounds"`
+	Message         string          `json:"message" binding:"required,max=2000"`
+	Model           string          `json:"model"`
+	GraphSnapshot   json.RawMessage `json:"graphSnapshot"`
+	ClientRevision  *int            `json:"clientRevision"`
+	ReadOnly        bool            `json:"readOnly"`
+	MaxToolRounds   *int            `json:"maxToolRounds"`
+	FocusNodeIDs    []string        `json:"focusNodeIds"`
+	SelectedNodeIDs []string        `json:"selectedNodeIds"`
 }
 
 func (h *AgentHandler) AgentStream(c *gin.Context) {
@@ -145,14 +147,16 @@ func (h *AgentHandler) AgentStream(c *gin.Context) {
 	}
 
 	out, err := h.agentService.RunStream(streamCtx, session, agentcore.AgentRunInput{
-		ConversationID: c.Param("conversationId"),
-		UserID:         middleware.GetUserID(c),
-		Message:        req.Message,
-		Model:          req.Model,
-		GraphSnapshot:  req.GraphSnapshot,
-		ClientRevision: req.ClientRevision,
-		ReadOnly:       req.ReadOnly,
-		MaxToolRounds:  maxToolRounds,
+		ConversationID:  c.Param("conversationId"),
+		UserID:          middleware.GetUserID(c),
+		Message:         req.Message,
+		Model:           req.Model,
+		GraphSnapshot:   req.GraphSnapshot,
+		ClientRevision:  req.ClientRevision,
+		ReadOnly:        req.ReadOnly,
+		MaxToolRounds:   maxToolRounds,
+		FocusNodeIDs:    req.FocusNodeIDs,
+		SelectedNodeIDs: req.SelectedNodeIDs,
 	}, writeEvent)
 	if err != nil {
 		snap := session.Snapshot()
@@ -212,7 +216,7 @@ func (h *AgentHandler) AgentStream(c *gin.Context) {
 }
 
 type agentConfirmRequest struct {
-	CallID         string   `json:"callId" binding:"required"`
+	CallID         string   `json:"callId"`
 	Approved       bool     `json:"approved"`
 	ApprovedOps    []string `json:"approvedOps"`
 	ContinueRounds int      `json:"continueRounds"`
@@ -305,8 +309,9 @@ func (h *AgentHandler) AgentStatus(c *gin.Context) {
 		"session":        persisted.Session,
 		"runtimeSummary": persisted.RuntimeSummary,
 		"source":         "db",
-		"canConfirm":     persisted.CanConfirm,
-		"canResume":      persisted.CanResume,
+		"canConfirm":     false,
+		"canResume":      false,
+		"recoverable":    false,
 	})
 }
 
@@ -345,8 +350,9 @@ func (h *AgentHandler) AgentResume(c *gin.Context) {
 		"session":        persisted.Session,
 		"runtimeSummary": persisted.RuntimeSummary,
 		"source":         "db",
-		"canConfirm":     persisted.CanConfirm,
-		"canResume":      persisted.CanResume,
+		"canConfirm":     false,
+		"canResume":      false,
+		"recoverable":    false,
 	})
 }
 

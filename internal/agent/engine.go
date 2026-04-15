@@ -39,6 +39,7 @@ const (
 	toolStatusCancelled       = "cancelled"
 	toolStatusDiscarded       = "discarded"
 	toolStatusClientOnly      = "client_only"
+	toolStatusPending         = "pending"
 )
 
 type faultTreeRuntimeSnapshot struct {
@@ -48,14 +49,16 @@ type faultTreeRuntimeSnapshot struct {
 }
 
 type AgentRunInput struct {
-	ConversationID string
-	UserID         string
-	Message        string
-	Model          string
-	GraphSnapshot  json.RawMessage
-	ClientRevision *int
-	ReadOnly       bool
-	MaxToolRounds  int
+	ConversationID  string
+	UserID          string
+	Message         string
+	Model           string
+	GraphSnapshot   json.RawMessage
+	ClientRevision  *int
+	ReadOnly        bool
+	MaxToolRounds   int
+	FocusNodeIDs    []string
+	SelectedNodeIDs []string
 }
 
 type AgentRunOutput struct {
@@ -145,6 +148,17 @@ func (s *AgentService) Enabled() bool {
 	return s.cfg.Enabled
 }
 
+func (s *AgentService) resolveAgentModel(inputModel string) string {
+	model := strings.TrimSpace(inputModel)
+	if model != "" {
+		return model
+	}
+	if s == nil {
+		return ""
+	}
+	return strings.TrimSpace(s.cfg.AgentModel)
+}
+
 func (s *AgentService) GetPersistedSessionStatus(sessionID, userID string) (*PersistedSessionStatus, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	userID = strings.TrimSpace(userID)
@@ -211,6 +225,9 @@ func canResumeFromRuntime(runtime *model.AgentSessionRuntime) bool {
 		return false
 	}
 	if !strings.EqualFold(strings.TrimSpace(runtime.WaitStatus), "waiting") {
+		return false
+	}
+	if runtime.ExpiresAt != nil && time.Now().UTC().After(runtime.ExpiresAt.UTC()) {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(runtime.WaitType)) {
@@ -406,11 +423,12 @@ func (s *AgentService) RunStream(
 		return nil, err
 	}
 
-	toolDefs := graph_ops.FilterToolsForMode(conversation.Type, input.ReadOnly, false)
+	toolDefs := graph_ops.FilterToolsForMode(conversation.Type, input.ReadOnly, s.cfg.IncludeHybridTools)
 	toolSchemas := graph_ops.ToOAITools(toolDefs)
 	toolGuide := graph_ops.BuildToolPromptGuide(toolDefs)
 	history := toChatHistory(historyMessages)
 	workingHistory := append([]ai.ChatHistoryMessage(nil), history...)
+	modelForRun := s.resolveAgentModel(input.Model)
 
 	currentMessage := message
 	if input.ReadOnly {
@@ -422,6 +440,9 @@ func (s *AgentService) RunStream(
 		} else {
 			currentMessage = "系统上下文：本轮使用前端 graphSnapshot。\n" + currentMessage
 		}
+	}
+	if focusHint := buildFocusNodeHint(input.FocusNodeIDs, input.SelectedNodeIDs); focusHint != "" {
+		currentMessage = focusHint + "\n" + currentMessage
 	}
 	roundLimit := s.cfg.MaxRounds
 	if input.MaxToolRounds > 0 {
@@ -477,12 +498,15 @@ func (s *AgentService) RunStream(
 					ContextData: currentContext,
 					GraphType:   conversation.Type,
 					Message:     currentMessage,
-					Model:       strings.TrimSpace(input.Model),
+					Model:       modelForRun,
 					History:     workingHistory,
 				},
 				Tools:                toolSchemas,
 				ToolChoice:           "auto",
 				ToolGuide:            toolGuide,
+				PromptVersion:        strings.TrimSpace(s.cfg.PromptVersion),
+				ReadOnly:             input.ReadOnly,
+				FullContextThreshold: s.cfg.FullContextNodeThreshold,
 				Temperature:          &temperature,
 				EnableFallbackParser: s.cfg.EnableFallbackParser,
 			}, func(chunk string) {
@@ -500,12 +524,15 @@ func (s *AgentService) RunStream(
 					ContextData: currentContext,
 					GraphType:   conversation.Type,
 					Message:     currentMessage,
-					Model:       strings.TrimSpace(input.Model),
+					Model:       modelForRun,
 					History:     workingHistory,
 				},
 				Tools:                toolSchemas,
 				ToolChoice:           "auto",
 				ToolGuide:            toolGuide,
+				PromptVersion:        strings.TrimSpace(s.cfg.PromptVersion),
+				ReadOnly:             input.ReadOnly,
+				FullContextThreshold: s.cfg.FullContextNodeThreshold,
 				Temperature:          &temperature,
 				EnableFallbackParser: s.cfg.EnableFallbackParser,
 			})
@@ -625,8 +652,15 @@ func (s *AgentService) RunStream(
 	}
 	emitThinkingEvent(writeEvent, "finalizing", 0, "正在整理最终答复并落库")
 
+	if errors.Is(runErr, context.Canceled) {
+		snap := session.Snapshot()
+		if snap.State == StatePausedForConfirm || snap.State == StatePausedForPreview {
+			return nil, runErr
+		}
+	}
+
 	if strings.TrimSpace(finalReply) == "" && len(allToolSummaries) > 0 {
-		finalReply = strings.Join(allToolSummaries, "；")
+		finalReply = "工具执行已完成：" + summarizePlainText(strings.Join(allToolSummaries, "；"), s.maxToolSummaryChars())
 	}
 	if strings.TrimSpace(finalReply) == "" {
 		finalReply = "操作已完成"
@@ -822,11 +856,11 @@ func (s *AgentService) executeRoundToolCalls(
 	toolResults = make([]ai.ChatHistoryMessage, 0, len(toolCalls)+4)
 	toolCalls = mergeRoundMutationCalls(toolCalls)
 
-	roundReadUsed := false
-	hadRecentRead := false
+	roundReadContextUsed := false
+	hadRecentReadContext := false
 	if session != nil {
-		hadRecentRead = session.HasRecentReadContext()
-		defer session.SetRecentReadContext(roundReadUsed)
+		hadRecentReadContext = session.HasRecentReadContext()
+		defer session.SetRecentReadContext(roundReadContextUsed)
 	}
 
 	for _, call := range toolCalls {
@@ -874,8 +908,8 @@ func (s *AgentService) executeRoundToolCalls(
 			continue
 		}
 
-		if def.Tier == graph_ops.TierServer && def.MutatesGraph && !readOnly && !roundReadUsed && !hadRecentRead {
-			autoReadCall := ai.ToolCall{ID: util.NewAgentToolCallID(), Name: "get_graph_snapshot", Arguments: json.RawMessage(`{}`)}
+		if def.Tier == graph_ops.TierServer && def.MutatesGraph && !readOnly && !roundReadContextUsed && !hadRecentReadContext {
+			autoReadCall := buildAutoReadCallForMutation(call)
 			autoDef, ok := graph_ops.GetTool(autoReadCall.Name)
 			if ok {
 				if s.safety != nil {
@@ -894,12 +928,12 @@ func (s *AgentService) executeRoundToolCalls(
 				if err != nil {
 					return summaries, toolResults, graphMutated, err
 				}
-				roundReadUsed = true
+				roundReadContextUsed = true
 				autoSummary := strings.TrimSpace(outcome.Summary)
 				if autoSummary == "" {
 					autoSummary = "已自动读取图上下文"
 				}
-				autoSummary = "auto_read_context: " + autoSummary
+				autoSummary = s.compactToolObservationText(autoReadCall.Name, status, "auto_read_context: "+autoSummary, outcome.Patch, "")
 				summaries = append(summaries, autoSummary)
 				toolResults = append(toolResults, buildToolResultHistoryMessage(autoReadCall.ID, autoReadCall.Name, status, autoSummary, outcome.Patch, ""))
 			}
@@ -933,11 +967,12 @@ func (s *AgentService) executeRoundToolCalls(
 		if hasGraphPatchChanges(outcome.Patch) {
 			graphMutated = true
 		}
-		if def.Tier == graph_ops.TierServer && def.ReadOnly {
-			roundReadUsed = true
+		if def.Tier == graph_ops.TierServer && graph_ops.ToolIsReadContext(def.Name) {
+			roundReadContextUsed = true
 		}
 
-		summaries = append(summaries, resultSummary)
+		observationSummary := s.compactToolObservationText(call.Name, finalStatus, resultSummary, outcome.Patch, "")
+		summaries = append(summaries, observationSummary)
 		toolResults = append(toolResults, buildToolResultHistoryMessage(call.ID, call.Name, finalStatus, resultSummary, outcome.Patch, ""))
 
 		if def.Tier == graph_ops.TierServer && def.MutatesGraph && finalStatus == toolStatusSuccess {
@@ -986,12 +1021,14 @@ func (s *AgentService) executeRoundToolCalls(
 				if err != nil {
 					return summaries, toolResults, graphMutated, err
 				}
-				roundReadUsed = true
+				if graph_ops.ToolIsReadContext(followCall.Name) {
+					roundReadContextUsed = true
+				}
 				followSummary := strings.TrimSpace(followOutcome.Summary)
 				if followSummary == "" {
 					followSummary = fmt.Sprintf("%s: %s", followCall.Name, followStatus)
 				}
-				followSummary = followCall.Name + "(auto): " + followSummary
+				followSummary = s.compactToolObservationText(followCall.Name, followStatus, followCall.Name+"(auto): "+followSummary, followOutcome.Patch, "")
 				summaries = append(summaries, followSummary)
 				toolResults = append(toolResults, buildToolResultHistoryMessage(followCall.ID, followCall.Name, followStatus, followSummary, followOutcome.Patch, ""))
 			}
@@ -1036,6 +1073,16 @@ func (s *AgentService) runToolCallWithAudit(
 	outcome, dispatchErr := s.dispatchToolCall(ctx, session, projectID, graphType, readOnly, runtimeSnapshot, call, def, writeEvent)
 	if dispatchErr != nil {
 		errMsg := dispatchErr.Error()
+		if errors.Is(dispatchErr, context.Canceled) {
+			snap := session.Snapshot()
+			if snap.State == StatePausedForConfirm || snap.State == StatePausedForPreview {
+				waitingSummary := "waiting_user_confirmation"
+				if err := s.agentToolCallRepo.UpdateStatus(toolRecord.ID, toolStatusPending, &waitingSummary, nil, nil); err != nil {
+					return nil, toolStatusFailed, fmt.Errorf("update waiting tool call status error: %v (origin=%w)", err, dispatchErr)
+				}
+				return &toolDispatchOutcome{Summary: waitingSummary, Status: toolStatusPending}, toolStatusPending, dispatchErr
+			}
+		}
 		if err := s.agentToolCallRepo.UpdateStatus(toolRecord.ID, toolStatusFailed, nil, nil, &errMsg); err != nil {
 			return nil, toolStatusFailed, fmt.Errorf("update failed tool call status error: %v (origin=%w)", err, dispatchErr)
 		}
@@ -1067,27 +1114,37 @@ func mergeRoundMutationCalls(toolCalls []ai.ToolCall) []ai.ToolCall {
 		return toolCalls
 	}
 
-	out := make([]ai.ToolCall, 0, len(toolCalls))
-	for i := 0; i < len(toolCalls); {
-		if !isMergeableMutationTool(toolCalls[i].Name) {
-			out = append(out, toolCalls[i])
-			i++
+	mutations := make([]ai.ToolCall, 0, len(toolCalls))
+	firstMutationIndex := -1
+	for i, call := range toolCalls {
+		if !isMergeableMutationTool(call.Name) {
 			continue
 		}
-
-		j := i
-		for j < len(toolCalls) && isMergeableMutationTool(toolCalls[j].Name) {
-			j++
+		if firstMutationIndex < 0 {
+			firstMutationIndex = i
 		}
+		mutations = append(mutations, call)
+	}
+	if len(mutations) <= 1 {
+		return toolCalls
+	}
 
-		segment := toolCalls[i:j]
-		merged, ok := mergeMutationSegment(segment)
-		if ok {
-			out = append(out, merged)
-		} else {
-			out = append(out, segment...)
+	merged, ok := mergeMutationSegment(mutations)
+	if !ok {
+		return toolCalls
+	}
+
+	out := make([]ai.ToolCall, 0, len(toolCalls)-len(mutations)+1)
+	inserted := false
+	for i, call := range toolCalls {
+		if isMergeableMutationTool(call.Name) {
+			if !inserted && i == firstMutationIndex {
+				out = append(out, merged)
+				inserted = true
+			}
+			continue
 		}
-		i = j
+		out = append(out, call)
 	}
 	return out
 }
@@ -1208,6 +1265,75 @@ func gateSemanticsArgsFromCall(call ai.ToolCall) json.RawMessage {
 	return json.RawMessage(raw)
 }
 
+func buildAutoReadCallForMutation(call ai.ToolCall) ai.ToolCall {
+	args := map[string]interface{}{}
+	if len(call.Arguments) > 0 && json.Valid(call.Arguments) {
+		_ = json.Unmarshal(call.Arguments, &args)
+	}
+
+	for _, key := range []string{"nodeId", "parentId", "newParentId", "rootNodeId"} {
+		if nodeID := stringFromMap(args, key); nodeID != "" {
+			raw, _ := json.Marshal(map[string]string{"nodeId": nodeID})
+			return ai.ToolCall{ID: util.NewAgentToolCallID(), Name: "get_node_detail", Arguments: json.RawMessage(raw)}
+		}
+	}
+
+	if strings.EqualFold(strings.TrimSpace(call.Name), "batch_operations") {
+		if nodeID := firstNodeIDFromBatchArgs(args); nodeID != "" {
+			raw, _ := json.Marshal(map[string]string{"nodeId": nodeID})
+			return ai.ToolCall{ID: util.NewAgentToolCallID(), Name: "get_node_detail", Arguments: json.RawMessage(raw)}
+		}
+	}
+
+	return ai.ToolCall{
+		ID:        util.NewAgentToolCallID(),
+		Name:      "get_graph_snapshot",
+		Arguments: json.RawMessage(`{"maxNodes":120,"maxEdges":200}`),
+	}
+}
+
+func firstNodeIDFromBatchArgs(args map[string]interface{}) string {
+	ops, ok := args["operations"].([]interface{})
+	if !ok {
+		return ""
+	}
+	for _, item := range ops {
+		op, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		opArgs, ok := op["args"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for _, key := range []string{"nodeId", "parentId", "newParentId", "rootNodeId"} {
+			if nodeID := stringFromMap(opArgs, key); nodeID != "" {
+				return nodeID
+			}
+		}
+	}
+	return ""
+}
+
+func stringFromMap(values map[string]interface{}, key string) string {
+	if values == nil {
+		return ""
+	}
+	if v, ok := values[key].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func buildFocusNodeHint(focusNodeIDs, selectedNodeIDs []string) string {
+	ids := uniqueStrings(append(append([]string{}, focusNodeIDs...), selectedNodeIDs...))
+	if len(ids) == 0 {
+		return ""
+	}
+	ids = limitStrings(ids, 20)
+	return fmt.Sprintf("系统上下文：本轮前端关注节点为 [%s]。涉及编辑或判断时，优先调用 get_node_detail 或 get_subtree 读取这些节点附近结构。", strings.Join(ids, ","))
+}
+
 func isHardStopSafetyError(err error) bool {
 	return errors.Is(err, ErrAgentLoopDetected) ||
 		errors.Is(err, ErrAgentMaxToolCalls) ||
@@ -1270,9 +1396,22 @@ type toolDispatchOutcome struct {
 	ChangedEdges int
 }
 
+type ToolObservationSummary struct {
+	Tool            string         `json:"tool"`
+	Status          string         `json:"status"`
+	NodeCount       int            `json:"nodeCount,omitempty"`
+	EdgeCount       int            `json:"edgeCount,omitempty"`
+	IssueCount      int            `json:"issueCount,omitempty"`
+	IssueCodes      []string       `json:"issueCodes,omitempty"`
+	AffectedNodeIDs []string       `json:"affectedNodeIds,omitempty"`
+	ChangedCounts   map[string]int `json:"changedCounts,omitempty"`
+	Error           string         `json:"error,omitempty"`
+	Summary         string         `json:"summary,omitempty"`
+}
+
 func normalizeToolFinalStatus(status string) string {
 	switch strings.TrimSpace(status) {
-	case toolStatusFailed, toolStatusCancelled, toolStatusDiscarded, toolStatusClientOnly, toolStatusSuccess:
+	case toolStatusFailed, toolStatusCancelled, toolStatusDiscarded, toolStatusClientOnly, toolStatusSuccess, toolStatusPending:
 		return strings.TrimSpace(status)
 	default:
 		return toolStatusSuccess
@@ -1419,50 +1558,205 @@ func buildToolResultHistoryMessage(callID, toolName, status, summary string, pat
 }
 
 func buildToolResultContent(toolName, status, summary string, patch *graph_ops.GraphPatch, errMsg string) string {
-	payload := map[string]interface{}{
-		"tool":   strings.TrimSpace(toolName),
-		"status": normalizeToolFinalStatus(status),
-	}
-
-	if v := summarizeToolSummaryForHistory(summary); v != "" {
-		payload["summary"] = v
-	}
-	if v := strings.TrimSpace(errMsg); v != "" {
-		payload["error"] = v
-	}
-	if patch != nil {
-		payload["changed"] = map[string]int{
-			"upsertNodes": len(patch.UpsertNodes),
-			"deleteNodes": len(patch.DeleteNodes),
-			"upsertEdges": len(patch.UpsertEdges),
-			"deleteEdges": len(patch.DeleteEdges),
-		}
-		affectedNodeIDs := make([]string, 0, len(patch.UpsertNodes)+len(patch.DeleteNodes))
-		for _, item := range patch.UpsertNodes {
-			if id, ok := item["id"].(string); ok && strings.TrimSpace(id) != "" {
-				affectedNodeIDs = append(affectedNodeIDs, strings.TrimSpace(id))
-			}
-		}
-		affectedNodeIDs = append(affectedNodeIDs, patch.DeleteNodes...)
-		if len(affectedNodeIDs) > 10 {
-			affectedNodeIDs = affectedNodeIDs[:10]
-		}
-		if len(affectedNodeIDs) > 0 {
-			payload["affectedNodeIds"] = affectedNodeIDs
-		}
-	}
-
-	raw, err := json.Marshal(payload)
+	observation := buildToolObservationSummary(toolName, status, summary, patch, errMsg)
+	raw, err := json.Marshal(observation)
 	if err != nil {
 		fallback, _ := json.Marshal(map[string]string{
 			"tool":    strings.TrimSpace(toolName),
 			"status":  normalizeToolFinalStatus(status),
-			"summary": strings.TrimSpace(summary),
+			"summary": summarizePlainText(summary, defaultToolSummaryLimit()),
 			"error":   strings.TrimSpace(errMsg),
 		})
 		return string(fallback)
 	}
 	return string(raw)
+}
+
+func (s *AgentService) compactToolObservationText(toolName, status, summary string, patch *graph_ops.GraphPatch, errMsg string) string {
+	raw, err := json.Marshal(buildToolObservationSummary(toolName, status, summary, patch, errMsg))
+	if err != nil {
+		return summarizePlainText(summary, s.maxToolSummaryChars())
+	}
+	return summarizePlainText(string(raw), s.maxToolSummaryChars())
+}
+
+func (s *AgentService) maxToolSummaryChars() int {
+	if s != nil && s.cfg.MaxToolSummaryChars > 0 {
+		return s.cfg.MaxToolSummaryChars
+	}
+	return defaultToolSummaryLimit()
+}
+
+func defaultToolSummaryLimit() int { return 1200 }
+
+func buildToolObservationSummary(toolName, status, summary string, patch *graph_ops.GraphPatch, errMsg string) ToolObservationSummary {
+	observation := ToolObservationSummary{
+		Tool:   strings.TrimSpace(toolName),
+		Status: normalizeToolFinalStatus(status),
+		Error:  strings.TrimSpace(errMsg),
+	}
+
+	if patch != nil {
+		observation.ChangedCounts = map[string]int{
+			"upsertNodes": len(patch.UpsertNodes),
+			"deleteNodes": len(patch.DeleteNodes),
+			"upsertEdges": len(patch.UpsertEdges),
+			"deleteEdges": len(patch.DeleteEdges),
+		}
+		affected := make([]string, 0, len(patch.UpsertNodes)+len(patch.DeleteNodes))
+		for _, item := range patch.UpsertNodes {
+			if id, ok := item["id"].(string); ok && strings.TrimSpace(id) != "" {
+				affected = append(affected, strings.TrimSpace(id))
+			}
+		}
+		affected = append(affected, patch.DeleteNodes...)
+		observation.AffectedNodeIDs = limitStrings(uniqueStrings(affected), 12)
+	}
+
+	trimmed := strings.TrimSpace(summary)
+	if trimmed == "" {
+		return observation
+	}
+	if !json.Valid([]byte(trimmed)) {
+		observation.Summary = summarizePlainText(trimmed, 280)
+		return observation
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
+		observation.Summary = summarizePlainText(trimmed, 280)
+		return observation
+	}
+	observation.NodeCount = intFromAny(payload["nodeCount"])
+	if observation.NodeCount == 0 {
+		observation.NodeCount = lenFromAny(payload["nodes"])
+	}
+	observation.EdgeCount = intFromAny(payload["edgeCount"])
+	if observation.EdgeCount == 0 {
+		observation.EdgeCount = lenFromAny(payload["edges"])
+	}
+	observation.IssueCount = intFromAny(payload["issueCount"])
+	if observation.IssueCount == 0 {
+		observation.IssueCount = lenFromAny(payload["issues"])
+	}
+	observation.IssueCodes = issueCodesFromPayload(payload["issues"])
+	if observation.Summary == "" {
+		if v, ok := payload["summary"].(string); ok {
+			observation.Summary = summarizePlainText(v, 280)
+		}
+	}
+	if len(observation.AffectedNodeIDs) == 0 {
+		observation.AffectedNodeIDs = affectedNodeIDsFromPayload(payload)
+	}
+	return observation
+}
+
+func intFromAny(v interface{}) int {
+	switch t := v.(type) {
+	case float64:
+		return int(t)
+	case int:
+		return t
+	case int64:
+		return int(t)
+	default:
+		return 0
+	}
+}
+
+func lenFromAny(v interface{}) int {
+	switch t := v.(type) {
+	case []interface{}:
+		return len(t)
+	case []map[string]interface{}:
+		return len(t)
+	default:
+		return 0
+	}
+}
+
+func issueCodesFromPayload(v interface{}) []string {
+	items, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	codes := make([]string, 0, len(items))
+	for _, item := range items {
+		obj, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if code, ok := obj["code"].(string); ok && strings.TrimSpace(code) != "" {
+			codes = append(codes, strings.TrimSpace(code))
+		}
+	}
+	return limitStrings(uniqueStrings(codes), 12)
+}
+
+func affectedNodeIDsFromPayload(payload map[string]interface{}) []string {
+	out := make([]string, 0, 8)
+	for _, key := range []string{"nodeId", "rootNodeId"} {
+		if v, ok := payload[key].(string); ok && strings.TrimSpace(v) != "" {
+			out = append(out, strings.TrimSpace(v))
+		}
+	}
+	for _, key := range []string{"parentNodeIds", "childNodeIds", "topEventIds"} {
+		out = append(out, stringSliceFromAny(payload[key])...)
+	}
+	return limitStrings(uniqueStrings(out), 12)
+}
+
+func stringSliceFromAny(v interface{}) []string {
+	items, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, strings.TrimSpace(s))
+		}
+	}
+	return out
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		v := strings.TrimSpace(value)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func limitStrings(values []string, limit int) []string {
+	if limit <= 0 || len(values) <= limit {
+		return values
+	}
+	return values[:limit]
+}
+
+func summarizePlainText(text string, maxLen int) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	if maxLen <= 0 {
+		maxLen = defaultToolSummaryLimit()
+	}
+	runes := []rune(trimmed)
+	if len(runes) <= maxLen {
+		return trimmed
+	}
+	return string(runes[:maxLen]) + "..."
 }
 
 func summarizeToolSummaryForHistory(summary string) string {

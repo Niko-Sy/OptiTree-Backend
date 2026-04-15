@@ -21,6 +21,9 @@ type AgentChatRequest struct {
 	Tools                []OAIToolDef `json:"tools,omitempty"`
 	ToolChoice           string       `json:"toolChoice,omitempty"` // "auto" | "none"
 	ToolGuide            string       `json:"toolGuide,omitempty"`
+	PromptVersion        string       `json:"promptVersion,omitempty"`
+	ReadOnly             bool         `json:"readOnly,omitempty"`
+	FullContextThreshold int          `json:"fullContextThreshold,omitempty"`
 	Temperature          *float64     `json:"temperature,omitempty"`
 	EnableFallbackParser bool         `json:"enableFallbackParser,omitempty"`
 }

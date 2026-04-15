@@ -71,6 +71,10 @@ agent:
   tool_call_rate_limit: 5
   enable_fallback_parser: true
   agent_model: ""
+  prompt_version: "v2"
+  include_hybrid_tools: false
+  max_tool_summary_chars: 1200
+  full_context_node_threshold: 120
 
 log:
   enabled: true

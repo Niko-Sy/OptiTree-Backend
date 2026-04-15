@@ -97,16 +97,20 @@ type AITaskConfig struct {
 
 // AgentConfig controls mixed agent execution behavior.
 type AgentConfig struct {
-	Enabled              bool          `mapstructure:"enabled"`
-	MaxRounds            int           `mapstructure:"max_rounds"`
-	MaxToolCalls         int           `mapstructure:"max_tool_calls"`
-	MaxNodesPerSession   int           `mapstructure:"max_nodes_per_session"`
-	ConfirmTimeout       time.Duration `mapstructure:"confirm_timeout"`
-	PreviewTimeout       time.Duration `mapstructure:"preview_timeout"`
-	SessionTTL           time.Duration `mapstructure:"session_ttl"`
-	ToolCallRateLimit    int           `mapstructure:"tool_call_rate_limit"`
-	EnableFallbackParser bool          `mapstructure:"enable_fallback_parser"`
-	AgentModel           string        `mapstructure:"agent_model"`
+	Enabled                  bool          `mapstructure:"enabled"`
+	MaxRounds                int           `mapstructure:"max_rounds"`
+	MaxToolCalls             int           `mapstructure:"max_tool_calls"`
+	MaxNodesPerSession       int           `mapstructure:"max_nodes_per_session"`
+	ConfirmTimeout           time.Duration `mapstructure:"confirm_timeout"`
+	PreviewTimeout           time.Duration `mapstructure:"preview_timeout"`
+	SessionTTL               time.Duration `mapstructure:"session_ttl"`
+	ToolCallRateLimit        int           `mapstructure:"tool_call_rate_limit"`
+	EnableFallbackParser     bool          `mapstructure:"enable_fallback_parser"`
+	AgentModel               string        `mapstructure:"agent_model"`
+	PromptVersion            string        `mapstructure:"prompt_version"`
+	IncludeHybridTools       bool          `mapstructure:"include_hybrid_tools"`
+	MaxToolSummaryChars      int           `mapstructure:"max_tool_summary_chars"`
+	FullContextNodeThreshold int           `mapstructure:"full_context_node_threshold"`
 }
 
 type ServerConfig struct {

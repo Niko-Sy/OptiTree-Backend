@@ -220,6 +220,49 @@ func TestAgentConfirm_AcceptsContinueRounds(t *testing.T) {
 	}
 }
 
+func TestAgentConfirm_AllowsEmptyCallIDForUniquePending(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	mgr := agentcore.NewAgentSessionManager(time.Minute)
+	session := mgr.NewSession("s_empty_call", "c1", "p1", "user_1", "faultTree")
+	if err := mgr.Create(session); err != nil {
+		t.Fatalf("create session failed: %v", err)
+	}
+	session.SetPending("call_expected", "update_node", []byte(`{"nodeId":"n1"}`))
+	session.SetState(agentcore.StatePausedForConfirm)
+
+	received := make(chan agentcore.ConfirmSignal, 1)
+	go func() {
+		received <- <-session.ConfirmChan()
+	}()
+
+	h := NewAgentHandler(&fakeAgentService{enabled: true}, mgr)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set(middleware.ContextKeyUserID, "user_1")
+		c.Next()
+	})
+	r.POST("/agent/sessions/:sessionId/confirm", h.AgentConfirm)
+
+	req := httptest.NewRequest(http.MethodPost, "/agent/sessions/s_empty_call/confirm", strings.NewReader(`{"approved":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+
+	select {
+	case got := <-received:
+		if got.CallID != "call_expected" || !got.Approved {
+			t.Fatalf("expected pending call to be filled, got %+v", got)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("did not receive confirm signal")
+	}
+}
+
 func TestAgentStream_PassesSnapshotOptions(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -239,6 +282,12 @@ func TestAgentStream_PassesSnapshotOptions(t *testing.T) {
 			if len(input.GraphSnapshot) == 0 {
 				t.Fatalf("expected graphSnapshot to be passed through")
 			}
+			if strings.Join(input.FocusNodeIDs, ",") != "gate_1,basic_2" {
+				t.Fatalf("unexpected focusNodeIds: %+v", input.FocusNodeIDs)
+			}
+			if strings.Join(input.SelectedNodeIDs, ",") != "gate_3" {
+				t.Fatalf("unexpected selectedNodeIds: %+v", input.SelectedNodeIDs)
+			}
 			return &agentcore.AgentRunOutput{ConversationID: input.ConversationID, SessionID: session.ID, UserMessageID: "msg_u"}, nil
 		},
 	}
@@ -251,7 +300,7 @@ func TestAgentStream_PassesSnapshotOptions(t *testing.T) {
 	})
 	r.POST("/assistant/conversations/:conversationId/agent/stream", h.AgentStream)
 
-	body := `{"message":"分析当前图","model":"qwen3","graphSnapshot":{"nodes":[],"edges":[]},"clientRevision":7,"readOnly":true,"maxToolRounds":3}`
+	body := `{"message":"分析当前图","model":"qwen3","graphSnapshot":{"nodes":[],"edges":[]},"clientRevision":7,"readOnly":true,"maxToolRounds":3,"focusNodeIds":["gate_1","basic_2"],"selectedNodeIds":["gate_3"]}`
 	req := httptest.NewRequest(http.MethodPost, "/assistant/conversations/conv_1/agent/stream", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -350,8 +399,11 @@ func TestAgentResume_ReturnsDBRuntimeWhenMemoryMissing(t *testing.T) {
 	if canConfirm, _ := data["canConfirm"].(bool); canConfirm {
 		t.Fatalf("expected canConfirm=false for db fallback, got %v", data["canConfirm"])
 	}
-	if canResume, _ := data["canResume"].(bool); !canResume {
-		t.Fatalf("expected canResume=true, got %v", data["canResume"])
+	if canResume, _ := data["canResume"].(bool); canResume {
+		t.Fatalf("expected canResume=false for db-only fallback, got %v", data["canResume"])
+	}
+	if recoverable, _ := data["recoverable"].(bool); recoverable {
+		t.Fatalf("expected recoverable=false for db-only fallback, got %v", data["recoverable"])
 	}
 	runtimeSummary, ok := data["runtimeSummary"].(map[string]interface{})
 	if !ok {

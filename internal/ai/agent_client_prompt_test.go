@@ -6,13 +6,13 @@ import (
 	"testing"
 )
 
-func TestBuildAgentMessages_FaultTreeIncludesIECAndToolchainRules(t *testing.T) {
+func TestBuildAgentMessages_FaultTreeUsesCompactPromptV2(t *testing.T) {
 	req := AgentChatRequest{
 		ChatRequest: ChatRequest{
 			GraphType: "faultTree",
 			Message:   "请检查并修复故障树逻辑",
 		},
-		ToolGuide: "- get_graph_snapshot | tier=server | required=[none] | flags=[read_only]",
+		ToolGuide: "Contract order for graph edits: read_context -> validate -> mutate -> validate.\n[read_context]\n- get_graph_snapshot | required=[none] | flags=[read_only]",
 	}
 
 	messages := buildAgentMessages(req)
@@ -20,19 +20,25 @@ func TestBuildAgentMessages_FaultTreeIncludesIECAndToolchainRules(t *testing.T) 
 		t.Fatalf("expected at least one message")
 	}
 	sys := messages[0].Content
+	if len([]rune(sys)) > 1400 {
+		t.Fatalf("expected compact system prompt, got %d chars: %s", len([]rune(sys)), sys)
+	}
 
 	checks := []string{
-		"IEC 61025",
 		"Top Event",
 		"Basic Event",
-		"Toolchain-first",
 		"Runtime Tool Guide",
-		"get_graph_snapshot | tier=server",
-		"do NOT ask the user to resend raw nodes/edges",
+		"get_graph_snapshot | required=[none]",
+		"read_context -> validate -> mutate -> validate",
 	}
 	for _, check := range checks {
 		if !strings.Contains(sys, check) {
 			t.Fatalf("expected system prompt to contain %q, got: %s", check, sys)
+		}
+	}
+	for _, bad := range []string{"add_edge", "delete_edge", "change_gate_type", "restructure_subtree", "+node", "+edge", "-edge", "local subtree refactor"} {
+		if strings.Contains(sys, bad) {
+			t.Fatalf("system prompt should not contain misleading action %q: %s", bad, sys)
 		}
 	}
 }
@@ -51,15 +57,12 @@ func TestBuildAgentMessages_KnowledgeGraphNotPollutedByFTA(t *testing.T) {
 	}
 	sys := messages[0].Content
 
-	if strings.Contains(sys, "IEC 61025") {
-		t.Fatalf("knowledge graph prompt should not include IEC 61025 rules: %s", sys)
-	}
 	if !strings.Contains(sys, "knowledge graph") {
 		t.Fatalf("expected knowledge graph wording in system prompt: %s", sys)
 	}
 }
 
-func TestBuildAgentMessages_UsesChunkedContextModeForLargeGraphs(t *testing.T) {
+func TestBuildAgentMessages_UsesSummaryContextModeForLargeGraphs(t *testing.T) {
 	nodes := make([]map[string]interface{}, 0, 450)
 	for i := 0; i < 450; i++ {
 		nodes = append(nodes, map[string]interface{}{
@@ -86,10 +89,69 @@ func TestBuildAgentMessages_UsesChunkedContextModeForLargeGraphs(t *testing.T) {
 	}
 	userMsg := messages[len(messages)-1].Content
 
-	if !strings.Contains(userMsg, "Context mode: chunked") {
-		t.Fatalf("expected agent context mode to be chunked, got user prompt: %s", userMsg)
+	if !strings.Contains(userMsg, "Context mode: summary") {
+		t.Fatalf("expected agent context mode to be summary, got user prompt: %s", userMsg)
 	}
-	if strings.Contains(userMsg, "Context mode: full") {
-		t.Fatalf("large graph should not use full context mode: %s", userMsg)
+	if strings.Contains(userMsg, `"chunks"`) {
+		t.Fatalf("large graph should not include full chunks by default: %s", userMsg)
+	}
+}
+
+func TestBuildAgentMessages_UsesChunkedContextOnlyWhenExplicitlyRequested(t *testing.T) {
+	nodes := make([]map[string]interface{}, 0, 450)
+	for i := 0; i < 450; i++ {
+		nodes = append(nodes, map[string]interface{}{
+			"id":   fmt.Sprintf("n_%d", i),
+			"type": "basicEvent",
+			"name": fmt.Sprintf("Node-%d", i),
+		})
+	}
+
+	req := AgentChatRequest{
+		ChatRequest: ChatRequest{
+			GraphType: "faultTree",
+			Message:   "请全图遍历分析所有节点",
+			ContextData: map[string]interface{}{
+				"nodes": nodes,
+				"edges": []map[string]interface{}{},
+			},
+		},
+	}
+
+	messages := buildAgentMessages(req)
+	userMsg := messages[len(messages)-1].Content
+	if !strings.Contains(userMsg, "Context mode: chunked") {
+		t.Fatalf("expected explicit full graph request to use chunked mode, got: %s", userMsg)
+	}
+	if !strings.Contains(userMsg, `"chunks"`) {
+		t.Fatalf("expected chunk payload for explicit full graph request, got: %s", userMsg)
+	}
+}
+
+func TestBuildAgentMessages_RespectsFullContextThreshold(t *testing.T) {
+	nodes := make([]map[string]interface{}, 0, 150)
+	for i := 0; i < 150; i++ {
+		nodes = append(nodes, map[string]interface{}{
+			"id":   fmt.Sprintf("n_%d", i),
+			"type": "basicEvent",
+		})
+	}
+
+	req := AgentChatRequest{
+		ChatRequest: ChatRequest{
+			GraphType: "faultTree",
+			Message:   "检查当前图",
+			ContextData: map[string]interface{}{
+				"nodes": nodes,
+				"edges": []map[string]interface{}{},
+			},
+		},
+		FullContextThreshold: 200,
+	}
+
+	messages := buildAgentMessages(req)
+	userMsg := messages[len(messages)-1].Content
+	if !strings.Contains(userMsg, "Context mode: full") {
+		t.Fatalf("expected raised threshold to keep full context, got: %s", userMsg)
 	}
 }

@@ -31,6 +31,18 @@ func TestCanResumeFromRuntime_OnlyWaitingActionableTypes(t *testing.T) {
 	}
 }
 
+func TestCanResumeFromRuntime_ExpiredRuntimeNotResumable(t *testing.T) {
+	expiredAt := time.Now().UTC().Add(-time.Second)
+	runtime := &model.AgentSessionRuntime{
+		WaitType:   "confirm",
+		WaitStatus: "waiting",
+		ExpiresAt:  &expiredAt,
+	}
+	if canResumeFromRuntime(runtime) {
+		t.Fatalf("expected expired runtime not resumable: %+v", runtime)
+	}
+}
+
 func TestBuildPersistedRuntimeSummary_RedactsRawPayload(t *testing.T) {
 	expiresAt := time.Now().UTC().Add(2 * time.Minute)
 	callID := "call_1"
