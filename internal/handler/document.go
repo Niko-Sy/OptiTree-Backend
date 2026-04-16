@@ -2,7 +2,12 @@ package handler
 
 import (
 	"fmt"
+	"io"
 	"mime"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 
 	"optitree-backend/internal/constant"
 	"optitree-backend/internal/middleware"
@@ -90,9 +95,11 @@ func (h *DocumentHandler) Upload(c *gin.Context) {
 		}
 		docIDs = append(docIDs, doc.ID)
 		documents = append(documents, gin.H{
-			"id":       doc.ID,
-			"fileName": doc.FileName,
-			"status":   doc.Status,
+			"id":            doc.ID,
+			"fileName":      doc.FileName,
+			"status":        doc.Status,
+			"readerKind":    doc.ReaderKind,
+			"previewStatus": doc.PreviewStatus,
 		})
 	}
 
@@ -126,4 +133,135 @@ func (h *DocumentHandler) GetByID(c *gin.Context) {
 		return
 	}
 	util.Success(c, gin.H{"document": doc})
+}
+
+func (h *DocumentHandler) ListByProject(c *gin.Context) {
+	projectID := strings.TrimSpace(c.Param("projectId"))
+	if projectID == "" {
+		util.Fail(c, constant.CodeInvalidParam, "projectId 不能为空")
+		return
+	}
+
+	list, err := h.docService.ListByProject(c.Request.Context(), projectID, middleware.GetUserID(c))
+	if err != nil {
+		switch err {
+		case service.ErrDocumentPermissionDenied:
+			util.FailForbidden(c)
+		default:
+			util.FailServerError(c)
+		}
+		return
+	}
+
+	util.Success(c, gin.H{"list": list})
+}
+
+func (h *DocumentHandler) SearchByProject(c *gin.Context) {
+	projectID := strings.TrimSpace(c.Param("projectId"))
+	if projectID == "" {
+		util.Fail(c, constant.CodeInvalidParam, "projectId 不能为空")
+		return
+	}
+
+	results, err := h.docService.Search(
+		c.Request.Context(),
+		projectID,
+		c.Query("q"),
+		middleware.GetUserID(c),
+	)
+	if err != nil {
+		switch err {
+		case service.ErrDocumentPermissionDenied:
+			util.FailForbidden(c)
+		default:
+			util.FailServerError(c)
+		}
+		return
+	}
+
+	util.Success(c, gin.H{"list": results})
+}
+
+func (h *DocumentHandler) Preview(c *gin.Context) {
+	docID := strings.TrimSpace(c.Param("docId"))
+	if docID == "" {
+		util.Fail(c, constant.CodeInvalidParam, "docId 不能为空")
+		return
+	}
+
+	binary, err := h.docService.Preview(c.Request.Context(), docID, middleware.GetUserID(c))
+	if err != nil {
+		switch err {
+		case service.ErrDocumentNotFound:
+			c.JSON(http.StatusNotFound, gin.H{"code": constant.CodeNotFound, "message": constant.MsgNotFound})
+		case service.ErrDocumentPermissionDenied:
+			util.FailForbidden(c)
+		case service.ErrDocumentPreviewProcessing:
+			c.JSON(http.StatusConflict, gin.H{"code": constant.CodeConflict, "message": "文档预览生成中"})
+		case service.ErrDocumentPreviewFailed:
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"code": constant.CodeAIFailed, "message": "文档预览不可用"})
+		default:
+			util.FailServerError(c)
+		}
+		return
+	}
+	defer binary.Reader.Close()
+
+	filename := binary.FileName
+	if strings.TrimSpace(filename) == "" {
+		filename = "document"
+	}
+
+	contentType := strings.TrimSpace(binary.ContentType)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	c.Header("Content-Type", contentType)
+	c.Header("Content-Disposition", "inline; filename*=UTF-8''"+url.PathEscape(filename))
+	if binary.Size > 0 {
+		c.Header("Content-Length", strconv.FormatInt(binary.Size, 10))
+	}
+	c.Status(http.StatusOK)
+	_, _ = io.Copy(c.Writer, binary.Reader)
+}
+
+func (h *DocumentHandler) Download(c *gin.Context) {
+	docID := strings.TrimSpace(c.Param("docId"))
+	if docID == "" {
+		util.Fail(c, constant.CodeInvalidParam, "docId 不能为空")
+		return
+	}
+
+	binary, err := h.docService.Download(c.Request.Context(), docID, middleware.GetUserID(c))
+	if err != nil {
+		switch err {
+		case service.ErrDocumentNotFound:
+			c.JSON(http.StatusNotFound, gin.H{"code": constant.CodeNotFound, "message": constant.MsgNotFound})
+		case service.ErrDocumentPermissionDenied:
+			util.FailForbidden(c)
+		default:
+			util.FailServerError(c)
+		}
+		return
+	}
+	defer binary.Reader.Close()
+
+	filename := binary.FileName
+	if strings.TrimSpace(filename) == "" {
+		filename = "document"
+	}
+
+	contentType := strings.TrimSpace(binary.ContentType)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	c.Header("Content-Type", contentType)
+	c.Header("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(filename))
+	if binary.Size > 0 {
+		c.Header("Content-Length", strconv.FormatInt(binary.Size, 10))
+	}
+	c.Status(http.StatusOK)
+	_, _ = io.Copy(c.Writer, binary.Reader)
 }

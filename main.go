@@ -211,6 +211,8 @@ func main() {
 	authRepo := repository.NewAuthRepository(db)
 	aiTaskRepo := repository.NewAITaskRepository(db)
 	docRepo := repository.NewDocumentRepository(db)
+	docConvertTaskRepo := repository.NewDocumentConversionTaskRepository(db)
+	docSearchIndexRepo := repository.NewDocumentSearchIndexRepository(db)
 	aiConversationRepo := repository.NewAIConversationRepository(db)
 	aiChatMessageRepo := repository.NewAIChatMessageRepository(db)
 	agentSessionRepo := repository.NewAgentSessionRepository(db)
@@ -311,7 +313,10 @@ func main() {
 	if err := aiTaskSvc.StartFaultTreeDispatcher(context.Background()); err != nil {
 		log.Fatal().Err(err).Msg("启动 AI 故障树调度器失败")
 	}
-	docSvc := service.NewDocumentService(docRepo, storageSvc)
+	docSvc := service.NewDocumentService(docRepo, docConvertTaskRepo, docSearchIndexRepo, memberRepo, storageSvc, rdb)
+	if err := docSvc.StartBackgroundWorkers(context.Background()); err != nil {
+		log.Fatal().Err(err).Msg("启动文档转换/索引后台 Worker 失败")
+	}
 	memberSvc := service.NewMemberService(db, memberRepo, projectRepo, userRepo, notificationRepo, auditRepo, rdb, cachePolicy)
 	notificationSvc := service.NewNotificationService(notificationRepo)
 	teamSvc := service.NewTeamService(db)
@@ -425,6 +430,10 @@ func main() {
 			projects.POST("/:projectId/invitations/:invitationId/revoke", withAdminRole(memberRepo, memberH.RevokeInvitation))
 			projects.POST("/:projectId/members/:memberId/update", withAdminRole(memberRepo, memberH.UpdateRole))
 			projects.POST("/:projectId/members/:memberId/remove", withAdminRole(memberRepo, memberH.RemoveMember))
+
+			// 项目文档
+			projects.GET("/:projectId/documents/search", docH.SearchByProject)
+			projects.GET("/:projectId/documents", docH.ListByProject)
 		}
 
 		notifications := authed.Group("/notifications")
@@ -461,6 +470,8 @@ func main() {
 		{
 			docs.POST("/upload", docH.Upload)
 			docs.GET("/:docId", docH.GetByID)
+			docs.GET("/:docId/preview", docH.Preview)
+			docs.GET("/:docId/download", docH.Download)
 		}
 
 		// AI 任务
@@ -529,6 +540,7 @@ func main() {
 		log.Error().Err(err).Msg("服务关闭超时")
 	}
 	aiTaskSvc.StopFaultTreeDispatcher()
+	docSvc.StopBackgroundWorkers()
 
 	_ = rdb.Close()
 	log.Info().Msg("服务已关闭")

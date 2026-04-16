@@ -45,6 +45,29 @@ const (
 	DocStatusFailed  = "failed"
 )
 
+// 文档阅读器类型
+const (
+	DocumentReaderKindPDF         = "pdf"
+	DocumentReaderKindTabular     = "tabular"
+	DocumentReaderKindText        = "text"
+	DocumentReaderKindUnsupported = "unsupported"
+)
+
+// 文档预览状态
+const (
+	DocumentPreviewReady      = "ready"
+	DocumentPreviewProcessing = "processing"
+	DocumentPreviewFailed     = "failed"
+)
+
+// 文档转换任务状态
+const (
+	DocumentConversionTaskPending    = "pending"
+	DocumentConversionTaskProcessing = "processing"
+	DocumentConversionTaskCompleted  = "completed"
+	DocumentConversionTaskFailed     = "failed"
+)
+
 // AI 任务类型
 const (
 	AITaskTypeGenerateFaultTree      = "generateFaultTree"
@@ -120,6 +143,8 @@ const (
 	RedisKeyAITaskLatest                = "ai:task:project:latest:"
 	RedisKeyAITaskWorkerStreamEntries   = "ai:task:stream:entries:worker:"
 	RedisKeyAITaskProducerStreamEntries = "ai:task:stream:entries:producer:"
+	RedisKeyDocumentSearch              = "docs:search:"
+	RedisKeyDocumentSearchIx            = "docs:search:index:project:"
 	RedisKeyResetPassword               = "reset:"
 	RedisKeyUserInfo                    = "user:info:"
 )

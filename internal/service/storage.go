@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +20,7 @@ import (
 var (
 	ErrFileTypeForbidden = errors.New("文件类型不支持")
 	ErrFileTooLarge      = errors.New("文件过大")
+	ErrStorageNotFound   = errors.New("存储文件不存在")
 )
 
 type StorageService struct {
@@ -25,6 +29,7 @@ type StorageService struct {
 	maxFileSize   int64
 	allowedImages map[string]bool
 	allowedDocs   map[string]bool
+	remoteClient  *http.Client
 }
 
 func NewStorageService(localPath, baseURL string, maxFileSize int64, allowedImages, allowedDocs []string) *StorageService {
@@ -42,6 +47,9 @@ func NewStorageService(localPath, baseURL string, maxFileSize int64, allowedImag
 		maxFileSize:   maxFileSize,
 		allowedImages: imgMap,
 		allowedDocs:   docMap,
+		remoteClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
 	}
 }
 
@@ -63,6 +71,16 @@ func (s *StorageService) SaveDocument(file multipart.File, header *multipart.Fil
 		return "", ErrFileTooLarge
 	}
 	return s.save(file, header, "documents")
+}
+
+func (s *StorageService) SaveGeneratedDocument(fileName, mimeType string, data []byte) (string, error) {
+	if !s.allowedDocs[mimeType] {
+		return "", ErrFileTypeForbidden
+	}
+	if int64(len(data)) > s.maxFileSize {
+		return "", ErrFileTooLarge
+	}
+	return s.saveBytes(fileName, data, "documents")
 }
 
 // LocalPath converts a storage URL back to its absolute file system path.
@@ -109,6 +127,34 @@ func (s *StorageService) save(file multipart.File, header *multipart.FileHeader,
 	return s.baseURL + "/" + relPath, nil
 }
 
+func (s *StorageService) saveBytes(fileName string, data []byte, subDir string) (string, error) {
+	ext := strings.ToLower(filepath.Ext(fileName))
+	if ext == "" {
+		ext = ".bin"
+	}
+	dateStr := time.Now().Format("2006/01/02")
+	relDir := filepath.Join(subDir, dateStr)
+	absDir := filepath.Join(s.localPath, relDir)
+
+	if err := os.MkdirAll(absDir, 0755); err != nil {
+		return "", fmt.Errorf("创建目录失败: %w", err)
+	}
+
+	token, err := util.RandomToken(8)
+	if err != nil {
+		return "", err
+	}
+	filename := token + ext
+	absPath := filepath.Join(absDir, filename)
+
+	if err := os.WriteFile(absPath, data, 0644); err != nil {
+		return "", fmt.Errorf("写入文件失败: %w", err)
+	}
+
+	relPath := filepath.ToSlash(filepath.Join(relDir, filename))
+	return s.baseURL + "/" + relPath, nil
+}
+
 func (s *StorageService) DeleteFile(ctx context.Context, urlPath string) error {
 	// 从 URL 路径提取相对路径
 	relPath := strings.TrimPrefix(urlPath, s.baseURL+"/")
@@ -125,4 +171,83 @@ func (s *StorageService) GetAllowedDocMIMETypes() []string {
 		types = append(types, t)
 	}
 	return types
+}
+
+// OpenDocument opens a document by source URL and returns stream, size and content type.
+func (s *StorageService) OpenDocument(ctx context.Context, sourceURL, fallbackContentType string) (io.ReadCloser, int64, string, error) {
+	trimmedURL := strings.TrimSpace(sourceURL)
+	if trimmedURL == "" {
+		return nil, 0, "", ErrStorageNotFound
+	}
+
+	if localPath := s.LocalPath(trimmedURL); localPath != "" {
+		f, err := os.Open(localPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, 0, "", ErrStorageNotFound
+			}
+			return nil, 0, "", err
+		}
+		st, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return nil, 0, "", err
+		}
+		contentType := detectContentType(localPath, fallbackContentType)
+		return f, st.Size(), contentType, nil
+	}
+
+	parsed, err := url.Parse(trimmedURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return nil, 0, "", ErrStorageNotFound
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, trimmedURL, nil)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	resp, err := s.remoteClient.Do(req)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		_ = resp.Body.Close()
+		return nil, 0, "", ErrStorageNotFound
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return nil, 0, "", fmt.Errorf("远端文件读取失败，status=%d", resp.StatusCode)
+	}
+
+	contentType, _, parseErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if parseErr != nil || strings.TrimSpace(contentType) == "" {
+		contentType = fallbackContentType
+	}
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/octet-stream"
+	}
+
+	if resp.ContentLength > 0 && s.maxFileSize > 0 && resp.ContentLength > s.maxFileSize {
+		_ = resp.Body.Close()
+		return nil, 0, "", ErrFileTooLarge
+	}
+
+	return resp.Body, resp.ContentLength, contentType, nil
+}
+
+func detectContentType(path string, fallbackContentType string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext != "" {
+		if contentType := mime.TypeByExtension(ext); contentType != "" {
+			mainType, _, err := mime.ParseMediaType(contentType)
+			if err == nil && strings.TrimSpace(mainType) != "" {
+				return mainType
+			}
+		}
+	}
+	if strings.TrimSpace(fallbackContentType) != "" {
+		return fallbackContentType
+	}
+	return "application/octet-stream"
 }

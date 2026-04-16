@@ -79,6 +79,16 @@ func NewAgentToolCallID() string {
 	return NewID("atool")
 }
 
+// NewDocumentConversionTaskID 生成文档转换任务 ID
+func NewDocumentConversionTaskID() string {
+	return NewID("dct")
+}
+
+// NewDocumentSearchIndexID 生成文档搜索索引 ID
+func NewDocumentSearchIndexID() string {
+	return NewID("dsi")
+}
+
 // RandomToken 生成 N 字节的随机十六进制 token
 func RandomToken(n int) (string, error) {
 	b := make([]byte, n)
