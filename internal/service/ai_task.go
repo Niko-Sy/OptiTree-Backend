@@ -35,15 +35,16 @@ const (
 )
 
 type AITaskService struct {
-	taskRepo       *repository.AITaskRepository
-	docRepo        *repository.DocumentRepository
-	projectRepo    *repository.ProjectRepository
-	memberRepo     *repository.MemberRepository
-	projectService *ProjectService
-	ftService      *FaultTreeService
-	kgService      *KnowledgeGraphService
-	progressHub    *TaskProgressHub
-	rdb            *redis.Client
+	taskRepo           *repository.AITaskRepository
+	docRepo            *repository.DocumentRepository
+	docConvertTaskRepo *repository.DocumentConversionTaskRepository
+	projectRepo        *repository.ProjectRepository
+	memberRepo         *repository.MemberRepository
+	projectService     *ProjectService
+	ftService          *FaultTreeService
+	kgService          *KnowledgeGraphService
+	progressHub        *TaskProgressHub
+	rdb                *redis.Client
 
 	queueStream    string
 	queueMaxLen    int64
@@ -108,6 +109,7 @@ type TaskCallbackInput struct {
 func NewAITaskService(
 	taskRepo *repository.AITaskRepository,
 	docRepo *repository.DocumentRepository,
+	docConvertTaskRepo *repository.DocumentConversionTaskRepository,
 	projectRepo *repository.ProjectRepository,
 	memberRepo *repository.MemberRepository,
 	projectService *ProjectService,
@@ -172,6 +174,7 @@ func NewAITaskService(
 	return &AITaskService{
 		taskRepo:            taskRepo,
 		docRepo:             docRepo,
+		docConvertTaskRepo:  docConvertTaskRepo,
 		projectRepo:         projectRepo,
 		memberRepo:          memberRepo,
 		projectService:      projectService,
@@ -342,7 +345,7 @@ func (s *AITaskService) collectTaskDocuments(docIDs []string) ([]AITaskQueueDocu
 	if len(docIDs) == 0 {
 		return nil, ErrAITaskNoDocuments
 	}
-	docs, err := s.docRepo.FindByIDs(docIDs)
+	docs, err := s.docRepo.FindByIDsOrdered(docIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -372,6 +375,141 @@ func (s *AITaskService) collectTaskDocuments(docIDs []string) ([]AITaskQueueDocu
 		return nil, ErrAITaskNoDocuments
 	}
 	return refs, nil
+}
+
+func normalizeDocIDs(docIDs []string) []string {
+	if len(docIDs) == 0 {
+		return []string{}
+	}
+
+	normalized := make([]string, 0, len(docIDs))
+	seen := make(map[string]struct{}, len(docIDs))
+	for _, id := range docIDs {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		normalized = append(normalized, trimmed)
+	}
+	return normalized
+}
+
+func projectIDValue(projectID *string) string {
+	if projectID == nil {
+		return ""
+	}
+	return strings.TrimSpace(*projectID)
+}
+
+func (s *AITaskService) normalizeTaskDocumentsToProject(
+	ctx context.Context,
+	targetProjectID string,
+	userID string,
+	docIDs []string,
+) ([]string, error) {
+	targetProjectID = strings.TrimSpace(targetProjectID)
+	userID = strings.TrimSpace(userID)
+	normalizedIDs := normalizeDocIDs(docIDs)
+	if targetProjectID == "" || len(normalizedIDs) == 0 {
+		return normalizedIDs, nil
+	}
+
+	docs, err := s.docRepo.FindByIDsOrdered(normalizedIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(docs) == 0 {
+		return nil, ErrAITaskNoDocuments
+	}
+
+	// Make sure orphan docs are persisted to the target project before task enqueue.
+	orphanIDs := make([]string, 0)
+	for i := range docs {
+		doc := docs[i]
+		docProjectID := projectIDValue(doc.ProjectID)
+		if docProjectID == "" {
+			if strings.TrimSpace(doc.UploadedBy) != userID {
+				return nil, ErrProjectPermissionDenied
+			}
+			orphanIDs = append(orphanIDs, doc.ID)
+			continue
+		}
+		if docProjectID == targetProjectID {
+			continue
+		}
+
+		member, memberErr := s.memberRepo.FindByProjectAndUser(docProjectID, userID)
+		if memberErr != nil {
+			return nil, memberErr
+		}
+		if member == nil {
+			return nil, ErrProjectPermissionDenied
+		}
+	}
+	if len(orphanIDs) > 0 {
+		if err := s.docRepo.BindOrphanDocsToProject(orphanIDs, targetProjectID); err != nil {
+			return nil, err
+		}
+		docs, err = s.docRepo.FindByIDsOrdered(normalizedIDs)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	effective := make([]string, 0, len(normalizedIDs))
+	clonedCount := 0
+	for i := range docs {
+		doc := docs[i]
+		docProjectID := projectIDValue(doc.ProjectID)
+		switch {
+		case docProjectID == "":
+			// Should not happen after BindOrphanDocsToProject, but keep safe fallback.
+			effective = append(effective, doc.ID)
+		case docProjectID == targetProjectID:
+			effective = append(effective, doc.ID)
+		default:
+			cloned, cloneErr := s.docRepo.CloneToProject(doc, targetProjectID, userID)
+			if cloneErr != nil {
+				return nil, cloneErr
+			}
+			if strings.EqualFold(strings.TrimSpace(cloned.FileType), "docx") && cloned.DerivedPdfDocID == nil && s.docConvertTaskRepo != nil {
+				if upsertErr := s.docConvertTaskRepo.UpsertPendingByDocument(cloned.ID, cloned.ProjectID); upsertErr != nil {
+					errMsg := "DOCX 异步转换任务创建失败"
+					_ = s.docRepo.UpdatePreviewMeta(cloned.ID, constant.DocumentPreviewFailed, nil, &errMsg)
+					_ = s.docConvertTaskRepo.SetFailedByDocument(cloned.ID, errMsg)
+					log.Warn().Err(upsertErr).Str("docId", cloned.ID).Str("projectId", targetProjectID).Msg("upsert cloned DOCX conversion task failed")
+				} else if s.rdb != nil {
+					if queueErr := enqueueDocumentConversionTask(ctx, s.rdb, cloned.ID, "ai_generate_clone"); queueErr != nil {
+						errMsg := "DOCX 异步转换任务入队失败"
+						_ = s.docRepo.UpdatePreviewMeta(cloned.ID, constant.DocumentPreviewFailed, nil, &errMsg)
+						_ = s.docConvertTaskRepo.SetFailedByDocument(cloned.ID, errMsg)
+						log.Warn().Err(queueErr).Str("docId", cloned.ID).Str("projectId", targetProjectID).Msg("enqueue cloned DOCX conversion task failed")
+					}
+				}
+			}
+			clonedCount++
+			effective = append(effective, cloned.ID)
+		}
+	}
+
+	if len(effective) == 0 {
+		return nil, ErrAITaskNoDocuments
+	}
+
+	log.Info().
+		Str("projectId", targetProjectID).
+		Str("userId", userID).
+		Int("inputDocCount", len(normalizedIDs)).
+		Int("boundOrphanCount", len(orphanIDs)).
+		Int("clonedDocCount", clonedCount).
+		Int("effectiveDocCount", len(effective)).
+		Msg("normalized AI generation documents")
+
+	return effective, nil
 }
 
 func buildIdempotencyKey(
@@ -569,9 +707,10 @@ type GenerateFaultTreeInput struct {
 }
 
 type GenerateFaultTreeOutput struct {
-	TaskID    string `json:"taskId"`
-	Status    string `json:"status"`
-	ProjectID string `json:"projectId"`
+	TaskID          string   `json:"taskId"`
+	Status          string   `json:"status"`
+	ProjectID       string   `json:"projectId"`
+	EffectiveDocIDs []string `json:"effectiveDocIds,omitempty"`
 }
 
 func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFaultTreeInput) (*GenerateFaultTreeOutput, error) {
@@ -589,7 +728,8 @@ func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFau
 		modelName = "default"
 	}
 	projectID := project.ID
-	idem := buildIdempotencyKey(constant.AITaskTypeGenerateFaultTree, input.UserID, &projectID, input.TopEvent, input.DocIDs, cfg)
+	requestDocIDs := normalizeDocIDs(input.DocIDs)
+	idem := buildIdempotencyKey(constant.AITaskTypeGenerateFaultTree, input.UserID, &projectID, input.TopEvent, requestDocIDs, cfg)
 	task, created, err := s.createTask(ctx, constant.AITaskTypeGenerateFaultTree, modelName, input.UserID, &projectID, idem)
 	if err != nil {
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
@@ -600,7 +740,15 @@ func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFau
 		return &GenerateFaultTreeOutput{TaskID: task.ID, Status: task.Status, ProjectID: projectID}, nil
 	}
 
-	documents, err := s.collectTaskDocuments(input.DocIDs)
+	effectiveDocIDs, err := s.normalizeTaskDocumentsToProject(ctx, projectID, input.UserID, requestDocIDs)
+	if err != nil {
+		_ = s.taskRepo.SetFailed(task.ID, err.Error())
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
+		s.cacheStatus(ctx, task.ID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		return nil, err
+	}
+
+	documents, err := s.collectTaskDocuments(effectiveDocIDs)
 	if err != nil {
 		_ = s.taskRepo.SetFailed(task.ID, err.Error())
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
@@ -614,7 +762,7 @@ func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFau
 		TaskType:  constant.AITaskTypeGenerateFaultTree,
 		UserID:    input.UserID,
 		TopEvent:  input.TopEvent,
-		DocIDs:    input.DocIDs,
+		DocIDs:    effectiveDocIDs,
 		Documents: documents,
 		Config:    cfg,
 		Attempt:   0,
@@ -642,7 +790,12 @@ func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFau
 		StageLabel:    "任务已进入调度队列",
 	})
 
-	return &GenerateFaultTreeOutput{TaskID: task.ID, Status: task.Status, ProjectID: projectID}, nil
+	return &GenerateFaultTreeOutput{
+		TaskID:          task.ID,
+		Status:          task.Status,
+		ProjectID:       projectID,
+		EffectiveDocIDs: effectiveDocIDs,
+	}, nil
 }
 
 // Generate Knowledge Graph
@@ -654,9 +807,10 @@ type GenerateKnowledgeGraphInput struct {
 }
 
 type GenerateKnowledgeGraphOutput struct {
-	TaskID    string `json:"taskId"`
-	Status    string `json:"status"`
-	ProjectID string `json:"projectId"`
+	TaskID          string   `json:"taskId"`
+	Status          string   `json:"status"`
+	ProjectID       string   `json:"projectId"`
+	EffectiveDocIDs []string `json:"effectiveDocIds,omitempty"`
 }
 
 func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input GenerateKnowledgeGraphInput) (*GenerateKnowledgeGraphOutput, error) {
@@ -674,7 +828,8 @@ func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input Genera
 		modelName = "default"
 	}
 	projectID := project.ID
-	idem := buildIdempotencyKey(constant.AITaskTypeGenerateKnowledgeGraph, input.UserID, &projectID, "", input.DocIDs, cfg)
+	requestDocIDs := normalizeDocIDs(input.DocIDs)
+	idem := buildIdempotencyKey(constant.AITaskTypeGenerateKnowledgeGraph, input.UserID, &projectID, "", requestDocIDs, cfg)
 	task, created, err := s.createTask(ctx, constant.AITaskTypeGenerateKnowledgeGraph, modelName, input.UserID, &projectID, idem)
 	if err != nil {
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
@@ -685,7 +840,15 @@ func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input Genera
 		return &GenerateKnowledgeGraphOutput{TaskID: task.ID, Status: task.Status, ProjectID: projectID}, nil
 	}
 
-	documents, err := s.collectTaskDocuments(input.DocIDs)
+	effectiveDocIDs, err := s.normalizeTaskDocumentsToProject(ctx, projectID, input.UserID, requestDocIDs)
+	if err != nil {
+		_ = s.taskRepo.SetFailed(task.ID, err.Error())
+		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
+		s.cacheStatus(ctx, task.ID, constant.AITaskStatusFailed, 0, "failed", "生成失败")
+		return nil, err
+	}
+
+	documents, err := s.collectTaskDocuments(effectiveDocIDs)
 	if err != nil {
 		_ = s.taskRepo.SetFailed(task.ID, err.Error())
 		_ = s.setProjectGenerationStatus(projectID, constant.ProjectGenerationFailed)
@@ -698,7 +861,7 @@ func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input Genera
 		ProjectID: projectID,
 		TaskType:  constant.AITaskTypeGenerateKnowledgeGraph,
 		UserID:    input.UserID,
-		DocIDs:    input.DocIDs,
+		DocIDs:    effectiveDocIDs,
 		Documents: documents,
 		Config:    cfg,
 		Attempt:   0,
@@ -723,7 +886,12 @@ func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input Genera
 		StageLabel:    task.StageLabel,
 	})
 
-	return &GenerateKnowledgeGraphOutput{TaskID: task.ID, Status: task.Status, ProjectID: projectID}, nil
+	return &GenerateKnowledgeGraphOutput{
+		TaskID:          task.ID,
+		Status:          task.Status,
+		ProjectID:       projectID,
+		EffectiveDocIDs: effectiveDocIDs,
+	}, nil
 }
 
 func (s *AITaskService) HandleTaskCallback(ctx context.Context, input TaskCallbackInput) error {

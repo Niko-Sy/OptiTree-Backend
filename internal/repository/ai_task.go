@@ -156,6 +156,178 @@ func (r *DocumentRepository) FindByIDs(ids []string) ([]model.Document, error) {
 	return docs, err
 }
 
+// FindByIDsOrdered returns documents in the same order as the input ids.
+func (r *DocumentRepository) FindByIDsOrdered(ids []string) ([]model.Document, error) {
+	if len(ids) == 0 {
+		return []model.Document{}, nil
+	}
+
+	docs, err := r.FindByIDs(ids)
+	if err != nil {
+		return nil, err
+	}
+
+	byID := make(map[string]model.Document, len(docs))
+	for i := range docs {
+		byID[docs[i].ID] = docs[i]
+	}
+
+	ordered := make([]model.Document, 0, len(ids))
+	for _, id := range ids {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		doc, ok := byID[trimmed]
+		if !ok {
+			continue
+		}
+		ordered = append(ordered, doc)
+	}
+	return ordered, nil
+}
+
+func (r *DocumentRepository) BindOrphanDocsToProject(docIDs []string, projectID string) error {
+	if len(docIDs) == 0 {
+		return nil
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return errors.New("project id is required")
+	}
+
+	normalized := make([]string, 0, len(docIDs))
+	seen := make(map[string]struct{}, len(docIDs))
+	for _, id := range docIDs {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		normalized = append(normalized, trimmed)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+
+	return r.db.Model(&model.Document{}).
+		Where("id IN ?", normalized).
+		Where("project_id IS NULL OR TRIM(project_id) = ''").
+		Update("project_id", projectID).Error
+}
+
+func (r *DocumentRepository) CloneToProject(source model.Document, projectID string, uploadedBy string) (*model.Document, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return nil, errors.New("project id is required")
+	}
+	uploader := strings.TrimSpace(uploadedBy)
+	if uploader == "" {
+		uploader = strings.TrimSpace(source.UploadedBy)
+	}
+
+	fileType := strings.ToLower(strings.TrimSpace(source.FileType))
+	previewStatus := source.PreviewStatus
+	previewErrorMessage := source.PreviewErrorMessage
+	var derivedPDFDocID *string
+
+	if fileType == "docx" {
+		sourceDerivedID := ""
+		if source.DerivedPdfDocID != nil {
+			sourceDerivedID = strings.TrimSpace(*source.DerivedPdfDocID)
+		}
+
+		if sourceDerivedID != "" {
+			derivedDoc, err := r.FindByID(sourceDerivedID)
+			if err != nil {
+				return nil, err
+			}
+			if derivedDoc != nil {
+				derivedClone := &model.Document{
+					ID:                  util.NewDocumentID(),
+					FileName:            derivedDoc.FileName,
+					FileType:            derivedDoc.FileType,
+					ReaderKind:          derivedDoc.ReaderKind,
+					MimeType:            derivedDoc.MimeType,
+					Size:                derivedDoc.Size,
+					Status:              derivedDoc.Status,
+					PreviewStatus:       derivedDoc.PreviewStatus,
+					DerivedPdfDocID:     nil,
+					PreviewErrorMessage: derivedDoc.PreviewErrorMessage,
+					Summary:             derivedDoc.Summary,
+					SourceURL:           derivedDoc.SourceURL,
+					TextExtractURL:      derivedDoc.TextExtractURL,
+					UploadedBy:          uploader,
+					ProjectID:           &projectID,
+				}
+
+				if strings.TrimSpace(derivedClone.Status) == "" {
+					derivedClone.Status = constant.DocStatusParsed
+				}
+				if strings.TrimSpace(derivedClone.ReaderKind) == "" {
+					derivedClone.ReaderKind = constant.DocumentReaderKindPDF
+				}
+				if strings.TrimSpace(derivedClone.PreviewStatus) == "" {
+					derivedClone.PreviewStatus = constant.DocumentPreviewReady
+				}
+
+				if err := r.db.Create(derivedClone).Error; err != nil {
+					return nil, err
+				}
+				derivedID := derivedClone.ID
+				derivedPDFDocID = &derivedID
+				previewStatus = constant.DocumentPreviewReady
+				previewErrorMessage = nil
+			}
+		}
+
+		if derivedPDFDocID == nil {
+			if strings.TrimSpace(previewStatus) == "" || strings.TrimSpace(previewStatus) == constant.DocumentPreviewReady {
+				previewStatus = constant.DocumentPreviewProcessing
+			}
+		}
+	} else {
+		derivedPDFDocID = nil
+	}
+
+	clone := &model.Document{
+		ID:                  util.NewDocumentID(),
+		FileName:            source.FileName,
+		FileType:            source.FileType,
+		ReaderKind:          source.ReaderKind,
+		MimeType:            source.MimeType,
+		Size:                source.Size,
+		Status:              source.Status,
+		PreviewStatus:       previewStatus,
+		DerivedPdfDocID:     derivedPDFDocID,
+		PreviewErrorMessage: previewErrorMessage,
+		Summary:             source.Summary,
+		SourceURL:           source.SourceURL,
+		TextExtractURL:      source.TextExtractURL,
+		UploadedBy:          uploader,
+		ProjectID:           &projectID,
+	}
+
+	if strings.TrimSpace(clone.Status) == "" {
+		clone.Status = constant.DocStatusPending
+	}
+	if strings.TrimSpace(clone.ReaderKind) == "" {
+		clone.ReaderKind = constant.DocumentReaderKindUnsupported
+	}
+	if strings.TrimSpace(clone.PreviewStatus) == "" {
+		clone.PreviewStatus = constant.DocumentPreviewReady
+	}
+
+	if err := r.db.Create(clone).Error; err != nil {
+		return nil, err
+	}
+
+	return clone, nil
+}
+
 func (r *DocumentRepository) FindByProjectID(projectID string) ([]model.Document, error) {
 	var docs []model.Document
 	err := r.db.Where("project_id = ?", projectID).
@@ -282,20 +454,33 @@ func (r *DocumentConversionTaskRepository) UpsertPendingByDocument(documentID st
 	}).Create(task).Error
 }
 
-func (r *DocumentConversionTaskRepository) TakeNextPending() (*model.DocumentConversionTask, error) {
-	var task model.DocumentConversionTask
+func (r *DocumentConversionTaskRepository) TakePendingByDocument(documentID string) (*model.DocumentConversionTask, error) {
+	docID := strings.TrimSpace(documentID)
+	if docID == "" {
+		return nil, nil
+	}
+
+	var task *model.DocumentConversionTask
 	err := r.db.Transaction(func(tx *gorm.DB) error {
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("status = ?", constant.DocumentConversionTaskPending).
+		tasks := make([]model.DocumentConversionTask, 0, 1)
+		queryErr := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where("document_id = ? AND status = ?", docID, constant.DocumentConversionTaskPending).
 			Order("created_at ASC").
-			First(&task).Error
-		if err != nil {
-			return err
+			Limit(1).
+			Find(&tasks).Error
+		if queryErr != nil {
+			return queryErr
 		}
 
-		attemptCount := task.AttemptCount + 1
+		if len(tasks) == 0 {
+			task = nil
+			return nil
+		}
+
+		picked := tasks[0]
+		attemptCount := picked.AttemptCount + 1
 		if err := tx.Model(&model.DocumentConversionTask{}).
-			Where("id = ?", task.ID).
+			Where("id = ?", picked.ID).
 			Updates(map[string]interface{}{
 				"status":        constant.DocumentConversionTaskProcessing,
 				"attempt_count": attemptCount,
@@ -306,21 +491,66 @@ func (r *DocumentConversionTaskRepository) TakeNextPending() (*model.DocumentCon
 			return err
 		}
 
-		task.Status = constant.DocumentConversionTaskProcessing
-		task.AttemptCount = attemptCount
-		if task.StartedAt == nil {
+		picked.Status = constant.DocumentConversionTaskProcessing
+		picked.AttemptCount = attemptCount
+		if picked.StartedAt == nil {
 			now := time.Now().UTC()
-			task.StartedAt = &now
+			picked.StartedAt = &now
 		}
+		task = &picked
 		return nil
 	})
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, nil
-	}
 	if err != nil {
 		return nil, err
 	}
-	return &task, nil
+	return task, nil
+}
+
+func (r *DocumentConversionTaskRepository) TakeNextPending() (*model.DocumentConversionTask, error) {
+	var task *model.DocumentConversionTask
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		tasks := make([]model.DocumentConversionTask, 0, 1)
+		queryErr := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where("status = ?", constant.DocumentConversionTaskPending).
+			Order("created_at ASC").
+			Limit(1).
+			Find(&tasks).Error
+		if queryErr != nil {
+			return queryErr
+		}
+
+		if len(tasks) == 0 {
+			task = nil
+			return nil
+		}
+
+		picked := tasks[0]
+		attemptCount := picked.AttemptCount + 1
+		if err := tx.Model(&model.DocumentConversionTask{}).
+			Where("id = ?", picked.ID).
+			Updates(map[string]interface{}{
+				"status":        constant.DocumentConversionTaskProcessing,
+				"attempt_count": attemptCount,
+				"started_at":    gorm.Expr("COALESCE(started_at, NOW())"),
+				"error_message": nil,
+				"updated_at":    gorm.Expr("NOW()"),
+			}).Error; err != nil {
+			return err
+		}
+
+		picked.Status = constant.DocumentConversionTaskProcessing
+		picked.AttemptCount = attemptCount
+		if picked.StartedAt == nil {
+			now := time.Now().UTC()
+			picked.StartedAt = &now
+		}
+		task = &picked
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return task, nil
 }
 
 func (r *DocumentConversionTaskRepository) SetCompleted(taskID string, derivedPDFDocID *string) error {
@@ -355,6 +585,28 @@ func (r *DocumentConversionTaskRepository) SetFailed(taskID string, errMsg strin
 
 	return r.db.Model(&model.DocumentConversionTask{}).
 		Where("id = ?", strings.TrimSpace(taskID)).
+		Updates(map[string]interface{}{
+			"status":        constant.DocumentConversionTaskFailed,
+			"error_message": message,
+			"completed_at":  gorm.Expr("NOW()"),
+			"updated_at":    gorm.Expr("NOW()"),
+		}).Error
+}
+
+func (r *DocumentConversionTaskRepository) SetFailedByDocument(documentID string, errMsg string) error {
+	docID := strings.TrimSpace(documentID)
+	if docID == "" {
+		return nil
+	}
+
+	message := strings.TrimSpace(errMsg)
+	if message == "" {
+		message = "DOCX conversion failed"
+	}
+
+	return r.db.Model(&model.DocumentConversionTask{}).
+		Where("document_id = ?", docID).
+		Where("status IN ?", []string{constant.DocumentConversionTaskPending, constant.DocumentConversionTaskProcessing}).
 		Updates(map[string]interface{}{
 			"status":        constant.DocumentConversionTaskFailed,
 			"error_message": message,

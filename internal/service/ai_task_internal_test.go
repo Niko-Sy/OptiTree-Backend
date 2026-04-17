@@ -62,6 +62,31 @@ func TestProjectGenerationStatusFromTaskStatus(t *testing.T) {
 	}
 }
 
+func TestNormalizeDocIDs(t *testing.T) {
+	got := normalizeDocIDs([]string{" doc_a ", "doc_b", "", "doc_a", "doc_c", "doc_b"})
+	want := []string{"doc_a", "doc_b", "doc_c"}
+
+	if len(got) != len(want) {
+		t.Fatalf("normalizeDocIDs len=%d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("normalizeDocIDs[%d]=%q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestProjectIDValue(t *testing.T) {
+	if got := projectIDValue(nil); got != "" {
+		t.Fatalf("projectIDValue(nil)=%q, want empty", got)
+	}
+
+	v := "  proj_123  "
+	if got := projectIDValue(&v); got != "proj_123" {
+		t.Fatalf("projectIDValue(ptr)=%q, want %q", got, "proj_123")
+	}
+}
+
 type testErr string
 
 func (e testErr) Error() string {

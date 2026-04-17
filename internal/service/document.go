@@ -43,9 +43,12 @@ const (
 	documentSearchCacheTTL         = 10 * time.Minute
 	documentSearchCacheIndexTTL    = 12 * time.Hour
 	documentWorkerPollInterval     = 2 * time.Second
+	documentConversionPendingBlock = 200 * time.Millisecond
 	documentIndexMaxBlocks         = 300
-	documentDefaultConvertWorkers  = 1
+	documentDefaultConvertWorkers  = 3
+	documentMaxConvertWorkers      = 3
 	documentDefaultSearchIxWorkers = 1
+	documentConversionTaskTTL      = 30 * time.Minute
 )
 
 var mimeToFileType = map[string]string{
@@ -135,7 +138,19 @@ func NewDocumentService(
 	memberRepo *repository.MemberRepository,
 	storage *StorageService,
 	rdb *redis.Client,
+	convertWorkers int,
+	pollInterval time.Duration,
 ) *DocumentService {
+	if convertWorkers <= 0 {
+		convertWorkers = documentDefaultConvertWorkers
+	}
+	if convertWorkers > documentMaxConvertWorkers {
+		convertWorkers = documentMaxConvertWorkers
+	}
+	if pollInterval <= 0 {
+		pollInterval = documentWorkerPollInterval
+	}
+
 	return &DocumentService{
 		docRepo:            docRepo,
 		docConvertTaskRepo: docConvertTaskRepo,
@@ -143,9 +158,9 @@ func NewDocumentService(
 		memberRepo:         memberRepo,
 		storage:            storage,
 		rdb:                rdb,
-		convertWorkers:     documentDefaultConvertWorkers,
+		convertWorkers:     convertWorkers,
 		searchIndexWorker:  documentDefaultSearchIxWorkers,
-		pollInterval:       documentWorkerPollInterval,
+		pollInterval:       pollInterval,
 	}
 }
 
@@ -169,9 +184,23 @@ func (s *DocumentService) StartBackgroundWorkers(ctx context.Context) error {
 	s.workerStarted = true
 
 	if s.docConvertTaskRepo != nil {
+		if s.rdb != nil {
+			if err := s.ensureConversionQueueGroup(workerCtx); err != nil {
+				s.workerCancel()
+				s.workerWG.Wait()
+				s.workerStarted = false
+				s.workerCancel = nil
+				s.workerCtx = nil
+				return err
+			}
+		}
+
 		workers := s.convertWorkers
 		if workers <= 0 {
 			workers = documentDefaultConvertWorkers
+		}
+		if workers > documentMaxConvertWorkers {
+			workers = documentMaxConvertWorkers
 		}
 		for idx := 0; idx < workers; idx++ {
 			workerName := fmt.Sprintf("doc-convert-%d", idx+1)
@@ -224,6 +253,56 @@ func (s *DocumentService) StopBackgroundWorkers() {
 }
 
 func (s *DocumentService) conversionWorkerLoop(ctx context.Context, workerName string) {
+	if s.rdb == nil {
+		s.conversionWorkerLoopDBFallback(ctx, workerName)
+		return
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		msg, readErr := s.readNextConversionQueueMessage(ctx, workerName)
+		if readErr != nil {
+			log.Warn().Err(readErr).Str("worker", workerName).Msg("read conversion queue message failed")
+			if s.waitOrDone(ctx, s.pollInterval) {
+				return
+			}
+			continue
+		}
+		if msg == nil {
+			continue
+		}
+
+		task, err := s.docConvertTaskRepo.TakePendingByDocument(msg.DocumentID)
+		if err != nil {
+			log.Warn().Err(err).Str("worker", workerName).Str("docId", msg.DocumentID).Msg("take pending conversion task by document failed")
+			if s.waitOrDone(ctx, s.pollInterval) {
+				return
+			}
+			continue
+		}
+		if task == nil {
+			s.ackConversionQueueMessage(ctx, msg.EntryID)
+			continue
+		}
+
+		if time.Since(msg.EnqueuedAt) > documentConversionTaskTTL {
+			errMsg := "DOCX conversion task expired in queue"
+			_ = s.docRepo.UpdatePreviewMeta(task.DocumentID, constant.DocumentPreviewFailed, nil, &errMsg)
+			_ = s.docConvertTaskRepo.SetFailed(task.ID, errMsg)
+			s.ackConversionQueueMessage(ctx, msg.EntryID)
+			log.Warn().Str("worker", workerName).Str("taskId", task.ID).Str("docId", task.DocumentID).Msg("document conversion task expired")
+			continue
+		}
+
+		s.handleConversionTask(ctx, task, workerName)
+		s.ackConversionQueueMessage(ctx, msg.EntryID)
+	}
+}
+
+func (s *DocumentService) conversionWorkerLoopDBFallback(ctx context.Context, workerName string) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -246,6 +325,82 @@ func (s *DocumentService) conversionWorkerLoop(ctx context.Context, workerName s
 
 		s.handleConversionTask(ctx, task, workerName)
 	}
+}
+
+func (s *DocumentService) ensureConversionQueueGroup(ctx context.Context) error {
+	if s.rdb == nil {
+		return nil
+	}
+	err := s.rdb.XGroupCreateMkStream(ctx, documentConversionQueueStream, documentConversionQueueGroup, "$").Err()
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(strings.ToUpper(err.Error()), "BUSYGROUP") {
+		return nil
+	}
+	return err
+}
+
+func (s *DocumentService) readNextConversionQueueMessage(ctx context.Context, workerName string) (*documentConversionQueueMessage, error) {
+	if s.rdb == nil {
+		return nil, nil
+	}
+
+	readOne := func(id string, block time.Duration) (*documentConversionQueueMessage, error) {
+		result, err := s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    documentConversionQueueGroup,
+			Consumer: workerName,
+			Streams:  []string{documentConversionQueueStream, id},
+			Count:    1,
+			Block:    block,
+			NoAck:    false,
+		}).Result()
+		if err != nil {
+			if errors.Is(err, redis.Nil) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		if len(result) == 0 || len(result[0].Messages) == 0 {
+			return nil, nil
+		}
+
+		parsed, parseErr := parseDocumentConversionQueueMessage(result[0].Messages[0])
+		if parseErr != nil {
+			_ = s.ackConversionQueueMessage(ctx, result[0].Messages[0].ID)
+			return nil, parseErr
+		}
+		return parsed, nil
+	}
+
+	pendingMsg, err := readOne("0", documentConversionPendingBlock)
+	if err != nil {
+		return nil, err
+	}
+	if pendingMsg != nil {
+		return pendingMsg, nil
+	}
+
+	block := s.pollInterval
+	if block <= 0 {
+		block = documentWorkerPollInterval
+	}
+	return readOne(">", block)
+}
+
+func (s *DocumentService) ackConversionQueueMessage(ctx context.Context, entryID string) error {
+	if s.rdb == nil {
+		return nil
+	}
+	entryID = strings.TrimSpace(entryID)
+	if entryID == "" {
+		return nil
+	}
+	if err := s.rdb.XAck(ctx, documentConversionQueueStream, documentConversionQueueGroup, entryID).Err(); err != nil {
+		return err
+	}
+	_ = s.rdb.XDel(ctx, documentConversionQueueStream, entryID).Err()
+	return nil
 }
 
 func (s *DocumentService) searchIndexWorkerLoop(ctx context.Context, workerName string) {
@@ -333,9 +488,19 @@ func (s *DocumentService) Upload(ctx context.Context, input UploadDocumentInput)
 		if err := s.docConvertTaskRepo.UpsertPendingByDocument(doc.ID, doc.ProjectID); err != nil {
 			errMsg := "DOCX 异步转换任务创建失败"
 			_ = s.docRepo.UpdatePreviewMeta(doc.ID, constant.DocumentPreviewFailed, nil, &errMsg)
+			_ = s.docConvertTaskRepo.SetFailedByDocument(doc.ID, errMsg)
 			doc.PreviewStatus = constant.DocumentPreviewFailed
 			doc.PreviewErrorMessage = &errMsg
 			log.Warn().Err(err).Str("docId", doc.ID).Msg("enqueue DOCX conversion task failed")
+		} else if s.rdb != nil {
+			if queueErr := enqueueDocumentConversionTask(ctx, s.rdb, doc.ID, "upload"); queueErr != nil {
+				errMsg := "DOCX 异步转换任务入队失败"
+				_ = s.docRepo.UpdatePreviewMeta(doc.ID, constant.DocumentPreviewFailed, nil, &errMsg)
+				_ = s.docConvertTaskRepo.SetFailedByDocument(doc.ID, errMsg)
+				doc.PreviewStatus = constant.DocumentPreviewFailed
+				doc.PreviewErrorMessage = &errMsg
+				log.Warn().Err(queueErr).Str("docId", doc.ID).Msg("enqueue DOCX conversion redis queue failed")
+			}
 		}
 	}
 	return doc, nil

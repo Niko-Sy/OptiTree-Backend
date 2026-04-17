@@ -97,6 +97,10 @@ storage:
     - "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     - "text/plain"
 
+document:
+  conversion_workers: 3
+  conversion_poll_interval: 2s
+
 rate_limit:
   enabled: true
   requests_per_second: 100

@@ -258,6 +258,7 @@ func main() {
 	aiTaskSvc := service.NewAITaskService(
 		aiTaskRepo,
 		docRepo,
+		docConvertTaskRepo,
 		projectRepo,
 		memberRepo,
 		projectSvc,
@@ -313,7 +314,16 @@ func main() {
 	if err := aiTaskSvc.StartFaultTreeDispatcher(context.Background()); err != nil {
 		log.Fatal().Err(err).Msg("启动 AI 故障树调度器失败")
 	}
-	docSvc := service.NewDocumentService(docRepo, docConvertTaskRepo, docSearchIndexRepo, memberRepo, storageSvc, rdb)
+	docSvc := service.NewDocumentService(
+		docRepo,
+		docConvertTaskRepo,
+		docSearchIndexRepo,
+		memberRepo,
+		storageSvc,
+		rdb,
+		cfg.Document.ConversionWorkers,
+		cfg.Document.ConversionPollInterval,
+	)
 	if err := docSvc.StartBackgroundWorkers(context.Background()); err != nil {
 		log.Fatal().Err(err).Msg("启动文档转换/索引后台 Worker 失败")
 	}

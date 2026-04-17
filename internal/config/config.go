@@ -14,6 +14,7 @@ type Config struct {
 	Cache     CacheConfig     `mapstructure:"cache"`
 	JWT       JWTConfig       `mapstructure:"jwt"`
 	Storage   StorageConfig   `mapstructure:"storage"`
+	Document  DocumentConfig  `mapstructure:"document"`
 	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
 	AI        AIConfig        `mapstructure:"ai"`
 	AITask    AITaskConfig    `mapstructure:"ai_task"`
@@ -171,6 +172,11 @@ type StorageConfig struct {
 	MaxFileSize       int64    `mapstructure:"max_file_size"`
 	AllowedImageTypes []string `mapstructure:"allowed_image_types"`
 	AllowedDocTypes   []string `mapstructure:"allowed_doc_types"`
+}
+
+type DocumentConfig struct {
+	ConversionWorkers      int           `mapstructure:"conversion_workers"`
+	ConversionPollInterval time.Duration `mapstructure:"conversion_poll_interval"`
 }
 
 type RateLimitConfig struct {
