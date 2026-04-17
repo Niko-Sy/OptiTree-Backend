@@ -37,9 +37,10 @@ type executionPlanStep struct {
 }
 
 type executionPlan struct {
-	Goal          string              `json:"goal"`
-	Steps         []executionPlanStep `json:"steps"`
-	BlockedReason string              `json:"blockedReason,omitempty"`
+	Goal            string              `json:"goal"`
+	Steps           []executionPlanStep `json:"steps"`
+	BlockedReason   string              `json:"blockedReason,omitempty"`
+	SuccessfulTools map[string]bool     `json:"successfulTools,omitempty"`
 }
 
 type plannerPhaseInput struct {
@@ -152,6 +153,7 @@ CRITICAL fault-tree tool constraints:
 - There is no dedicated edge deletion tool in available tools. Remove wrong connection by move_node or deleting/recreating wrong node.
 - move_node(nodeId, newParentId): newParentId must be a valid parent in current structure; avoid creating cycles.
 - add_node requires a valid gate-like parent in fault tree mutation flow; if parent relation is missing, repair structure first.
+- For heavily broken structures, prefer batch_operations with repairMode=true to do phased restructuring.
 - For reversed relation or cycle fixes, prefer atomic batch_operations with validate before and after.
 
 Recent failed attempts (do NOT repeat same failing strategy):
@@ -220,7 +222,7 @@ func parseExecutionPlan(raw, fallbackGoal string, readOnly bool, toolGuide strin
 		steps[i].ID = i + 1
 	}
 
-	return &executionPlan{Goal: goal, Steps: steps}, nil
+	return &executionPlan{Goal: goal, Steps: steps, SuccessfulTools: make(map[string]bool)}, nil
 }
 
 func buildFallbackExecutionPlan(goal string, readOnly bool) *executionPlan {
@@ -244,7 +246,7 @@ func buildFallbackExecutionPlan(goal string, readOnly bool) *executionPlan {
 		}
 	}
 
-	return &executionPlan{Goal: goal, Steps: steps}
+	return &executionPlan{Goal: goal, Steps: steps, SuccessfulTools: make(map[string]bool)}
 }
 
 func (p *executionPlan) NextPendingStep() *executionPlanStep {
@@ -274,6 +276,37 @@ func (p *executionPlan) collectAllFailures() []failedAttempt {
 		}
 	}
 	return all
+}
+
+func (p *executionPlan) RecordSuccessfulTool(toolName string) {
+	if p == nil {
+		return
+	}
+	key := normalizeToolNameKey(toolName)
+	if key == "" {
+		return
+	}
+	if p.SuccessfulTools == nil {
+		p.SuccessfulTools = make(map[string]bool)
+	}
+	p.SuccessfulTools[key] = true
+}
+
+func (p *executionPlan) HasSuccessfulTool(toolName string) bool {
+	if p == nil {
+		return false
+	}
+	if strings.TrimSpace(toolName) == "" {
+		return true
+	}
+	if p.SuccessfulTools == nil {
+		return false
+	}
+	return p.SuccessfulTools[normalizeToolNameKey(toolName)]
+}
+
+func normalizeToolNameKey(toolName string) string {
+	return strings.ToLower(strings.TrimSpace(toolName))
 }
 
 func formatPlannerPriorFailures(attempts []failedAttempt) string {

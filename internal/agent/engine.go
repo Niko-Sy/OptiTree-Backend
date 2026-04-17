@@ -2441,21 +2441,19 @@ func updatePlanAfterRound(
 		if name == "" {
 			continue
 		}
-		calledTools[name] = true
+		calledTools[normalizeToolNameKey(name)] = true
 	}
 
 	expectedTool := strings.TrimSpace(step.ExpectedTool)
-	expectedToolCalled := expectedTool == "" || calledTools[expectedTool]
 
 	outcomes := parseRoundToolOutcomes(toolResults)
-	successCount := 0
+	roundSuccessCount := 0
 	failureAttempts := make([]failedAttempt, 0, 4)
 	for _, outcome := range outcomes {
-		if expectedTool != "" && !strings.EqualFold(outcome.Tool, expectedTool) {
-			continue
-		}
+		toolName := strings.TrimSpace(outcome.Tool)
 		if isPlanSuccessfulStatus(outcome.Status) {
-			successCount++
+			roundSuccessCount++
+			plan.RecordSuccessfulTool(toolName)
 			continue
 		}
 		if isPlanFailedStatus(outcome.Status) {
@@ -2466,11 +2464,32 @@ func updatePlanAfterRound(
 			if errMsg == "" {
 				errMsg = "tool call failed"
 			}
-			failureAttempts = append(failureAttempts, failedAttempt{Round: round, Tool: strings.TrimSpace(outcome.Tool), Error: errMsg})
+			if toolName == "" {
+				toolName = firstToolName(toolCalls)
+			}
+			failureAttempts = append(failureAttempts, failedAttempt{Round: round, Tool: toolName, Error: errMsg})
 		}
 	}
 
-	if expectedToolCalled && successCount > 0 && len(failureAttempts) == 0 {
+	expectedSatisfied := plan.HasSuccessfulTool(expectedTool)
+	if expectedTool != "" && len(toolCalls) > 0 && !expectedSatisfied {
+		expectedToolCalled := calledTools[normalizeToolNameKey(expectedTool)]
+		if !expectedToolCalled && len(failureAttempts) == 0 {
+			failureAttempts = append(failureAttempts, failedAttempt{
+				Round: round,
+				Tool:  summarizeToolNames(toolCalls, 3),
+				Error: fmt.Sprintf("expected tool %s was not called", expectedTool),
+			})
+		} else if len(failureAttempts) == 0 {
+			failureAttempts = append(failureAttempts, failedAttempt{
+				Round: round,
+				Tool:  expectedTool,
+				Error: fmt.Sprintf("expected tool %s did not produce a successful result", expectedTool),
+			})
+		}
+	}
+
+	if expectedSatisfied && roundSuccessCount > 0 && len(failureAttempts) == 0 {
 		step.Status = planStepDone
 		step.Round = round
 		result := summarizePlainText(strings.Join(summaries, "；"), 280)
@@ -2482,15 +2501,7 @@ func updatePlanAfterRound(
 		return step, nil
 	}
 
-	if expectedTool != "" && len(toolCalls) > 0 && !expectedToolCalled {
-		failureAttempts = append(failureAttempts, failedAttempt{
-			Round: round,
-			Tool:  summarizeToolNames(toolCalls, 3),
-			Error: fmt.Sprintf("expected tool %s was not called", expectedTool),
-		})
-	}
-
-	if expectedToolCalled && successCount == 0 && len(toolCalls) > 0 && len(failureAttempts) == 0 {
+	if expectedSatisfied && roundSuccessCount == 0 && len(toolCalls) > 0 && len(failureAttempts) == 0 {
 		failureAttempts = append(failureAttempts, failedAttempt{
 			Round: round,
 			Tool:  firstToolName(toolCalls),

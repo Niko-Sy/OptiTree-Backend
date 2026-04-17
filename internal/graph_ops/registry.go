@@ -161,13 +161,13 @@ var toolRegistry = []ToolDefinition{
 	},
 	{
 		Name:             "batch_operations",
-		Description:      "Execute multiple server operations atomically",
+		Description:      "Execute multiple server operations atomically; supports repairMode for phased restructuring",
 		Tier:             TierServer,
 		MutatesGraph:     true,
 		RequiresRead:     true,
 		RequireConfirm:   true,
 		ConfirmThreshold: 5,
-		PromptExample:    `{"operations":[{"tool":"update_node","args":{"nodeId":"n1","name":"新名称"}}]}`,
+		PromptExample:    `{"operations":[{"tool":"update_node","args":{"nodeId":"n1","name":"新名称"}}],"repairMode":false}`,
 		Parameters: mustJSON(map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -181,6 +181,10 @@ var toolRegistry = []ToolDefinition{
 						},
 						"required": []string{"tool", "args"},
 					},
+				},
+				"repairMode": map[string]interface{}{
+					"type":        "boolean",
+					"description": "Allow intermediate invalid states during phased repairs; only fatal graph errors remain blocking.",
 				},
 			},
 			"required": []string{"operations"},

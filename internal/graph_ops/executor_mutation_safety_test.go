@@ -217,3 +217,45 @@ func TestEnforceFaultTreeMutationSafety_BlocksCriticalIssues(t *testing.T) {
 		t.Fatalf("expected BASIC_EVENT_HAS_CHILDREN in error, got %v", err)
 	}
 }
+
+func TestEnforceFaultTreeMutationSafetyPermissive_AllowsStructuralWarnings(t *testing.T) {
+	state := newFaultTreeState(
+		[]model.FaultTreeNode{
+			{ID: "t1", Type: "topEvent", Name: "Top"},
+			{ID: "g1", Type: "gate", Name: "OR", GateType: strPtr("OR")},
+			{ID: "b1", Type: "basicEvent", Name: "Basic"},
+		},
+		[]model.FaultTreeEdge{
+			{ID: "e1", FromNodeID: "t1", ToNodeID: "g1"},
+			{ID: "e2", FromNodeID: "g1", ToNodeID: "b1"},
+		},
+	)
+
+	if err := enforceFaultTreeMutationSafety(state); err == nil {
+		t.Fatal("strict safety should block gate child-count warning")
+	}
+	if err := enforceFaultTreeMutationSafetyPermissive(state); err != nil {
+		t.Fatalf("permissive safety should allow non-fatal warnings, got %v", err)
+	}
+}
+
+func TestEnforceFaultTreeMutationSafetyPermissive_BlocksFatalIssues(t *testing.T) {
+	state := newFaultTreeState(
+		[]model.FaultTreeNode{
+			{ID: "n1", Type: "midEvent", Name: "Mid"},
+			{ID: "n2", Type: "basicEvent", Name: "Basic"},
+		},
+		[]model.FaultTreeEdge{{ID: "e1", FromNodeID: "n1", ToNodeID: "n2"}},
+	)
+
+	err := enforceFaultTreeMutationSafetyPermissive(state)
+	if err == nil {
+		t.Fatal("permissive safety should still block missing top event")
+	}
+	if !errors.Is(err, ErrOperationNotAllowed) {
+		t.Fatalf("expected ErrOperationNotAllowed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "MISSING_TOP_EVENT") {
+		t.Fatalf("expected MISSING_TOP_EVENT in error, got %v", err)
+	}
+}

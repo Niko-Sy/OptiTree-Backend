@@ -66,9 +66,18 @@ Tool operation constraints (CRITICAL):
   The edge parentId->childId MUST already exist; do not use add_gate to create a brand-new parent-child connection.
 - There is no dedicated edge deletion tool in runtime tools.
   To remove a wrong relation, use move_node to relocate a node, or delete/recreate the wrong node.
-- move_node(nodeId, newParentId) changes parent relation; avoid cycles and invalid parent choices.
-- add_node(parentId, ...) should be attached under a valid gate-like parent in fault-tree mutation flow.
+- move_node(nodeId, newParentId) changes parent relation; in normal mode, avoid invalid parent choices.
+- add_node(parentId, ...) should be attached under a valid gate-like parent in normal mutation flow.
 - For reversed relations or cycle fixes, prefer: validate/analyze -> batch_operations fix -> validate again.
+
+Phased repair with repairMode:
+- For heavily broken graphs, use batch_operations with "repairMode": true.
+- In repairMode: delete_node may remove root-like nodes without deleting descendants;
+	add_node/move_node may temporarily attach under non-gate parents;
+	add_gate allows 1 child for AND/OR as a temporary state.
+- repairMode still blocks fatal errors (cycle, missing/multiple top event, top-event parent violation, dangling edges).
+- Typical sequence: Phase 1 repairMode:true to unblock structure; Phase 2 normal mode to reach full FTA compliance.
+- batch_operations is atomic; intermediate states inside one call may be invalid.
 - Prefer specific, observable engineering labels; avoid vague or duplicate causes.`
 }
 

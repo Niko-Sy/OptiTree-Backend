@@ -48,6 +48,7 @@ type PlannedPatchSet struct {
 	Summary      []string           `json:"summary"`
 	ChangedNodes int                `json:"changedNodes"`
 	ChangedEdges int                `json:"changedEdges"`
+	RepairMode   bool               `json:"repairMode,omitempty"`
 }
 
 type Executor struct {
@@ -188,6 +189,7 @@ func (e *Executor) PlanFaultTreeOperation(state *faultTreeState, projectID, tool
 		Summary:      make([]string, 0, 1),
 		ChangedNodes: changedNodes,
 		ChangedEdges: changedEdges,
+		RepairMode:   isRepairModeBatchOperation(toolName, args),
 	}
 	if summary != "" {
 		plan.Summary = append(plan.Summary, summary)
@@ -220,6 +222,7 @@ func (e *Executor) ApplyPatchSet(ctx context.Context, projectID, graphType strin
 		Patch:        GraphPatch{},
 		ChangedNodes: 0,
 		ChangedEdges: 0,
+		RepairMode:   plan.RepairMode,
 	}
 
 	for _, op := range plan.Operations {
@@ -235,6 +238,9 @@ func (e *Executor) ApplyPatchSet(ctx context.Context, projectID, graphType strin
 		mergedPlan.Patch = mergePatch(mergedPlan.Patch, opPlan.Patch)
 		mergedPlan.ChangedNodes += opPlan.ChangedNodes
 		mergedPlan.ChangedEdges += opPlan.ChangedEdges
+		if opPlan.RepairMode {
+			mergedPlan.RepairMode = true
+		}
 	}
 
 	result, _, _, _, err := e.applyPlannedPatchSet(ctx, projectID, graphType, "batch_operations", state, mergedPlan, -1)
@@ -283,7 +289,11 @@ func (e *Executor) applyPlannedPatchSet(
 
 	nextRevision := expectedRevision
 	if plannedPatchHasGraphChanges(plan) {
-		if err := enforceFaultTreeMutationSafety(state); err != nil {
+		safetyCheck := enforceFaultTreeMutationSafety
+		if detectRepairMode(plan) {
+			safetyCheck = enforceFaultTreeMutationSafetyPermissive
+		}
+		if err := safetyCheck(state); err != nil {
 			return nil, nil, nil, expectedRevision, err
 		}
 
@@ -419,6 +429,21 @@ func (e *Executor) applyOperation(state *faultTreeState, projectID, toolName str
 		return e.applyValidateFTAConstraints(state)
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnknownTool, toolName)
+	}
+}
+
+func (e *Executor) applyOperationPermissive(state *faultTreeState, projectID, toolName string, args json.RawMessage) (*operationResult, error) {
+	switch strings.ToLower(strings.TrimSpace(toolName)) {
+	case "delete_node":
+		return e.applyDeleteNodePermissive(state, args)
+	case "add_node":
+		return e.applyAddNodePermissive(state, args)
+	case "move_node":
+		return e.applyMoveNodePermissive(state, args)
+	case "add_gate":
+		return e.applyAddGatePermissive(state, args)
+	default:
+		return e.applyOperation(state, projectID, toolName, args)
 	}
 }
 
@@ -795,6 +820,66 @@ func (e *Executor) applyDeleteNode(state *faultTreeState, args json.RawMessage) 
 	}, nil
 }
 
+func (e *Executor) applyDeleteNodePermissive(state *faultTreeState, args json.RawMessage) (*operationResult, error) {
+	var req struct {
+		NodeID         string `json:"nodeId"`
+		DeleteChildren bool   `json:"deleteChildren"`
+	}
+	if err := json.Unmarshal(args, &req); err != nil {
+		return nil, err
+	}
+
+	nodeID := strings.TrimSpace(req.NodeID)
+	node, ok := state.getNode(nodeID)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNodeNotFound, nodeID)
+	}
+	if strings.EqualFold(strings.TrimSpace(node.Type), "topEvent") {
+		return nil, fmt.Errorf("%w: topEvent cannot be deleted", ErrOperationNotAllowed)
+	}
+
+	parentIDs := state.parentIDsOf(nodeID)
+	childIDs := state.childIDsOf(nodeID)
+
+	toDelete := map[string]struct{}{nodeID: {}}
+	if req.DeleteChildren {
+		for _, child := range state.collectDescendants(nodeID) {
+			toDelete[child] = struct{}{}
+		}
+	}
+
+	deletedNodes, deletedEdges := state.removeNodes(toDelete)
+	if len(deletedNodes) == 0 {
+		return nil, fmt.Errorf("%w: no node deleted", ErrOperationNotAllowed)
+	}
+
+	patch := GraphPatch{
+		DeleteNodes: deletedNodes,
+		DeleteEdges: deletedEdges,
+	}
+	if !req.DeleteChildren && len(parentIDs) > 0 && len(childIDs) > 0 {
+		for _, pid := range parentIDs {
+			for _, cid := range childIDs {
+				if pid == cid {
+					continue
+				}
+				edge := model.FaultTreeEdge{ID: util.NewID("fte"), FromNodeID: pid, ToNodeID: cid}
+				if state.addEdge(edge) {
+					patch.UpsertEdges = append(patch.UpsertEdges, faultTreeEdgePatch(edge))
+				}
+			}
+		}
+	}
+
+	_, changedEdges := patchChangedCounts(patch)
+	return &operationResult{
+		summary:      fmt.Sprintf("已宽松删除 %d 个节点", len(deletedNodes)),
+		patch:        patch,
+		changedNodes: len(deletedNodes),
+		changedEdges: changedEdges,
+	}, nil
+}
+
 func (e *Executor) applyMoveNode(state *faultTreeState, args json.RawMessage) (*operationResult, error) {
 	var req struct {
 		NodeID      string `json:"nodeId"`
@@ -862,12 +947,78 @@ func (e *Executor) applyMoveNode(state *faultTreeState, args json.RawMessage) (*
 	}, nil
 }
 
+func (e *Executor) applyMoveNodePermissive(state *faultTreeState, args json.RawMessage) (*operationResult, error) {
+	var req struct {
+		NodeID      string `json:"nodeId"`
+		NewParentID string `json:"newParentId"`
+	}
+	if err := json.Unmarshal(args, &req); err != nil {
+		return nil, err
+	}
+
+	nodeID := strings.TrimSpace(req.NodeID)
+	newParentID := strings.TrimSpace(req.NewParentID)
+	if nodeID == "" || newParentID == "" {
+		return nil, fmt.Errorf("%w: nodeId and newParentId are required", ErrInvalidParameters)
+	}
+	if nodeID == newParentID {
+		return nil, fmt.Errorf("%w: node cannot be parent of itself", ErrInvalidParameters)
+	}
+	node, ok := state.getNode(nodeID)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNodeNotFound, nodeID)
+	}
+	newParent, ok := state.getNode(newParentID)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNodeNotFound, newParentID)
+	}
+	if strings.EqualFold(strings.TrimSpace(node.Type), "topEvent") {
+		return nil, fmt.Errorf("%w: topEvent cannot be moved under another parent", ErrOperationNotAllowed)
+	}
+	if strings.EqualFold(strings.TrimSpace(newParent.Type), "basicEvent") {
+		return nil, fmt.Errorf("%w: basicEvent cannot be a parent node", ErrOperationNotAllowed)
+	}
+
+	descendantSet := make(map[string]struct{}, 8)
+	for _, id := range state.collectDescendants(nodeID) {
+		descendantSet[id] = struct{}{}
+	}
+	if _, bad := descendantSet[newParentID]; bad {
+		return nil, fmt.Errorf("%w: moving node under its descendant would create a cycle", ErrOperationNotAllowed)
+	}
+
+	deletedEdgeIDs := state.removeIncomingEdges(nodeID)
+	added := false
+	newEdge := model.FaultTreeEdge{
+		ID:         util.NewID("fte"),
+		FromNodeID: newParentID,
+		ToNodeID:   nodeID,
+	}
+	if state.addEdge(newEdge) {
+		added = true
+	}
+
+	patch := GraphPatch{DeleteEdges: deletedEdgeIDs}
+	if added {
+		patch.UpsertEdges = append(patch.UpsertEdges, faultTreeEdgePatch(newEdge))
+	}
+
+	_, changedEdges := patchChangedCounts(patch)
+	return &operationResult{
+		summary:      fmt.Sprintf("已移动节点 %s 到父节点 %s（宽松模式）", nodeID, newParentID),
+		patch:        patch,
+		changedNodes: 1,
+		changedEdges: changedEdges,
+	}, nil
+}
+
 func (e *Executor) applyBatchOperations(state *faultTreeState, projectID string, args json.RawMessage) (*operationResult, error) {
 	var req struct {
 		Operations []struct {
 			Tool string          `json:"tool"`
 			Args json.RawMessage `json:"args"`
 		} `json:"operations"`
+		RepairMode bool `json:"repairMode"`
 	}
 	if err := json.Unmarshal(args, &req); err != nil {
 		return nil, err
@@ -888,7 +1039,15 @@ func (e *Executor) applyBatchOperations(state *faultTreeState, projectID string,
 			return nil, err
 		}
 
-		res, err := e.applyOperation(state, projectID, op.Tool, op.Args)
+		var (
+			res *operationResult
+			err error
+		)
+		if req.RepairMode {
+			res, err = e.applyOperationPermissive(state, projectID, op.Tool, op.Args)
+		} else {
+			res, err = e.applyOperation(state, projectID, op.Tool, op.Args)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -897,10 +1056,223 @@ func (e *Executor) applyBatchOperations(state *faultTreeState, projectID string,
 		merged = mergePatch(merged, res.patch)
 	}
 
+	if req.RepairMode {
+		if err := enforceFaultTreeMutationSafetyPermissive(state); err != nil {
+			return nil, err
+		}
+	}
+
+	summary := fmt.Sprintf("已执行 %d 个批量操作", len(req.Operations))
+	if req.RepairMode {
+		summary = fmt.Sprintf("已执行 %d 个批量操作（repairMode）", len(req.Operations))
+	}
+
 	return &operationResult{
-		summary:      fmt.Sprintf("已执行 %d 个批量操作", len(req.Operations)),
+		summary:      summary,
 		patch:        merged,
 		changedNodes: changedNodes,
+		changedEdges: changedEdges,
+	}, nil
+}
+
+func (e *Executor) applyAddNodePermissive(state *faultTreeState, args json.RawMessage) (*operationResult, error) {
+	var req struct {
+		Name        string  `json:"name"`
+		NodeType    string  `json:"nodeType"`
+		Description *string `json:"description"`
+		ParentID    *string `json:"parentId"`
+	}
+	if err := json.Unmarshal(args, &req); err != nil {
+		return nil, err
+	}
+
+	nodeName := SanitizeStringParam(req.Name, 60)
+	if nodeName == "" {
+		return nil, fmt.Errorf("%w: name is required", ErrInvalidParameters)
+	}
+	nodeType := strings.TrimSpace(req.NodeType)
+	if !isValidAddNodeType(nodeType) {
+		return nil, fmt.Errorf("%w: nodeType invalid", ErrInvalidParameters)
+	}
+
+	if nodeType == "topEvent" {
+		if len(state.nodes) > 0 {
+			return nil, fmt.Errorf("%w: topEvent can only be created on an empty tree", ErrOperationNotAllowed)
+		}
+		if req.ParentID != nil && strings.TrimSpace(*req.ParentID) != "" {
+			return nil, fmt.Errorf("%w: topEvent cannot have a parent", ErrOperationNotAllowed)
+		}
+	} else {
+		if req.ParentID == nil || strings.TrimSpace(*req.ParentID) == "" {
+			return nil, fmt.Errorf("%w: parentId is required for non-topEvent nodes", ErrInvalidParameters)
+		}
+	}
+
+	newNode := model.FaultTreeNode{
+		ID:              util.NewID("ftn"),
+		Type:            nodeType,
+		Name:            nodeName,
+		X:               0,
+		Y:               0,
+		Width:           220,
+		Height:          80,
+		Priority:        0,
+		ShowProbability: false,
+	}
+	if req.Description != nil {
+		value := SanitizeStringParam(*req.Description, 2000)
+		if value != "" {
+			newNode.Description = &value
+		}
+	}
+
+	parentID := ""
+	if req.ParentID != nil && strings.TrimSpace(*req.ParentID) != "" {
+		parentID = strings.TrimSpace(*req.ParentID)
+		parentNode, ok := state.getNode(parentID)
+		if !ok {
+			return nil, fmt.Errorf("%w: parent node %s", ErrNodeNotFound, parentID)
+		}
+		if strings.EqualFold(strings.TrimSpace(parentNode.Type), "basicEvent") {
+			return nil, fmt.Errorf("%w: basicEvent cannot be a parent node", ErrOperationNotAllowed)
+		}
+	}
+
+	state.addNode(newNode)
+	patch := GraphPatch{UpsertNodes: []map[string]interface{}{faultTreeNodePatch(newNode)}}
+	summary := fmt.Sprintf("已新增节点 %s（宽松模式）", newNode.ID)
+
+	if parentID != "" {
+		edge := model.FaultTreeEdge{
+			ID:         util.NewID("fte"),
+			FromNodeID: parentID,
+			ToNodeID:   newNode.ID,
+		}
+		state.addEdge(edge)
+		patch.UpsertEdges = append(patch.UpsertEdges, faultTreeEdgePatch(edge))
+		summary = fmt.Sprintf("已新增节点 %s 并连接到父节点 %s（宽松模式）", newNode.ID, parentID)
+	}
+
+	_, changedEdges := patchChangedCounts(patch)
+	return &operationResult{summary: summary, patch: patch, changedNodes: 1, changedEdges: changedEdges}, nil
+}
+
+func (e *Executor) applyAddGatePermissive(state *faultTreeState, args json.RawMessage) (*operationResult, error) {
+	var req struct {
+		GateType     string   `json:"gateType"`
+		ParentID     string   `json:"parentId"`
+		ParentNodeID string   `json:"parentNodeId"`
+		ChildIDs     []string `json:"childIds"`
+		ChildNodeIDs []string `json:"childNodeIds"`
+		Children     []string `json:"children"`
+	}
+	if err := json.Unmarshal(args, &req); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(req.ParentID) == "" {
+		req.ParentID = req.ParentNodeID
+	}
+	if len(req.ChildIDs) == 0 {
+		req.ChildIDs = req.ChildNodeIDs
+	}
+	if len(req.ChildIDs) == 0 {
+		req.ChildIDs = req.Children
+	}
+
+	gateType := strings.ToUpper(strings.TrimSpace(req.GateType))
+	if !isValidGateType(gateType) {
+		return nil, fmt.Errorf("%w: gateType invalid", ErrInvalidParameters)
+	}
+	parentID := strings.TrimSpace(req.ParentID)
+	parentNode, ok := state.getNode(parentID)
+	if !ok {
+		return nil, fmt.Errorf("%w: parent node %s", ErrNodeNotFound, parentID)
+	}
+	if strings.EqualFold(strings.TrimSpace(parentNode.Type), "basicEvent") {
+		return nil, fmt.Errorf("%w: basicEvent cannot be a parent node", ErrOperationNotAllowed)
+	}
+	if len(req.ChildIDs) == 0 {
+		return nil, fmt.Errorf("%w: childIds is required", ErrInvalidParameters)
+	}
+
+	childSet := make(map[string]struct{}, len(req.ChildIDs))
+	orderedChildren := make([]string, 0, len(req.ChildIDs))
+	for _, childID := range req.ChildIDs {
+		cid := strings.TrimSpace(childID)
+		if cid == "" {
+			continue
+		}
+		if _, dup := childSet[cid]; dup {
+			continue
+		}
+		if cid == parentID {
+			return nil, fmt.Errorf("%w: childIds cannot contain parentId", ErrInvalidParameters)
+		}
+		childNode, ok := state.getNode(cid)
+		if !ok {
+			return nil, fmt.Errorf("%w: child node %s", ErrNodeNotFound, cid)
+		}
+		if strings.EqualFold(strings.TrimSpace(childNode.Type), "topEvent") {
+			return nil, fmt.Errorf("%w: topEvent cannot be rewired as a child", ErrOperationNotAllowed)
+		}
+		if _, hasEdge := state.findEdgeID(parentID, cid); !hasEdge {
+			return nil, fmt.Errorf("%w: edge %s->%s does not exist, cannot rewire", ErrOperationNotAllowed, parentID, cid)
+		}
+		childSet[cid] = struct{}{}
+		orderedChildren = append(orderedChildren, cid)
+	}
+	if gateType == "NOT" {
+		if len(orderedChildren) == 0 {
+			return nil, fmt.Errorf("%w: add_gate requires at least 1 valid childIds for NOT gate", ErrInvalidParameters)
+		}
+		if len(orderedChildren) > 1 {
+			return nil, fmt.Errorf("%w: NOT gate supports at most 1 child", ErrInvalidParameters)
+		}
+	} else if len(orderedChildren) < 1 {
+		return nil, fmt.Errorf("%w: add_gate requires at least 1 valid childIds in repairMode", ErrInvalidParameters)
+	}
+
+	gateNode := model.FaultTreeNode{
+		ID:              util.NewID("gate"),
+		Type:            "gate",
+		Name:            gateType,
+		X:               0,
+		Y:               0,
+		Width:           220,
+		Height:          80,
+		Priority:        0,
+		ShowProbability: false,
+		GateType:        &gateType,
+	}
+	state.addNode(gateNode)
+
+	patch := GraphPatch{UpsertNodes: []map[string]interface{}{faultTreeNodePatch(gateNode)}}
+	deletedEdges := state.removeEdgesByFromTo(parentID, childSet)
+	patch.DeleteEdges = append(patch.DeleteEdges, deletedEdges...)
+
+	connects := []model.FaultTreeEdge{{
+		ID:         util.NewID("fte"),
+		FromNodeID: parentID,
+		ToNodeID:   gateNode.ID,
+	}}
+	for _, cid := range orderedChildren {
+		connects = append(connects, model.FaultTreeEdge{
+			ID:         util.NewID("fte"),
+			FromNodeID: gateNode.ID,
+			ToNodeID:   cid,
+		})
+	}
+	for _, edge := range connects {
+		if state.addEdge(edge) {
+			patch.UpsertEdges = append(patch.UpsertEdges, faultTreeEdgePatch(edge))
+		}
+	}
+
+	_, changedEdges := patchChangedCounts(patch)
+	return &operationResult{
+		summary:      fmt.Sprintf("已新增逻辑门 %s，并将 %d 个子节点从 %s 重连到该逻辑门（宽松模式）", gateNode.ID, len(orderedChildren), parentID),
+		patch:        patch,
+		changedNodes: 1,
 		changedEdges: changedEdges,
 	}, nil
 }
@@ -1221,6 +1593,46 @@ func enforceFaultTreeMutationSafety(state *faultTreeState) error {
 	return fmt.Errorf("%w: %s", ErrOperationNotAllowed, strings.Join(parts, "; "))
 }
 
+func enforceFaultTreeMutationSafetyPermissive(state *faultTreeState) error {
+	fatalCodes := map[string]struct{}{
+		"CYCLE_DETECTED":        {},
+		"MISSING_TOP_EVENT":     {},
+		"MULTIPLE_TOP_EVENTS":   {},
+		"TOP_EVENT_AS_CHILD":    {},
+		"TOP_EVENT_NOT_ROOT":    {},
+		"EDGE_NODE_ID_EMPTY":    {},
+		"EDGE_SOURCE_NOT_FOUND": {},
+		"EDGE_TARGET_NOT_FOUND": {},
+	}
+
+	issues := evaluateFTAConstraintIssues(state)
+	blocking := make([]ftaConstraintIssue, 0, len(issues))
+	for _, issue := range issues {
+		if _, ok := fatalCodes[strings.TrimSpace(issue.Code)]; ok {
+			blocking = append(blocking, issue)
+		}
+	}
+	if len(blocking) == 0 {
+		return nil
+	}
+
+	const maxIssueSummary = 5
+	parts := make([]string, 0, minInt(maxIssueSummary, len(blocking)))
+	for i := 0; i < len(blocking) && i < maxIssueSummary; i++ {
+		item := blocking[i]
+		if strings.TrimSpace(item.NodeID) != "" {
+			parts = append(parts, fmt.Sprintf("%s(%s): %s", item.Code, item.NodeID, item.Message))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", item.Code, item.Message))
+	}
+	if len(blocking) > maxIssueSummary {
+		parts = append(parts, fmt.Sprintf("... and %d more issues", len(blocking)-maxIssueSummary))
+	}
+
+	return fmt.Errorf("%w: %s", ErrOperationNotAllowed, strings.Join(parts, "; "))
+}
+
 func evaluateFTAConstraintIssues(state *faultTreeState) []ftaConstraintIssue {
 	issues := make([]ftaConstraintIssue, 0)
 	inDegree := make(map[string]int, len(state.nodes))
@@ -1417,6 +1829,34 @@ func expandPlannedOperations(toolName string, args json.RawMessage) []PlannedOpe
 		return []PlannedOperation{{ToolName: name, Args: cloneJSONRaw(args)}}
 	}
 	return out
+}
+
+func detectRepairMode(plan *PlannedPatchSet) bool {
+	if plan == nil {
+		return false
+	}
+	if plan.RepairMode {
+		return true
+	}
+	for _, op := range plan.Operations {
+		if isRepairModeBatchOperation(op.ToolName, op.Args) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRepairModeBatchOperation(toolName string, args json.RawMessage) bool {
+	if !strings.EqualFold(strings.TrimSpace(toolName), "batch_operations") {
+		return false
+	}
+	var payload struct {
+		RepairMode bool `json:"repairMode"`
+	}
+	if err := json.Unmarshal(args, &payload); err != nil {
+		return false
+	}
+	return payload.RepairMode
 }
 
 func encodeReadToolPayload(payload map[string]interface{}) string {

@@ -146,6 +146,43 @@ func TestUpdatePlanAfterRound_ExpectedToolAndSuccessRequired(t *testing.T) {
 	}
 }
 
+func TestUpdatePlanAfterRound_UsesHistoricalExpectedToolSuccess(t *testing.T) {
+	plan := &executionPlan{
+		Goal:            "修复",
+		SuccessfulTools: make(map[string]bool),
+		Steps: []executionPlanStep{
+			{ID: 1, Description: "先读取快照", ExpectedTool: "get_graph_snapshot", Status: planStepPending},
+			{ID: 2, Description: "执行修复", ExpectedTool: "get_graph_snapshot", Status: planStepPending},
+		},
+	}
+
+	callsRound1 := []ai.ToolCall{{ID: "c1", Name: "get_graph_snapshot", Arguments: json.RawMessage(`{}`)}}
+	resultsRound1 := []ai.ChatHistoryMessage{buildToolResultHistoryMessage("c1", "get_graph_snapshot", toolStatusSuccess, "ok", nil, "")}
+	completed, blocked := updatePlanAfterRound(plan, 1, []string{"snapshot ok"}, callsRound1, resultsRound1)
+	if blocked != nil {
+		t.Fatalf("round 1 should not block, got %+v", blocked)
+	}
+	if completed == nil || completed.ID != 1 {
+		t.Fatalf("round 1 should complete step 1, got %+v", completed)
+	}
+	if !plan.HasSuccessfulTool("get_graph_snapshot") {
+		t.Fatal("expected get_graph_snapshot to be recorded as successful across rounds")
+	}
+
+	callsRound2 := []ai.ToolCall{{ID: "c2", Name: "batch_operations", Arguments: json.RawMessage(`{"operations":[]}`)}}
+	resultsRound2 := []ai.ChatHistoryMessage{buildToolResultHistoryMessage("c2", "batch_operations", toolStatusSuccess, "ok", nil, "")}
+	completed, blocked = updatePlanAfterRound(plan, 2, []string{"batch ok"}, callsRound2, resultsRound2)
+	if blocked != nil {
+		t.Fatalf("round 2 should not block, got %+v", blocked)
+	}
+	if completed == nil || completed.ID != 2 {
+		t.Fatalf("round 2 should complete step 2 by historical expected tool satisfaction, got %+v", completed)
+	}
+	if len(plan.Steps[1].FailedAttempts) != 0 {
+		t.Fatalf("expected no failed attempts for step 2, got %+v", plan.Steps[1].FailedAttempts)
+	}
+}
+
 func TestUpdatePlanAfterRound_FailureAccumulationBlocksStep(t *testing.T) {
 	plan := &executionPlan{
 		Goal: "修复",

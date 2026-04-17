@@ -20,7 +20,7 @@ func TestBuildAgentMessages_FaultTreeUsesCompactPromptV2(t *testing.T) {
 		t.Fatalf("expected at least one message")
 	}
 	sys := messages[0].Content
-	if len([]rune(sys)) > 2600 {
+	if len([]rune(sys)) > 3300 {
 		t.Fatalf("expected compact system prompt, got %d chars: %s", len([]rune(sys)), sys)
 	}
 
@@ -30,6 +30,8 @@ func TestBuildAgentMessages_FaultTreeUsesCompactPromptV2(t *testing.T) {
 		"Tool operation constraints",
 		"rewires existing parent->child edges only",
 		"There is no dedicated edge deletion tool",
+		"Phased repair with repairMode",
+		"batch_operations with \"repairMode\": true",
 		"Runtime Tool Guide",
 		"get_graph_snapshot | required=[none]",
 		"read_context -> validate -> mutate -> validate",
