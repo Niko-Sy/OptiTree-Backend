@@ -107,6 +107,8 @@ type AgentConfig struct {
 	SessionTTL               time.Duration `mapstructure:"session_ttl"`
 	ToolCallRateLimit        int           `mapstructure:"tool_call_rate_limit"`
 	EnableFallbackParser     bool          `mapstructure:"enable_fallback_parser"`
+	EnablePlannerPhase       bool          `mapstructure:"enable_planner_phase"`
+	EnableLoopSoftWarning    bool          `mapstructure:"enable_loop_soft_warning"`
 	AgentModel               string        `mapstructure:"agent_model"`
 	PromptVersion            string        `mapstructure:"prompt_version"`
 	IncludeHybridTools       bool          `mapstructure:"include_hybrid_tools"`
@@ -194,6 +196,8 @@ func Load() (*Config, error) {
 	viper.SetEnvPrefix("OPTITREE")
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	viper.AutomaticEnv()
+	viper.SetDefault("agent.enable_planner_phase", true)
+	viper.SetDefault("agent.enable_loop_soft_warning", true)
 
 	if err := viper.ReadInConfig(); err != nil {
 		return nil, err

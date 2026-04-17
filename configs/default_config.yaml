@@ -70,6 +70,8 @@ agent:
   session_ttl: 30m
   tool_call_rate_limit: 5
   enable_fallback_parser: true
+  enable_planner_phase: true
+  enable_loop_soft_warning: true
   agent_model: ""
   prompt_version: "v2"
   include_hybrid_tools: false

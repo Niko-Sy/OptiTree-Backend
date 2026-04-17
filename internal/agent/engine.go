@@ -40,12 +40,23 @@ const (
 	toolStatusDiscarded       = "discarded"
 	toolStatusClientOnly      = "client_only"
 	toolStatusPending         = "pending"
+	toolStatusWarning         = "warning"
 )
 
 type faultTreeRuntimeSnapshot struct {
 	nodes    []model.FaultTreeNode
 	edges    []model.FaultTreeEdge
 	revision int
+}
+
+type roundExecutionState struct {
+	goal          string
+	knownFacts    []string
+	recentActions []string
+	seenFacts     map[string]struct{}
+	seenActions   map[string]struct{}
+	plan          *executionPlan
+	replanCount   int
 }
 
 type AgentRunInput struct {
@@ -430,19 +441,29 @@ func (s *AgentService) RunStream(
 	workingHistory := append([]ai.ChatHistoryMessage(nil), history...)
 	modelForRun := s.resolveAgentModel(input.Model)
 
-	currentMessage := message
-	if input.ReadOnly {
-		currentMessage = "系统约束：当前会话为只读模式，仅允许分析与只读工具，禁止执行结构写操作。\n" + currentMessage
-	}
-	if contextSource == "client_snapshot" {
-		if hasClientRevision {
-			currentMessage = fmt.Sprintf("系统上下文：本轮使用前端 graphSnapshot（clientRevision=%d）。\n%s", *input.ClientRevision, currentMessage)
-		} else {
-			currentMessage = "系统上下文：本轮使用前端 graphSnapshot。\n" + currentMessage
+	focusHint := buildFocusNodeHint(input.FocusNodeIDs, input.SelectedNodeIDs)
+	constraintPrefix := buildMessageConstraintPrefix(input.ReadOnly, contextSource, hasClientRevision, input.ClientRevision, focusHint)
+	currentMessage := composeAgentMessage(constraintPrefix, message)
+	executionState := newRoundExecutionState(message)
+	if s.cfg.EnablePlannerPhase && len(toolSchemas) > 0 {
+		emitThinkingEvent(writeEvent, "planning_start", 0, "正在生成执行计划")
+		plan, planErr := s.runPlannerPhase(ctx, plannerPhaseInput{
+			Message:       message,
+			Model:         modelForRun,
+			GraphType:     conversation.Type,
+			ContextData:   currentContext,
+			History:       workingHistory,
+			ToolGuide:     toolGuide,
+			ReadOnly:      input.ReadOnly,
+			PromptVersion: strings.TrimSpace(s.cfg.PromptVersion),
+			PriorFailures: nil,
+		})
+		if planErr != nil {
+			emitThinkingEvent(writeEvent, "planning_fallback", 0, fmt.Sprintf("规划阶段失败，使用默认计划继续：%s", summarizeThinking(planErr.Error(), 240)))
+			plan = buildFallbackExecutionPlan(message, input.ReadOnly)
 		}
-	}
-	if focusHint := buildFocusNodeHint(input.FocusNodeIDs, input.SelectedNodeIDs); focusHint != "" {
-		currentMessage = focusHint + "\n" + currentMessage
+		executionState.SetPlan(plan)
+		emitThinkingEvent(writeEvent, "plan_ready", 0, fmt.Sprintf("执行计划已生成，共 %d 步：%s", len(plan.Steps), summarizeExecutionPlan(plan)))
 	}
 	roundLimit := s.cfg.MaxRounds
 	if input.MaxToolRounds > 0 {
@@ -615,7 +636,36 @@ func (s *AgentService) RunStream(
 			emitThinkingEvent(writeEvent, "round_summary", round+1, "本轮未产生可执行工具结果")
 		}
 		allToolSummaries = append(allToolSummaries, roundSummaries...)
-		currentMessage = buildToolContinuationPrompt(message, round+1, roundSummaries)
+		executionState.RecordRound(roundSummaries, roundToolCalls)
+		completedStep, blockedStep := updatePlanAfterRound(executionState.plan, round+1, roundSummaries, roundToolCalls, roundToolResults)
+		if completedStep != nil {
+			emitThinkingEvent(writeEvent, "plan_step_done", round+1, fmt.Sprintf("步骤 %d 已完成：%s", completedStep.ID, completedStep.Description))
+		}
+		if blockedStep != nil {
+			emitThinkingEvent(writeEvent, "plan_blocked", round+1, strings.TrimSpace(executionState.plan.BlockedReason))
+			if executionState.CanReplan() {
+				executionState.IncReplanCount()
+				emitThinkingEvent(writeEvent, "replanning", round+1, fmt.Sprintf("步骤 %d 连续失败，触发重规划", blockedStep.ID))
+				newPlan, replanErr := s.runPlannerPhase(ctx, plannerPhaseInput{
+					Message:       message,
+					Model:         modelForRun,
+					GraphType:     conversation.Type,
+					ContextData:   currentContext,
+					History:       workingHistory,
+					ToolGuide:     toolGuide,
+					ReadOnly:      input.ReadOnly,
+					PromptVersion: strings.TrimSpace(s.cfg.PromptVersion),
+					PriorFailures: executionState.plan.collectAllFailures(),
+				})
+				if replanErr != nil {
+					emitThinkingEvent(writeEvent, "replanning_fallback", round+1, fmt.Sprintf("重规划失败，使用默认计划：%s", summarizeThinking(replanErr.Error(), 200)))
+					newPlan = buildFallbackExecutionPlan(message, input.ReadOnly)
+				}
+				executionState.SetPlan(newPlan)
+				emitThinkingEvent(writeEvent, "replan_ready", round+1, fmt.Sprintf("新计划已生成，共 %d 步：%s", len(newPlan.Steps), summarizeExecutionPlan(newPlan)))
+			}
+		}
+		currentMessage = buildToolContinuationPrompt(message, round+1, roundSummaries, constraintPrefix, executionState)
 
 		if len(roundToolCalls) == 0 {
 			break
@@ -863,6 +913,41 @@ func (s *AgentService) executeRoundToolCalls(
 		defer session.SetRecentReadContext(roundReadContextUsed)
 	}
 
+	handleSafetyCheck := func(call ai.ToolCall) (skip bool, hardErr error) {
+		if s.safety == nil {
+			return false, nil
+		}
+
+		warning, err := s.safety.CheckToolCallWithWarning(session, call, 0)
+		if err != nil {
+			errMsg := err.Error()
+			_ = writeEvent(map[string]interface{}{"type": "tool_call_error", "callId": call.ID, "tool": call.Name, "error": errMsg})
+			_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusFailed, false, errMsg, errMsg, nil))
+			summary := fmt.Sprintf("%s: %s", call.Name, errMsg)
+			summaries = append(summaries, summary)
+			toolResults = append(toolResults, buildToolResultHistoryMessage(call.ID, call.Name, toolStatusFailed, summary, nil, errMsg))
+			if isHardStopSafetyError(err) {
+				return false, err
+			}
+			return true, nil
+		}
+
+		if warning != nil {
+			warnMsg := strings.TrimSpace(warning.Message)
+			if warnMsg == "" {
+				warnMsg = "detected repetitive tool-call pattern; please switch strategy"
+			}
+			_ = writeEvent(map[string]interface{}{"type": "tool_call_warning", "callId": call.ID, "tool": call.Name, "warning": warnMsg, "warningCode": strings.TrimSpace(warning.Code)})
+			_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusWarning, false, warnMsg, "", nil))
+			summary := fmt.Sprintf("%s: %s", call.Name, warnMsg)
+			summaries = append(summaries, summary)
+			toolResults = append(toolResults, buildToolResultHistoryMessage(call.ID, call.Name, toolStatusWarning, summary, nil, ""))
+			return true, nil
+		}
+
+		return false, nil
+	}
+
 	for _, call := range toolCalls {
 		if strings.TrimSpace(call.ID) == "" {
 			call.ID = util.NewAgentToolCallID()
@@ -912,46 +997,34 @@ func (s *AgentService) executeRoundToolCalls(
 			autoReadCall := buildAutoReadCallForMutation(call)
 			autoDef, ok := graph_ops.GetTool(autoReadCall.Name)
 			if ok {
-				if s.safety != nil {
-					if err := s.safety.CheckToolCall(session, autoReadCall, 0); err != nil {
-						errMsg := err.Error()
-						_ = writeEvent(buildToolCallResultEvent(autoReadCall.ID, autoReadCall.Name, toolStatusFailed, false, errMsg, errMsg, nil))
-						summaries = append(summaries, fmt.Sprintf("%s: %s", autoReadCall.Name, errMsg))
-						toolResults = append(toolResults, buildToolResultHistoryMessage(autoReadCall.ID, autoReadCall.Name, toolStatusFailed, errMsg, nil, errMsg))
-						if isHardStopSafetyError(err) {
-							return summaries, toolResults, graphMutated, err
-						}
+				skipAutoRead, hardErr := handleSafetyCheck(autoReadCall)
+				if hardErr != nil {
+					return summaries, toolResults, graphMutated, hardErr
+				}
+				if !skipAutoRead {
+					session.IncToolCallCount()
+					outcome, status, err := s.runToolCallWithAudit(ctx, session, projectID, graphType, readOnly, runtimeSnapshot, autoReadCall, autoDef, writeEvent)
+					if err != nil {
+						return summaries, toolResults, graphMutated, err
 					}
+					roundReadContextUsed = true
+					autoSummary := strings.TrimSpace(outcome.Summary)
+					if autoSummary == "" {
+						autoSummary = "已自动读取图上下文"
+					}
+					autoSummary = s.compactToolObservationText(autoReadCall.Name, status, "auto_read_context: "+autoSummary, outcome.Patch, "")
+					summaries = append(summaries, autoSummary)
+					toolResults = append(toolResults, buildToolResultHistoryMessage(autoReadCall.ID, autoReadCall.Name, status, autoSummary, outcome.Patch, ""))
 				}
-				session.IncToolCallCount()
-				outcome, status, err := s.runToolCallWithAudit(ctx, session, projectID, graphType, readOnly, runtimeSnapshot, autoReadCall, autoDef, writeEvent)
-				if err != nil {
-					return summaries, toolResults, graphMutated, err
-				}
-				roundReadContextUsed = true
-				autoSummary := strings.TrimSpace(outcome.Summary)
-				if autoSummary == "" {
-					autoSummary = "已自动读取图上下文"
-				}
-				autoSummary = s.compactToolObservationText(autoReadCall.Name, status, "auto_read_context: "+autoSummary, outcome.Patch, "")
-				summaries = append(summaries, autoSummary)
-				toolResults = append(toolResults, buildToolResultHistoryMessage(autoReadCall.ID, autoReadCall.Name, status, autoSummary, outcome.Patch, ""))
 			}
 		}
 
-		if s.safety != nil {
-			if err := s.safety.CheckToolCall(session, call, 0); err != nil {
-				errMsg := err.Error()
-				_ = writeEvent(map[string]interface{}{"type": "tool_call_error", "callId": call.ID, "tool": call.Name, "error": errMsg})
-				_ = writeEvent(buildToolCallResultEvent(call.ID, call.Name, toolStatusFailed, false, errMsg, errMsg, nil))
-				summary := fmt.Sprintf("%s: %s", call.Name, errMsg)
-				summaries = append(summaries, summary)
-				toolResults = append(toolResults, buildToolResultHistoryMessage(call.ID, call.Name, toolStatusFailed, summary, nil, errMsg))
-				if isHardStopSafetyError(err) {
-					return summaries, toolResults, graphMutated, err
-				}
-				continue
-			}
+		skipCall, hardErr := handleSafetyCheck(call)
+		if hardErr != nil {
+			return summaries, toolResults, graphMutated, hardErr
+		}
+		if skipCall {
+			continue
 		}
 		session.IncToolCallCount()
 
@@ -1003,17 +1076,12 @@ func (s *AgentService) executeRoundToolCalls(
 					continue
 				}
 
-				if s.safety != nil {
-					if err := s.safety.CheckToolCall(session, followCall, 0); err != nil {
-						errMsg := err.Error()
-						_ = writeEvent(buildToolCallResultEvent(followCall.ID, followCall.Name, toolStatusFailed, false, errMsg, errMsg, nil))
-						summaries = append(summaries, fmt.Sprintf("%s: %s", followCall.Name, errMsg))
-						toolResults = append(toolResults, buildToolResultHistoryMessage(followCall.ID, followCall.Name, toolStatusFailed, errMsg, nil, errMsg))
-						if isHardStopSafetyError(err) {
-							return summaries, toolResults, graphMutated, err
-						}
-						continue
-					}
+				skipFollow, hardErr := handleSafetyCheck(followCall)
+				if hardErr != nil {
+					return summaries, toolResults, graphMutated, hardErr
+				}
+				if skipFollow {
+					continue
 				}
 
 				session.IncToolCallCount()
@@ -1114,37 +1182,28 @@ func mergeRoundMutationCalls(toolCalls []ai.ToolCall) []ai.ToolCall {
 		return toolCalls
 	}
 
-	mutations := make([]ai.ToolCall, 0, len(toolCalls))
-	firstMutationIndex := -1
-	for i, call := range toolCalls {
-		if !isMergeableMutationTool(call.Name) {
+	out := make([]ai.ToolCall, 0, len(toolCalls))
+	for i := 0; i < len(toolCalls); {
+		if !isMergeableMutationTool(toolCalls[i].Name) {
+			out = append(out, toolCalls[i])
+			i++
 			continue
 		}
-		if firstMutationIndex < 0 {
-			firstMutationIndex = i
-		}
-		mutations = append(mutations, call)
-	}
-	if len(mutations) <= 1 {
-		return toolCalls
-	}
 
-	merged, ok := mergeMutationSegment(mutations)
-	if !ok {
-		return toolCalls
-	}
-
-	out := make([]ai.ToolCall, 0, len(toolCalls)-len(mutations)+1)
-	inserted := false
-	for i, call := range toolCalls {
-		if isMergeableMutationTool(call.Name) {
-			if !inserted && i == firstMutationIndex {
-				out = append(out, merged)
-				inserted = true
-			}
-			continue
+		j := i
+		for j < len(toolCalls) && isMergeableMutationTool(toolCalls[j].Name) {
+			j++
 		}
-		out = append(out, call)
+
+		segment := toolCalls[i:j]
+		merged, ok := mergeMutationSegment(segment)
+		if ok {
+			out = append(out, merged)
+		} else {
+			out = append(out, segment...)
+		}
+
+		i = j
 	}
 	return out
 }
@@ -1411,7 +1470,7 @@ type ToolObservationSummary struct {
 
 func normalizeToolFinalStatus(status string) string {
 	switch strings.TrimSpace(status) {
-	case toolStatusFailed, toolStatusCancelled, toolStatusDiscarded, toolStatusClientOnly, toolStatusSuccess, toolStatusPending:
+	case toolStatusFailed, toolStatusCancelled, toolStatusDiscarded, toolStatusClientOnly, toolStatusSuccess, toolStatusPending, toolStatusWarning:
 		return strings.TrimSpace(status)
 	default:
 		return toolStatusSuccess
@@ -2247,13 +2306,395 @@ func estimateNodeMutation(toolName string) int {
 	}
 }
 
-func buildToolContinuationPrompt(originalMessage string, round int, summaries []string) string {
+func newRoundExecutionState(goal string) *roundExecutionState {
+	return &roundExecutionState{
+		goal:          strings.TrimSpace(goal),
+		knownFacts:    make([]string, 0, 12),
+		recentActions: make([]string, 0, 12),
+		seenFacts:     make(map[string]struct{}),
+		seenActions:   make(map[string]struct{}),
+	}
+}
+
+func (s *roundExecutionState) SetPlan(plan *executionPlan) {
+	if s == nil {
+		return
+	}
+	s.plan = plan
+}
+
+func (s *roundExecutionState) CanReplan() bool {
+	if s == nil {
+		return false
+	}
+	return s.replanCount < 2
+}
+
+func (s *roundExecutionState) IncReplanCount() {
+	if s == nil {
+		return
+	}
+	s.replanCount++
+}
+
+func (s *roundExecutionState) NextPendingPlanStep() *executionPlanStep {
+	if s == nil || s.plan == nil {
+		return nil
+	}
+	return s.plan.NextPendingStep()
+}
+
+func (s *roundExecutionState) RecordRound(summaries []string, toolCalls []ai.ToolCall) {
+	if s == nil {
+		return
+	}
+
+	for _, summary := range summaries {
+		fact := strings.TrimSpace(summary)
+		if fact == "" {
+			continue
+		}
+		if _, exists := s.seenFacts[fact]; exists {
+			continue
+		}
+		s.seenFacts[fact] = struct{}{}
+		s.knownFacts = append(s.knownFacts, fact)
+		if len(s.knownFacts) > 12 {
+			drop := s.knownFacts[0]
+			s.knownFacts = s.knownFacts[1:]
+			delete(s.seenFacts, drop)
+		}
+	}
+
+	for _, call := range toolCalls {
+		action := summarizeToolCallAction(call)
+		if action == "" {
+			continue
+		}
+		if _, exists := s.seenActions[action]; exists {
+			continue
+		}
+		s.seenActions[action] = struct{}{}
+		s.recentActions = append(s.recentActions, action)
+		if len(s.recentActions) > 12 {
+			drop := s.recentActions[0]
+			s.recentActions = s.recentActions[1:]
+			delete(s.seenActions, drop)
+		}
+	}
+}
+
+func summarizeToolCallAction(call ai.ToolCall) string {
+	name := strings.TrimSpace(call.Name)
+	if name == "" {
+		return ""
+	}
+	args := normalizeArgsHash(call.Arguments)
+	runes := []rune(args)
+	if len(runes) > 100 {
+		args = string(runes[:100]) + "..."
+	}
+	return fmt.Sprintf("%s %s", name, args)
+}
+
+func hasMeaningfulPlanProgress(summaries []string) bool {
+	for _, item := range summaries {
+		text := strings.ToLower(strings.TrimSpace(item))
+		if text == "" {
+			continue
+		}
+		if strings.Contains(text, "detected repetitive call pattern") {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+type roundToolOutcome struct {
+	Tool    string
+	Status  string
+	Summary string
+	Error   string
+}
+
+func updatePlanAfterRound(
+	plan *executionPlan,
+	round int,
+	summaries []string,
+	toolCalls []ai.ToolCall,
+	toolResults []ai.ChatHistoryMessage,
+) (completed *executionPlanStep, blocked *executionPlanStep) {
+	if plan == nil {
+		return nil, nil
+	}
+
+	step := plan.NextPendingStep()
+	if step == nil {
+		plan.BlockedReason = ""
+		return nil, nil
+	}
+
+	calledTools := make(map[string]bool, len(toolCalls))
+	for _, call := range toolCalls {
+		name := strings.TrimSpace(call.Name)
+		if name == "" {
+			continue
+		}
+		calledTools[name] = true
+	}
+
+	expectedTool := strings.TrimSpace(step.ExpectedTool)
+	expectedToolCalled := expectedTool == "" || calledTools[expectedTool]
+
+	outcomes := parseRoundToolOutcomes(toolResults)
+	successCount := 0
+	failureAttempts := make([]failedAttempt, 0, 4)
+	for _, outcome := range outcomes {
+		if expectedTool != "" && !strings.EqualFold(outcome.Tool, expectedTool) {
+			continue
+		}
+		if isPlanSuccessfulStatus(outcome.Status) {
+			successCount++
+			continue
+		}
+		if isPlanFailedStatus(outcome.Status) {
+			errMsg := strings.TrimSpace(outcome.Error)
+			if errMsg == "" {
+				errMsg = strings.TrimSpace(outcome.Summary)
+			}
+			if errMsg == "" {
+				errMsg = "tool call failed"
+			}
+			failureAttempts = append(failureAttempts, failedAttempt{Round: round, Tool: strings.TrimSpace(outcome.Tool), Error: errMsg})
+		}
+	}
+
+	if expectedToolCalled && successCount > 0 && len(failureAttempts) == 0 {
+		step.Status = planStepDone
+		step.Round = round
+		result := summarizePlainText(strings.Join(summaries, "；"), 280)
+		if result == "" {
+			result = fmt.Sprintf("round %d completed with expected tool", round)
+		}
+		step.Result = result
+		plan.BlockedReason = ""
+		return step, nil
+	}
+
+	if expectedTool != "" && len(toolCalls) > 0 && !expectedToolCalled {
+		failureAttempts = append(failureAttempts, failedAttempt{
+			Round: round,
+			Tool:  summarizeToolNames(toolCalls, 3),
+			Error: fmt.Sprintf("expected tool %s was not called", expectedTool),
+		})
+	}
+
+	if expectedToolCalled && successCount == 0 && len(toolCalls) > 0 && len(failureAttempts) == 0 {
+		failureAttempts = append(failureAttempts, failedAttempt{
+			Round: round,
+			Tool:  firstToolName(toolCalls),
+			Error: "no successful tool result for current step",
+		})
+	}
+
+	appendUniqueFailedAttempts(step, failureAttempts)
+	if len(step.FailedAttempts) >= 3 {
+		step.Status = planStepFailed
+		lastErr := "unknown"
+		if n := len(step.FailedAttempts); n > 0 {
+			lastErr = strings.TrimSpace(step.FailedAttempts[n-1].Error)
+		}
+		plan.BlockedReason = fmt.Sprintf("步骤%d连续失败%d次，最后错误：%s", step.ID, len(step.FailedAttempts), summarizePlainText(lastErr, 180))
+		return nil, step
+	}
+
+	return nil, nil
+}
+
+func firstToolName(toolCalls []ai.ToolCall) string {
+	for _, call := range toolCalls {
+		name := strings.TrimSpace(call.Name)
+		if name != "" {
+			return name
+		}
+	}
+	return "unknown_tool"
+}
+
+func appendUniqueFailedAttempts(step *executionPlanStep, attempts []failedAttempt) {
+	if step == nil || len(attempts) == 0 {
+		return
+	}
+
+	seen := make(map[string]struct{}, len(step.FailedAttempts)+len(attempts))
+	for _, existing := range step.FailedAttempts {
+		key := fmt.Sprintf("%d|%s|%s", existing.Round, strings.TrimSpace(existing.Tool), strings.TrimSpace(existing.Error))
+		seen[key] = struct{}{}
+	}
+
+	for _, item := range attempts {
+		item.Tool = strings.TrimSpace(item.Tool)
+		item.Error = strings.TrimSpace(item.Error)
+		if item.Tool == "" || item.Error == "" {
+			continue
+		}
+		key := fmt.Sprintf("%d|%s|%s", item.Round, item.Tool, item.Error)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		step.FailedAttempts = append(step.FailedAttempts, item)
+	}
+}
+
+func parseRoundToolOutcomes(toolResults []ai.ChatHistoryMessage) []roundToolOutcome {
+	outcomes := make([]roundToolOutcome, 0, len(toolResults))
+	for _, result := range toolResults {
+		if !strings.EqualFold(strings.TrimSpace(result.Role), "tool") {
+			continue
+		}
+
+		var observation ToolObservationSummary
+		if err := json.Unmarshal([]byte(result.Content), &observation); err == nil {
+			outcomes = append(outcomes, roundToolOutcome{
+				Tool:    strings.TrimSpace(observation.Tool),
+				Status:  normalizeToolFinalStatus(observation.Status),
+				Summary: strings.TrimSpace(observation.Summary),
+				Error:   strings.TrimSpace(observation.Error),
+			})
+			continue
+		}
+
+		var fallback map[string]interface{}
+		if err := json.Unmarshal([]byte(result.Content), &fallback); err != nil {
+			continue
+		}
+		outcomes = append(outcomes, roundToolOutcome{
+			Tool:    strings.TrimSpace(fmt.Sprintf("%v", fallback["tool"])),
+			Status:  normalizeToolFinalStatus(strings.TrimSpace(fmt.Sprintf("%v", fallback["status"]))),
+			Summary: strings.TrimSpace(fmt.Sprintf("%v", fallback["summary"])),
+			Error:   strings.TrimSpace(fmt.Sprintf("%v", fallback["error"])),
+		})
+	}
+	return outcomes
+}
+
+func isPlanSuccessfulStatus(status string) bool {
+	status = normalizeToolFinalStatus(status)
+	return status == toolStatusSuccess || status == toolStatusClientOnly
+}
+
+func isPlanFailedStatus(status string) bool {
+	status = normalizeToolFinalStatus(status)
+	switch status {
+	case toolStatusFailed, toolStatusCancelled, toolStatusDiscarded, toolStatusWarning:
+		return true
+	default:
+		return false
+	}
+}
+
+func buildMessageConstraintPrefix(readOnly bool, contextSource string, hasClientRevision bool, clientRevision *int, focusHint string) string {
+	lines := make([]string, 0, 3)
+	if readOnly {
+		lines = append(lines, "系统约束：当前会话为只读模式，仅允许分析与只读工具，禁止执行结构写操作。")
+	}
+	if strings.EqualFold(strings.TrimSpace(contextSource), "client_snapshot") {
+		if hasClientRevision && clientRevision != nil {
+			lines = append(lines, fmt.Sprintf("系统上下文：本轮使用前端 graphSnapshot（clientRevision=%d）。", *clientRevision))
+		} else {
+			lines = append(lines, "系统上下文：本轮使用前端 graphSnapshot。")
+		}
+	}
+	if v := strings.TrimSpace(focusHint); v != "" {
+		lines = append(lines, v)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func composeAgentMessage(constraintPrefix, message string) string {
+	base := strings.TrimSpace(message)
+	if base == "" {
+		base = "请继续完成用户任务"
+	}
+	prefix := strings.TrimSpace(constraintPrefix)
+	if prefix == "" {
+		return base
+	}
+	return prefix + "\n" + base
+}
+
+func buildToolContinuationPrompt(originalMessage string, round int, summaries []string, constraintPrefix string, state *roundExecutionState) string {
 	originalMessage = strings.TrimSpace(originalMessage)
 	if originalMessage == "" {
 		originalMessage = "请继续完成用户任务"
 	}
 
 	var b strings.Builder
+	prefix := strings.TrimSpace(constraintPrefix)
+	if prefix != "" {
+		b.WriteString("以下系统约束在本轮继续生效：\n")
+		b.WriteString(prefix)
+		b.WriteString("\n\n")
+	}
+
+	if state != nil {
+		if goal := strings.TrimSpace(state.goal); goal != "" {
+			b.WriteString(fmt.Sprintf("执行目标：%s\n", goal))
+		}
+		if state.plan != nil && len(state.plan.Steps) > 0 {
+			b.WriteString("执行计划：\n")
+			for _, step := range state.plan.Steps {
+				status := strings.TrimSpace(step.Status)
+				if status == "" {
+					status = planStepPending
+				}
+				b.WriteString(fmt.Sprintf("- 步骤 %d [%s] %s", step.ID, status, strings.TrimSpace(step.Description)))
+				if v := strings.TrimSpace(step.ExpectedTool); v != "" {
+					b.WriteString(fmt.Sprintf("（预期工具：%s）", v))
+				}
+				if v := strings.TrimSpace(step.SuccessCriterion); v != "" {
+					b.WriteString(fmt.Sprintf("；成功判据：%s", v))
+				}
+				if v := strings.TrimSpace(step.Result); v != "" {
+					b.WriteString(fmt.Sprintf("，结果：%s", v))
+				}
+				b.WriteString("\n")
+			}
+			if next := state.NextPendingPlanStep(); next != nil {
+				b.WriteString(fmt.Sprintf("当前待推进步骤：%d. %s\n", next.ID, strings.TrimSpace(next.Description)))
+				if len(next.FailedAttempts) > 0 {
+					b.WriteString(fmt.Sprintf("⚠ 步骤%d已失败 %d 次，请勿重复以下操作：\n", next.ID, len(next.FailedAttempts)))
+					start := 0
+					if len(next.FailedAttempts) > 5 {
+						start = len(next.FailedAttempts) - 5
+					}
+					for _, attempt := range next.FailedAttempts[start:] {
+						b.WriteString(fmt.Sprintf("- Round%d 调用 %s -> 失败：%s\n", attempt.Round, strings.TrimSpace(attempt.Tool), summarizePlainText(strings.TrimSpace(attempt.Error), 160)))
+					}
+					b.WriteString("请改变策略，尝试不同工具或参数。\n")
+				}
+			}
+			if reason := strings.TrimSpace(state.plan.BlockedReason); reason != "" {
+				b.WriteString(fmt.Sprintf("🚫 计划阻塞：%s\n", reason))
+				b.WriteString("请重新分析当前图结构，制定新修复策略。\n")
+			}
+		}
+		if len(state.recentActions) > 0 {
+			b.WriteString("已执行动作（已有结果，除非输入条件变化请勿重复）：\n")
+			for i, action := range state.recentActions {
+				b.WriteString(fmt.Sprintf("%d. %s\n", i+1, action))
+			}
+		}
+		if len(state.knownFacts) > 0 {
+			b.WriteString("已知关键事实：\n")
+			for i, fact := range state.knownFacts {
+				b.WriteString(fmt.Sprintf("%d. %s\n", i+1, fact))
+			}
+		}
+		b.WriteString("\n")
+	}
 	b.WriteString(fmt.Sprintf("原始用户目标：%s\n", originalMessage))
 	b.WriteString(fmt.Sprintf("当前是第 %d 轮工具执行后的结果：\n", round))
 	if len(summaries) == 0 {
@@ -2268,7 +2709,8 @@ func buildToolContinuationPrompt(originalMessage string, round int, summaries []
 		}
 	}
 	b.WriteString("请基于以上结果决定下一步：\n")
-	b.WriteString("1) 若仍需结构化图编辑，请继续调用合适工具；\n")
-	b.WriteString("2) 若任务已完成或无可执行工具，请直接给出最终自然语言答复。")
+	b.WriteString("1) 若仍需结构化图编辑，请推进到尚未完成的新步骤；\n")
+	b.WriteString("2) 若计划步骤均已完成或本轮无新增信息，请直接给出最终自然语言答复；\n")
+	b.WriteString("3) 不要重复调用已执行且参数相同的工具。")
 	return b.String()
 }

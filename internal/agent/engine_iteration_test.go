@@ -254,6 +254,77 @@ func TestBuildToolCallResultEvent_HasSchemaVersion(t *testing.T) {
 	}
 }
 
+func TestBuildToolContinuationPrompt_ContainsConstraintsAndExecutionState(t *testing.T) {
+	state := newRoundExecutionState("修复故障树结构")
+	state.RecordRound(
+		[]string{"validate_fta_constraints: issueCount=2", "发现循环边 q1_edge-9"},
+		[]ai.ToolCall{
+			{ID: "c1", Name: "validate_fta_constraints", Arguments: json.RawMessage(`{}`)},
+			{ID: "c2", Name: "get_node_detail", Arguments: json.RawMessage(`{"nodeId":"q1_N008"}`)},
+		},
+	)
+
+	prompt := buildToolContinuationPrompt(
+		"请修复当前故障树",
+		2,
+		[]string{"get_subtree 成功，节点=4，边=3"},
+		"系统约束：当前会话为只读模式，仅允许分析与只读工具，禁止执行结构写操作。",
+		state,
+	)
+
+	checks := []string{
+		"以下系统约束在本轮继续生效",
+		"执行目标：修复故障树结构",
+		"已执行动作（已有结果，除非输入条件变化请勿重复）",
+		"已知关键事实",
+		"不要重复调用已执行且参数相同的工具",
+	}
+	for _, check := range checks {
+		if !strings.Contains(prompt, check) {
+			t.Fatalf("expected continuation prompt to contain %q, got: %s", check, prompt)
+		}
+	}
+}
+
+func TestBuildToolContinuationPrompt_ContainsFailedAttemptsAndBlockedReason(t *testing.T) {
+	state := newRoundExecutionState("修复故障树结构")
+	state.SetPlan(&executionPlan{
+		Goal: "修复故障树结构",
+		Steps: []executionPlanStep{{
+			ID:           1,
+			Description:  "修复循环边",
+			ExpectedTool: "batch_operations",
+			Status:       planStepPending,
+			FailedAttempts: []failedAttempt{
+				{Round: 3, Tool: "add_gate", Error: "edge does not exist, cannot rewire"},
+				{Round: 4, Tool: "batch_operations", Error: "non-gate parent can only attach gate nodes"},
+			},
+		}},
+		BlockedReason: "步骤1连续失败2次，最后错误：non-gate parent can only attach gate nodes",
+	})
+
+	prompt := buildToolContinuationPrompt(
+		"请修复当前故障树",
+		5,
+		[]string{"validate_fta_constraints: issueCount=1"},
+		"",
+		state,
+	)
+
+	checks := []string{
+		"已失败 2 次",
+		"add_gate",
+		"batch_operations",
+		"计划阻塞",
+		"请改变策略",
+	}
+	for _, check := range checks {
+		if !strings.Contains(prompt, check) {
+			t.Fatalf("expected continuation prompt to contain %q, got: %s", check, prompt)
+		}
+	}
+}
+
 func TestToPersistedAIChatMessage_AssistantWithToolCalls(t *testing.T) {
 	history := ai.ChatHistoryMessage{
 		Role:             "assistant",

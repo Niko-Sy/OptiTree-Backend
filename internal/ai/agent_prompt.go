@@ -5,12 +5,33 @@ import (
 	"strings"
 )
 
+func buildAgentSystemPrompt(req AgentChatRequest, graphTypeName string) string {
+	switch strings.ToLower(strings.TrimSpace(req.PromptVersion)) {
+	case "v3":
+		return buildAgentSystemPromptV3(req, graphTypeName)
+	case "", "v2":
+		return buildAgentSystemPromptV2(req, graphTypeName)
+	default:
+		return buildAgentSystemPromptV2(req, graphTypeName)
+	}
+}
+
 func buildAgentSystemPromptV2(req AgentChatRequest, graphTypeName string) string {
 	parts := []string{baseSystemPrompt(req.GraphType, graphTypeName)}
 	if strings.EqualFold(strings.TrimSpace(req.GraphType), "faultTree") {
 		parts = append(parts, faultTreeDomainRulesCompact())
 	}
 	parts = append(parts, runtimeToolPolicy(req.ToolGuide, req.ReadOnly))
+	return strings.Join(parts, "\n\n")
+}
+
+func buildAgentSystemPromptV3(req AgentChatRequest, graphTypeName string) string {
+	parts := []string{baseSystemPrompt(req.GraphType, graphTypeName)}
+	if strings.EqualFold(strings.TrimSpace(req.GraphType), "faultTree") {
+		parts = append(parts, faultTreeDomainRulesCompact())
+	}
+	parts = append(parts, runtimeToolPolicy(req.ToolGuide, req.ReadOnly))
+	parts = append(parts, executionDiscipline())
 	return strings.Join(parts, "\n\n")
 }
 
@@ -36,8 +57,18 @@ func faultTreeDomainRulesCompact() string {
 	return `Fault tree rules:
 - Top Event: one root-level system failure; it should not be a child.
 - Intermediate Event: decomposable failure state.
-- Basic Event: leaf/root cause; it should not have children.
+- Basic Event: leaf/root cause; it must NOT have children.
 - Gate: AND means all inputs are required, OR means any input is sufficient, NOT means negated single input.
+- AND/OR gates require at least 2 children; NOT gate requires exactly 1 child.
+
+Tool operation constraints (CRITICAL):
+- add_gate(parentId, childIds, gateType) rewires existing parent->child edges only.
+  The edge parentId->childId MUST already exist; do not use add_gate to create a brand-new parent-child connection.
+- There is no dedicated edge deletion tool in runtime tools.
+  To remove a wrong relation, use move_node to relocate a node, or delete/recreate the wrong node.
+- move_node(nodeId, newParentId) changes parent relation; avoid cycles and invalid parent choices.
+- add_node(parentId, ...) should be attached under a valid gate-like parent in fault-tree mutation flow.
+- For reversed relations or cycle fixes, prefer: validate/analyze -> batch_operations fix -> validate again.
 - Prefer specific, observable engineering labels; avoid vague or duplicate causes.`
 }
 
@@ -59,4 +90,12 @@ func runtimeToolPolicy(toolGuide string, readOnly bool) string {
 
 Runtime Tool Guide:
 %s`, mode, guide)
+}
+
+func executionDiscipline() string {
+	return `Execution discipline:
+- Follow the current plan and round evidence; do not restart reasoning from scratch every round.
+- Execute at most one unresolved step per round and prefer the smallest useful tool call set.
+- If the same tool with the same arguments already produced a result, do not call it again unless the graph context changed.
+- If no tool call can advance the task, stop tool calls and provide the final answer directly.`
 }

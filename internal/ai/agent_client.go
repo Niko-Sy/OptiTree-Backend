@@ -409,7 +409,7 @@ func buildAgentMessages(req AgentChatRequest) []oaiMsg {
 
 	fullContextJSON, contextMode := buildAgentFullContextJSON(req.GraphType, req.ContextData, req.Message, req.FullContextThreshold)
 	schemaHint := graphSchemaHint(req.GraphType)
-	sys := buildAgentSystemPromptV2(req, graphTypeName)
+	sys := buildAgentSystemPrompt(req, graphTypeName)
 	usr := buildUserPrompt(req.GraphType, schemaHint, contextMode, fullContextJSON, req.Message)
 
 	messages := []oaiMsg{{Role: "system", Content: sys}}

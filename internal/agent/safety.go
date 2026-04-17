@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -26,6 +27,11 @@ type callFingerprint struct {
 	GateType string
 }
 
+type ToolCallWarning struct {
+	Code    string
+	Message string
+}
+
 // SafetyController enforces runtime limits for one agent session.
 type SafetyController struct {
 	cfg config.AgentConfig
@@ -35,6 +41,7 @@ type SafetyController struct {
 	roundCalls    map[string]map[string]int
 	historyCalls  map[string][]callFingerprint
 	nodeMutations map[string]int
+	loopWarnings  map[string]map[string]int
 }
 
 func NewSafetyController(cfg config.AgentConfig) *SafetyController {
@@ -44,6 +51,7 @@ func NewSafetyController(cfg config.AgentConfig) *SafetyController {
 		roundCalls:    make(map[string]map[string]int),
 		historyCalls:  make(map[string][]callFingerprint),
 		nodeMutations: make(map[string]int),
+		loopWarnings:  make(map[string]map[string]int),
 	}
 }
 
@@ -77,22 +85,27 @@ func (c *SafetyController) CheckRoundWithLimit(round int, roundLimit int) error 
 }
 
 func (c *SafetyController) CheckToolCall(session *AgentSession, call ai.ToolCall, estimatedNodeMutations int) error {
+	_, err := c.CheckToolCallWithWarning(session, call, estimatedNodeMutations)
+	return err
+}
+
+func (c *SafetyController) CheckToolCallWithWarning(session *AgentSession, call ai.ToolCall, estimatedNodeMutations int) (*ToolCallWarning, error) {
 	if session == nil {
-		return ErrAgentSessionInactive
+		return nil, ErrAgentSessionInactive
 	}
 
 	state := session.State()
 	if state == StateCancelled || state == StateDone {
-		return ErrAgentSessionInactive
+		return nil, ErrAgentSessionInactive
 	}
 
 	if c.cfg.MaxToolCalls > 0 && session.ToolCallCount() >= c.cfg.MaxToolCalls {
-		return ErrAgentMaxToolCalls
+		return nil, ErrAgentMaxToolCalls
 	}
 
 	sessionID := strings.TrimSpace(session.ID)
 	if sessionID == "" {
-		return ErrAgentSessionInactive
+		return nil, ErrAgentSessionInactive
 	}
 	kind := classifyToolKind(call.Name)
 
@@ -105,25 +118,12 @@ func (c *SafetyController) CheckToolCall(session *AgentSession, call ai.ToolCall
 		}
 		used := c.roundCalls[sessionID][kind]
 		if used >= c.cfg.ToolCallRateLimit {
-			return ErrAgentRateLimited
+			return nil, ErrAgentRateLimited
 		}
 		c.roundCalls[sessionID][kind] = used + 1
 	}
 
-	fingerprint := callFingerprint{
-		ToolName: strings.TrimSpace(call.Name),
-		ArgsHash: normalizeArgsHash(call.Arguments),
-	}
-	if strings.EqualFold(strings.TrimSpace(call.Name), "update_gate") {
-		var gateArgs struct {
-			NodeID   string `json:"nodeId"`
-			GateType string `json:"gateType"`
-		}
-		if err := json.Unmarshal(call.Arguments, &gateArgs); err == nil {
-			fingerprint.NodeID = strings.TrimSpace(gateArgs.NodeID)
-			fingerprint.GateType = strings.ToUpper(strings.TrimSpace(gateArgs.GateType))
-		}
-	}
+	fingerprint := callFingerprintFromToolCall(call)
 	if fingerprint.ToolName == "" {
 		fingerprint.ToolName = "unknown"
 	}
@@ -135,12 +135,21 @@ func (c *SafetyController) CheckToolCall(session *AgentSession, call ai.ToolCall
 	}
 	c.historyCalls[sessionID] = history
 
+	if c.cfg.EnableLoopSoftWarning {
+		if warning := c.buildEarlyDuplicateWarning(sessionID, call, history); warning != nil {
+			return warning, nil
+		}
+	}
+
 	if len(history) >= 3 {
 		a := history[len(history)-1]
 		b := history[len(history)-2]
 		d := history[len(history)-3]
 		if a == b && b == d {
-			return ErrAgentLoopDetected
+			if c.cfg.EnableLoopSoftWarning && c.consumeLoopWarningToken(sessionID, loopWarningKeyForFingerprint(a)) {
+				return &ToolCallWarning{Code: "loop_warning", Message: formatLoopWarningMessage(call.Name)}, nil
+			}
+			return nil, ErrAgentLoopDetected
 		}
 	}
 	if len(history) >= 4 {
@@ -148,26 +157,53 @@ func (c *SafetyController) CheckToolCall(session *AgentSession, call ai.ToolCall
 		b := history[len(history)-2]
 		c2 := history[len(history)-3]
 		d := history[len(history)-4]
-		if a == c2 && b == d {
-			return ErrAgentLoopDetected
+		if isGenericABABLoop(d, c2, b, a) {
+			if c.cfg.EnableLoopSoftWarning && c.consumeLoopWarningToken(sessionID, loopWarningKeyForPattern("abab", d, c2, b, a)) {
+				return &ToolCallWarning{Code: "loop_warning", Message: formatLoopWarningMessage(call.Name)}, nil
+			}
+			return nil, ErrAgentLoopDetected
 		}
 		if isReadValidateAlternatingLoop(d, c2, b, a) {
-			return ErrAgentLoopDetected
+			if c.cfg.EnableLoopSoftWarning && c.consumeLoopWarningToken(sessionID, loopWarningKeyForPattern("read_validate", d, c2, b, a)) {
+				return &ToolCallWarning{Code: "loop_warning", Message: formatLoopWarningMessage(call.Name)}, nil
+			}
+			return nil, ErrAgentLoopDetected
 		}
 		if isGateTypeToggleLoop(d, c2, b, a) {
-			return ErrAgentLoopDetected
+			if c.cfg.EnableLoopSoftWarning && c.consumeLoopWarningToken(sessionID, loopWarningKeyForPattern("gate_toggle", d, c2, b, a)) {
+				return &ToolCallWarning{Code: "loop_warning", Message: formatLoopWarningMessage(call.Name)}, nil
+			}
+			return nil, ErrAgentLoopDetected
 		}
 	}
 
 	if estimatedNodeMutations > 0 && c.cfg.MaxNodesPerSession > 0 {
 		next := c.nodeMutations[sessionID] + estimatedNodeMutations
 		if next > c.cfg.MaxNodesPerSession {
-			return ErrAgentNodeLimitExceeded
+			return nil, ErrAgentNodeLimitExceeded
 		}
 		c.nodeMutations[sessionID] = next
 	}
 
-	return nil
+	return nil, nil
+}
+
+func isGenericABABLoop(a, b, c, d callFingerprint) bool {
+	if !(a == c && b == d) {
+		return false
+	}
+
+	k1 := classifyToolKind(a.ToolName)
+	k2 := classifyToolKind(b.ToolName)
+	// Allow read/validate repetitions to be decided by the dedicated, stricter rule.
+	if isReadOrValidateKind(k1) && isReadOrValidateKind(k2) {
+		return false
+	}
+	return true
+}
+
+func isReadOrValidateKind(kind string) bool {
+	return kind == "read" || kind == "validate"
 }
 
 func (c *SafetyController) RecordMutation(sessionID string, changedNodes int) error {
@@ -200,6 +236,79 @@ func (c *SafetyController) ClearSession(sessionID string) {
 	delete(c.roundCalls, sessionID)
 	delete(c.historyCalls, sessionID)
 	delete(c.nodeMutations, sessionID)
+	delete(c.loopWarnings, sessionID)
+}
+
+func callFingerprintFromToolCall(call ai.ToolCall) callFingerprint {
+	fingerprint := callFingerprint{
+		ToolName: strings.TrimSpace(call.Name),
+		ArgsHash: normalizeArgsHash(call.Arguments),
+	}
+	if strings.EqualFold(strings.TrimSpace(call.Name), "update_gate") {
+		var gateArgs struct {
+			NodeID   string `json:"nodeId"`
+			GateType string `json:"gateType"`
+		}
+		if err := json.Unmarshal(call.Arguments, &gateArgs); err == nil {
+			fingerprint.NodeID = strings.TrimSpace(gateArgs.NodeID)
+			fingerprint.GateType = strings.ToUpper(strings.TrimSpace(gateArgs.GateType))
+		}
+	}
+	return fingerprint
+}
+
+func (c *SafetyController) buildEarlyDuplicateWarning(sessionID string, call ai.ToolCall, history []callFingerprint) *ToolCallWarning {
+	if len(history) < 2 {
+		return nil
+	}
+	last := history[len(history)-1]
+	prev := history[len(history)-2]
+	if last != prev {
+		return nil
+	}
+	if !c.consumeLoopWarningToken(sessionID, loopWarningKeyForFingerprint(last)) {
+		return nil
+	}
+	return &ToolCallWarning{Code: "loop_warning", Message: formatLoopWarningMessage(call.Name)}
+}
+
+func (c *SafetyController) consumeLoopWarningToken(sessionID, key string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	key = strings.TrimSpace(key)
+	if sessionID == "" || key == "" {
+		return false
+	}
+	if _, ok := c.loopWarnings[sessionID]; !ok {
+		c.loopWarnings[sessionID] = make(map[string]int)
+	}
+	used := c.loopWarnings[sessionID][key]
+	c.loopWarnings[sessionID][key] = used + 1
+	return used == 0
+}
+
+func loopWarningKeyForFingerprint(fp callFingerprint) string {
+	return fmt.Sprintf("fp:%s", callFingerprintKey(fp))
+}
+
+func loopWarningKeyForPattern(kind string, a, b, c, d callFingerprint) string {
+	return fmt.Sprintf("%s:%s|%s|%s|%s", strings.TrimSpace(kind), callFingerprintKey(a), callFingerprintKey(b), callFingerprintKey(c), callFingerprintKey(d))
+}
+
+func callFingerprintKey(fp callFingerprint) string {
+	return strings.Join([]string{
+		strings.TrimSpace(fp.ToolName),
+		strings.TrimSpace(fp.ArgsHash),
+		strings.TrimSpace(fp.NodeID),
+		strings.TrimSpace(fp.GateType),
+	}, "#")
+}
+
+func formatLoopWarningMessage(toolName string) string {
+	name := strings.TrimSpace(toolName)
+	if name == "" {
+		name = "unknown_tool"
+	}
+	return fmt.Sprintf("detected repetitive call pattern around %s; please switch strategy or proceed to the next unresolved step", name)
 }
 
 func classifyToolKind(toolName string) string {
@@ -217,6 +326,10 @@ func classifyToolKind(toolName string) string {
 }
 
 func isReadValidateAlternatingLoop(a, b, c, d callFingerprint) bool {
+	if !(a == c && b == d) {
+		return false
+	}
+
 	kinds := []string{
 		classifyToolKind(a.ToolName),
 		classifyToolKind(b.ToolName),
@@ -224,7 +337,7 @@ func isReadValidateAlternatingLoop(a, b, c, d callFingerprint) bool {
 		classifyToolKind(d.ToolName),
 	}
 	for _, kind := range kinds {
-		if kind == "mutation" {
+		if kind != "read" && kind != "validate" {
 			return false
 		}
 	}

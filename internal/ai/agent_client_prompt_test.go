@@ -20,13 +20,16 @@ func TestBuildAgentMessages_FaultTreeUsesCompactPromptV2(t *testing.T) {
 		t.Fatalf("expected at least one message")
 	}
 	sys := messages[0].Content
-	if len([]rune(sys)) > 1400 {
+	if len([]rune(sys)) > 2600 {
 		t.Fatalf("expected compact system prompt, got %d chars: %s", len([]rune(sys)), sys)
 	}
 
 	checks := []string{
 		"Top Event",
 		"Basic Event",
+		"Tool operation constraints",
+		"rewires existing parent->child edges only",
+		"There is no dedicated edge deletion tool",
 		"Runtime Tool Guide",
 		"get_graph_snapshot | required=[none]",
 		"read_context -> validate -> mutate -> validate",
@@ -153,5 +156,28 @@ func TestBuildAgentMessages_RespectsFullContextThreshold(t *testing.T) {
 	userMsg := messages[len(messages)-1].Content
 	if !strings.Contains(userMsg, "Context mode: full") {
 		t.Fatalf("expected raised threshold to keep full context, got: %s", userMsg)
+	}
+}
+
+func TestBuildAgentMessages_PromptVersionV3InjectsExecutionDiscipline(t *testing.T) {
+	req := AgentChatRequest{
+		ChatRequest: ChatRequest{
+			GraphType: "faultTree",
+			Message:   "请修复故障树结构",
+		},
+		PromptVersion: "v3",
+		ToolGuide:     "[read_context]\n- get_graph_snapshot | required=[none]",
+	}
+
+	messages := buildAgentMessages(req)
+	if len(messages) < 1 {
+		t.Fatalf("expected at least one message")
+	}
+	sys := messages[0].Content
+	if !strings.Contains(sys, "Execution discipline") {
+		t.Fatalf("expected v3 prompt to include execution discipline, got: %s", sys)
+	}
+	if !strings.Contains(sys, "do not call it again") {
+		t.Fatalf("expected v3 prompt to include anti-repeat instruction, got: %s", sys)
 	}
 }
