@@ -51,7 +51,7 @@ func TestToFaultTreeGraph_MapsNOTGateFromAIResult(t *testing.T) {
 		},
 	}
 
-	nodes, _, err := toFaultTreeGraph(result)
+	nodes, _, err := toFaultTreeGraph(result, faultTreeNodeDefaults{Width: 140, Height: 60})
 	if err != nil {
 		t.Fatalf("toFaultTreeGraph error: %v", err)
 	}

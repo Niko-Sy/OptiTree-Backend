@@ -77,6 +77,32 @@ type AIProviderConfig struct {
 	ModelMaxCompletion  map[string]int `mapstructure:"model_max_completion_tokens"`
 }
 
+// FaultTreeNodeDefaultsConfig holds default field values applied to each AI-generated
+// fault tree node when the AI returns an empty or zero value for that field.
+type FaultTreeNodeDefaultsConfig struct {
+	// Width / Height: default node dimensions in pixels (applied when AI returns 0 or negative).
+	Width  float64 `mapstructure:"width"`
+	Height float64 `mapstructure:"height"`
+
+	// Priority: default node priority (applied when AI returns 0).
+	Priority int `mapstructure:"priority"`
+
+	// ShowProbability: whether to show probability on new nodes by default.
+	ShowProbability bool `mapstructure:"show_probability"`
+
+	// ErrorLevel: default error level string (applied when AI returns empty).
+	// Leave blank to keep the field unset (nil).
+	ErrorLevel string `mapstructure:"error_level"`
+
+	// InvestigateMethod: default investigation method (applied when AI returns empty).
+	// Leave blank to keep the field unset (nil).
+	InvestigateMethod string `mapstructure:"investigate_method"`
+
+	// Description: default description (applied when AI returns empty).
+	// Leave blank to keep the field unset (nil).
+	Description string `mapstructure:"description"`
+}
+
 // AITaskConfig holds queue and callback settings for async AI generation tasks.
 type AITaskConfig struct {
 	Stream         string `mapstructure:"stream"`
@@ -94,6 +120,9 @@ type AITaskConfig struct {
 	ProjectLockTTL      time.Duration `mapstructure:"project_lock_ttl"`
 	CallbackDedupeTTL   time.Duration `mapstructure:"callback_dedupe_ttl"`
 	SnapshotTTL         time.Duration `mapstructure:"snapshot_ttl"`
+
+	// NodeDefaults contains per-field default values for AI-generated fault tree nodes.
+	NodeDefaults FaultTreeNodeDefaultsConfig `mapstructure:"node_defaults"`
 }
 
 // AgentConfig controls mixed agent execution behavior.

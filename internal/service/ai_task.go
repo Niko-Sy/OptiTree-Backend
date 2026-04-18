@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"optitree-backend/internal/ai"
+	"optitree-backend/internal/config"
 	"optitree-backend/internal/constant"
 	"optitree-backend/internal/model"
 	"optitree-backend/internal/repository"
@@ -61,6 +62,8 @@ type AITaskService struct {
 	projectLockTTL      time.Duration
 	callbackDedupeTTL   time.Duration
 	snapshotTTL         time.Duration
+
+	ftNodeDefaults config.FaultTreeNodeDefaultsConfig
 
 	dispatcherMu      sync.Mutex
 	dispatcherCtx     context.Context
@@ -131,6 +134,7 @@ func NewAITaskService(
 	projectLockTTL time.Duration,
 	callbackDedupeTTL time.Duration,
 	snapshotTTL time.Duration,
+	nodeDefaults config.FaultTreeNodeDefaultsConfig,
 ) *AITaskService {
 	if strings.TrimSpace(queueStream) == "" {
 		queueStream = "stream:ai:tasks"
@@ -196,6 +200,7 @@ func NewAITaskService(
 		projectLockTTL:      projectLockTTL,
 		callbackDedupeTTL:   callbackDedupeTTL,
 		snapshotTTL:         snapshotTTL,
+		ftNodeDefaults:      nodeDefaults,
 	}
 }
 

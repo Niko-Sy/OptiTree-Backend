@@ -280,6 +280,7 @@ func main() {
 		cfg.AITask.ProjectLockTTL,
 		cfg.AITask.CallbackDedupeTTL,
 		cfg.AITask.SnapshotTTL,
+		cfg.AITask.NodeDefaults,
 	)
 	assistantSvc := service.NewAssistantService(
 		aiConversationRepo,

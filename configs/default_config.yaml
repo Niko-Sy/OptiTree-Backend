@@ -60,6 +60,22 @@ ai_task:
   callback_dedupe_ttl: 24h
   snapshot_ttl: 24h
 
+  # 故障树节点字段默认值：当 AI 返回的对应字段为空或零值时，自动填充以下配置的默认值。
+  node_defaults:
+    # 节点默认宽高（像素），AI 返回 0 或负值时生效
+    width: 140
+    height: 60
+    # 节点默认优先级
+    priority: 0
+    # 是否默认显示概率标签
+    show_probability: false
+    # 默认错误等级（留空则该字段保持 null 不填充）
+    error_level: ""
+    # 默认调查方法（留空则该字段保持 null 不填充）
+    investigate_method: ""
+    # 默认描述（留空则该字段保持 null 不填充）
+    description: ""
+
 agent:
   enabled: false
   max_rounds: 10

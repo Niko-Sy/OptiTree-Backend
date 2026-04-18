@@ -11,11 +11,51 @@ import (
 	"time"
 
 	"optitree-backend/internal/ai"
+	"optitree-backend/internal/config"
 	"optitree-backend/internal/constant"
 	"optitree-backend/internal/model"
 
 	"github.com/lib/pq"
 )
+
+// faultTreeNodeDefaults bundles all per-field fallback values applied when the
+// AI returns zero/empty for a given FaultTreeNode field.
+type faultTreeNodeDefaults struct {
+	Width             float64
+	Height            float64
+	Priority          int
+	ShowProbability   bool
+	ErrorLevel        string
+	InvestigateMethod string
+	Description       string
+	// Documents holds the project's document file_name values used when the AI
+	// returns no documents for a node.
+	Documents []string
+}
+
+// faultTreeNodeDefaultsFrom builds a faultTreeNodeDefaults from config,
+// substituting sensible hard-coded minimums for Width/Height if they are not
+// configured (≤ 0).
+func faultTreeNodeDefaultsFrom(cfg config.FaultTreeNodeDefaultsConfig, docs []string) faultTreeNodeDefaults {
+	w := cfg.Width
+	if w <= 0 {
+		w = 140
+	}
+	h := cfg.Height
+	if h <= 0 {
+		h = 60
+	}
+	return faultTreeNodeDefaults{
+		Width:             w,
+		Height:            h,
+		Priority:          cfg.Priority,
+		ShowProbability:   cfg.ShowProbability,
+		ErrorLevel:        strings.TrimSpace(cfg.ErrorLevel),
+		InvestigateMethod: strings.TrimSpace(cfg.InvestigateMethod),
+		Description:       strings.TrimSpace(cfg.Description),
+		Documents:         docs,
+	}
+}
 
 var (
 	ErrProjectTypeMismatch      = errors.New("项目类型不匹配")
@@ -98,7 +138,19 @@ func (s *AITaskService) publishTaskEvent(evt TaskProgressEvent) {
 }
 
 func (s *AITaskService) saveGeneratedFaultTreeToProject(ctx context.Context, projectID string, result *ai.FaultTreeResult) error {
-	nodes, edges, err := toFaultTreeGraph(result)
+	var docFileNames []string
+	if s.docRepo != nil {
+		if docs, docErr := s.docRepo.FindByProjectID(projectID); docErr == nil {
+			for _, doc := range docs {
+				if name := strings.TrimSpace(doc.FileName); name != "" {
+					docFileNames = append(docFileNames, name)
+				}
+			}
+		}
+	}
+
+	defaults := faultTreeNodeDefaultsFrom(s.ftNodeDefaults, docFileNames)
+	nodes, edges, err := toFaultTreeGraph(result, defaults)
 	if err != nil {
 		return err
 	}
@@ -155,7 +207,7 @@ func (s *AITaskService) saveGeneratedKnowledgeGraphToProject(ctx context.Context
 	return ErrVersionConflict
 }
 
-func toFaultTreeGraph(result *ai.FaultTreeResult) ([]model.FaultTreeNode, []model.FaultTreeEdge, error) {
+func toFaultTreeGraph(result *ai.FaultTreeResult, defaults faultTreeNodeDefaults) ([]model.FaultTreeNode, []model.FaultTreeEdge, error) {
 	if result == nil || len(result.Nodes) == 0 {
 		return nil, nil, ErrAIGenerationResultFormat
 	}
@@ -182,18 +234,29 @@ func toFaultTreeGraph(result *ai.FaultTreeResult) ([]model.FaultTreeNode, []mode
 		}
 
 		x, y := pickXY(raw)
-		width := toFloat(raw["width"], 140)
-		height := toFloat(raw["height"], 60)
+
+		width := toFloat(raw["width"], defaults.Width)
 		if width <= 0 {
-			width = 140
+			width = defaults.Width
 		}
+		height := toFloat(raw["height"], defaults.Height)
 		if height <= 0 {
-			height = 60
+			height = defaults.Height
 		}
 
 		prob := pickFloatPtr(raw["probability"])
 		if prob == nil {
 			prob = pickFloatPtr(data["probability"])
+		}
+
+		// Priority: use AI value when non-zero, otherwise apply config default.
+		priority := int(toFloat(raw["priority"], float64(defaults.Priority)))
+
+		// ShowProbability: prefer AI-supplied value; fall back to config default
+		// only when the AI did not supply the field at all (raw key absent).
+		showProb := defaults.ShowProbability
+		if _, hasSP := raw["showProbability"]; hasSP {
+			showProb = toBool(raw["showProbability"])
 		}
 
 		n := model.FaultTreeNode{
@@ -206,30 +269,51 @@ func toFaultTreeGraph(result *ai.FaultTreeResult) ([]model.FaultTreeNode, []mode
 			Height:          height,
 			Probability:     prob,
 			GateType:        gateType,
-			Priority:        int(toFloat(raw["priority"], 0)),
-			ShowProbability: toBool(raw["showProbability"]),
+			Priority:        priority,
+			ShowProbability: showProb,
 			Documents:       toStringArray(raw["documents"]),
 		}
 
+		// Documents: if AI returned none, fill with project document file names.
 		if len(n.Documents) == 0 {
-			n.Documents = pq.StringArray{}
+			if len(defaults.Documents) > 0 {
+				n.Documents = pq.StringArray(defaults.Documents)
+			} else {
+				n.Documents = pq.StringArray{}
+			}
 		}
 
 		if b, ok := marshalMaybe(raw["rules"], []byte("[]")); ok {
 			n.Rules = b
 		}
+
+		// EventID
 		if v := toString(raw["eventId"]); v != "" {
 			n.EventID = ptr(v)
 		}
+
+		// Description: prefer AI value; fall back to config default.
 		if v := toString(raw["description"]); v != "" {
 			n.Description = ptr(v)
+		} else if defaults.Description != "" {
+			n.Description = ptr(defaults.Description)
 		}
+
+		// ErrorLevel: prefer AI value; fall back to config default.
 		if v := toString(raw["errorLevel"]); v != "" {
 			n.ErrorLevel = ptr(v)
+		} else if defaults.ErrorLevel != "" {
+			n.ErrorLevel = ptr(defaults.ErrorLevel)
 		}
+
+		// InvestigateMethod: prefer AI value; fall back to config default.
 		if v := toString(raw["investigateMethod"]); v != "" {
 			n.InvestigateMethod = ptr(v)
+		} else if defaults.InvestigateMethod != "" {
+			n.InvestigateMethod = ptr(defaults.InvestigateMethod)
 		}
+
+		// Transfer
 		if v := toString(raw["transfer"]); v != "" {
 			n.Transfer = ptr(v)
 		}
