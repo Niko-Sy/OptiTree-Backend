@@ -67,9 +67,10 @@ func (h *AITaskHandler) GetLatestFaultTreeTaskByProject(c *gin.Context) {
 
 // generateFaultTreeRequest is the body for POST /ai/fault-trees/generate.
 type generateFaultTreeRequest struct {
-	DocIDs    []string `json:"docIds" binding:"required,min=1"`
-	TopEvent  string   `json:"topEvent" binding:"required,max=60"`
-	ProjectID *string  `json:"projectId"`
+	DocIDs           []string `json:"docIds" binding:"required,min=1"`
+	TopEvent         string   `json:"topEvent" binding:"required,max=60"`
+	ProjectID        *string  `json:"projectId"`
+	UserRequirements string   `json:"userRequirements"`
 }
 
 // GenerateFaultTree handles POST /ai/fault-trees/generate.
@@ -83,10 +84,11 @@ func (h *AITaskHandler) GenerateFaultTree(c *gin.Context) {
 	}
 	userID := middleware.GetUserID(c)
 	out, err := h.aiTaskService.GenerateFaultTree(c.Request.Context(), service.GenerateFaultTreeInput{
-		DocIDs:    req.DocIDs,
-		TopEvent:  req.TopEvent,
-		ProjectID: req.ProjectID,
-		UserID:    userID,
+		DocIDs:           req.DocIDs,
+		TopEvent:         req.TopEvent,
+		ProjectID:        req.ProjectID,
+		UserID:           userID,
+		UserRequirements: strings.TrimSpace(req.UserRequirements),
 	})
 	if err != nil {
 		switch {
@@ -106,8 +108,9 @@ func (h *AITaskHandler) GenerateFaultTree(c *gin.Context) {
 
 // generateKGRequest is the body for POST /ai/knowledge-graphs/generate.
 type generateKGRequest struct {
-	DocIDs    []string `json:"docIds" binding:"required,min=1"`
-	ProjectID *string  `json:"projectId"`
+	DocIDs           []string `json:"docIds" binding:"required,min=1"`
+	ProjectID        *string  `json:"projectId"`
+	UserRequirements string   `json:"userRequirements"`
 }
 
 // GenerateKnowledgeGraph handles POST /ai/knowledge-graphs/generate.
@@ -120,9 +123,10 @@ func (h *AITaskHandler) GenerateKnowledgeGraph(c *gin.Context) {
 	}
 	userID := middleware.GetUserID(c)
 	out, err := h.aiTaskService.GenerateKnowledgeGraph(c.Request.Context(), service.GenerateKnowledgeGraphInput{
-		DocIDs:    req.DocIDs,
-		ProjectID: req.ProjectID,
-		UserID:    userID,
+		DocIDs:           req.DocIDs,
+		ProjectID:        req.ProjectID,
+		UserID:           userID,
+		UserRequirements: strings.TrimSpace(req.UserRequirements),
 	})
 	if err != nil {
 		switch {

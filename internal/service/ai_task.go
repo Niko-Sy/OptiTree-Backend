@@ -80,17 +80,19 @@ type AITaskQueueDocument struct {
 }
 
 type AITaskQueueMessage struct {
-	TaskID    string                `json:"taskId"`
-	ProjectID string                `json:"projectId"`
-	TaskType  string                `json:"taskType"`
-	UserID    string                `json:"userId"`
-	TopEvent  string                `json:"topEvent,omitempty"`
-	DocIDs    []string              `json:"docIds"`
-	Documents []AITaskQueueDocument `json:"documents"`
-	Config    ai.GenerateConfig     `json:"config"`
-	Attempt   int                   `json:"attempt"`
-	TraceID   string                `json:"traceId,omitempty"`
-	CreatedAt string                `json:"createdAt"`
+	TaskID           string                `json:"taskId"`
+	ProjectID        string                `json:"projectId"`
+	TaskType         string                `json:"taskType"`
+	UserID           string                `json:"userId"`
+	TopEvent         string                `json:"topEvent,omitempty"`
+	DocIDs           []string              `json:"docIds"`
+	Documents        []AITaskQueueDocument `json:"documents"`
+	Config           ai.GenerateConfig     `json:"config"`
+	Attempt          int                   `json:"attempt"`
+	TraceID          string                `json:"traceId,omitempty"`
+	CreatedAt        string                `json:"createdAt"`
+	UserRequirements string                `json:"userRequirements,omitempty"`
+	FileName         string                `json:"filename,omitempty"`
 }
 
 type TaskCallbackInput struct {
@@ -577,11 +579,13 @@ func (s *AITaskService) enqueueTask(ctx context.Context, msg AITaskQueueMessage)
 		MaxLen: s.queueMaxLen,
 		Approx: true,
 		Values: map[string]interface{}{
-			"taskId":    msg.TaskID,
-			"projectId": msg.ProjectID,
-			"taskType":  msg.TaskType,
-			"attempt":   msg.Attempt,
-			"payload":   string(payload),
+			"taskId":           msg.TaskID,
+			"projectId":        msg.ProjectID,
+			"taskType":         msg.TaskType,
+			"attempt":          msg.Attempt,
+			"payload":          string(payload),
+			"userRequirements": msg.UserRequirements,
+			"filename":         msg.FileName,
 		},
 	}).Result()
 	if err != nil {
@@ -602,10 +606,12 @@ func (s *AITaskService) enqueueFaultTreeProducerTask(ctx context.Context, msg AI
 		MaxLen: s.queueMaxLen,
 		Approx: true,
 		Values: map[string]interface{}{
-			"taskId":    msg.TaskID,
-			"projectId": msg.ProjectID,
-			"taskType":  msg.TaskType,
-			"payload":   string(payload),
+			"taskId":           msg.TaskID,
+			"projectId":        msg.ProjectID,
+			"taskType":         msg.TaskType,
+			"payload":          string(payload),
+			"userRequirements": msg.UserRequirements,
+			"filename":         msg.FileName,
 		},
 	}).Result()
 	if err != nil {
@@ -705,10 +711,11 @@ func (s *AITaskService) clearTaskStreamEntries(ctx context.Context, taskID strin
 // Generate Fault Tree
 
 type GenerateFaultTreeInput struct {
-	DocIDs    []string
-	TopEvent  string
-	ProjectID *string
-	UserID    string
+	DocIDs           []string
+	TopEvent         string
+	ProjectID        *string
+	UserID           string
+	UserRequirements string
 }
 
 type GenerateFaultTreeOutput struct {
@@ -761,18 +768,24 @@ func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFau
 		return nil, err
 	}
 
+	fileName := ""
+	if len(documents) > 0 {
+		fileName = documents[0].FileName
+	}
 	message := AITaskQueueMessage{
-		TaskID:    task.ID,
-		ProjectID: projectID,
-		TaskType:  constant.AITaskTypeGenerateFaultTree,
-		UserID:    input.UserID,
-		TopEvent:  input.TopEvent,
-		DocIDs:    effectiveDocIDs,
-		Documents: documents,
-		Config:    cfg,
-		Attempt:   0,
-		TraceID:   task.ID,
-		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		TaskID:           task.ID,
+		ProjectID:        projectID,
+		TaskType:         constant.AITaskTypeGenerateFaultTree,
+		UserID:           input.UserID,
+		TopEvent:         input.TopEvent,
+		DocIDs:           effectiveDocIDs,
+		Documents:        documents,
+		Config:           cfg,
+		Attempt:          0,
+		TraceID:          task.ID,
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339Nano),
+		UserRequirements: input.UserRequirements,
+		FileName:         fileName,
 	}
 	if err := s.enqueueFaultTreeProducerTask(ctx, message); err != nil {
 		_ = s.taskRepo.SetFailed(task.ID, err.Error())
@@ -806,9 +819,10 @@ func (s *AITaskService) GenerateFaultTree(ctx context.Context, input GenerateFau
 // Generate Knowledge Graph
 
 type GenerateKnowledgeGraphInput struct {
-	DocIDs    []string
-	ProjectID *string
-	UserID    string
+	DocIDs           []string
+	ProjectID        *string
+	UserID           string
+	UserRequirements string
 }
 
 type GenerateKnowledgeGraphOutput struct {
@@ -861,17 +875,23 @@ func (s *AITaskService) GenerateKnowledgeGraph(ctx context.Context, input Genera
 		return nil, err
 	}
 
+	kgFileName := ""
+	if len(documents) > 0 {
+		kgFileName = documents[0].FileName
+	}
 	message := AITaskQueueMessage{
-		TaskID:    task.ID,
-		ProjectID: projectID,
-		TaskType:  constant.AITaskTypeGenerateKnowledgeGraph,
-		UserID:    input.UserID,
-		DocIDs:    effectiveDocIDs,
-		Documents: documents,
-		Config:    cfg,
-		Attempt:   0,
-		TraceID:   task.ID,
-		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		TaskID:           task.ID,
+		ProjectID:        projectID,
+		TaskType:         constant.AITaskTypeGenerateKnowledgeGraph,
+		UserID:           input.UserID,
+		DocIDs:           effectiveDocIDs,
+		Documents:        documents,
+		Config:           cfg,
+		Attempt:          0,
+		TraceID:          task.ID,
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339Nano),
+		UserRequirements: input.UserRequirements,
+		FileName:         kgFileName,
 	}
 	if err := s.enqueueTask(ctx, message); err != nil {
 		_ = s.taskRepo.SetFailed(task.ID, err.Error())
