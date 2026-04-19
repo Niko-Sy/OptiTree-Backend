@@ -147,6 +147,10 @@ Hard rules:
 - Use concise Chinese for goal/description/purpose.
 - Every step must include successCriterion.
 - Do not include trailing commas or comments in JSON.
+- Mutation steps must be concrete and executable, not abstract labels.
+- BAD step example: "执行最小必要结构修复".
+- GOOD step example: "move_node(q1_N009,newParentId=q1_N005) 将 basicEvent 的子节点迁移到中间事件".
+- Each mutation step should include target node IDs and expected structural change.
 
 CRITICAL fault-tree tool constraints:
 - add_gate(parentId, childIds, gateType) rewires EXISTING parent->child edges only. Do not use it to create a new connection.
@@ -241,7 +245,7 @@ func buildFallbackExecutionPlan(goal string, readOnly bool) *executionPlan {
 	} else {
 		steps = []executionPlanStep{
 			{ID: 1, Description: "读取上下文并确认目标差异", ExpectedTool: "get_node_detail", Purpose: "避免盲改", SuccessCriterion: "明确待修复节点和边关系", Status: planStepPending},
-			{ID: 2, Description: "执行最小必要结构修复", ExpectedTool: "batch_operations", Purpose: "推进核心目标", SuccessCriterion: "修复操作执行成功且 patch 有效", Status: planStepPending},
+			{ID: 2, Description: "按问题节点执行结构修复（优先 move_node，复杂场景用 batch_operations）", ExpectedTool: "batch_operations", Purpose: "推进核心目标", SuccessCriterion: "修复操作执行成功且 patch 有效", Status: planStepPending},
 			{ID: 3, Description: "复核约束并收敛答复", ExpectedTool: "validate_fta_constraints", Purpose: "确认结果可用", SuccessCriterion: "校验无阻塞问题并可给出结论", Status: planStepPending},
 		}
 	}

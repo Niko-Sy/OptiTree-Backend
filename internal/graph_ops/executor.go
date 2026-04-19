@@ -1553,12 +1553,14 @@ func (e *Executor) applyValidateFTAConstraints(state *faultTreeState) (*operatio
 	topEvents := collectTopEventIDs(state.nodes)
 
 	payload := map[string]interface{}{
-		"tool":        "validate_fta_constraints",
-		"nodeCount":   len(state.nodes),
-		"edgeCount":   len(state.edges),
-		"topEventIds": topEvents,
-		"issueCount":  len(issues),
-		"issues":      toIssuePayload(issues),
+		"tool":            "validate_fta_constraints",
+		"nodeCount":       len(state.nodes),
+		"edgeCount":       len(state.edges),
+		"topEventIds":     topEvents,
+		"issueCount":      len(issues),
+		"issueCodes":      collectIssueCodesFromIssues(issues),
+		"affectedNodeIds": collectAffectedNodeIDsFromIssues(issues),
+		"issues":          toIssuePayload(issues),
 	}
 
 	return &operationResult{summary: encodeReadToolPayload(payload), patch: GraphPatch{}, changedNodes: 0}, nil
@@ -1739,14 +1741,91 @@ func collectTopEventIDs(nodes []model.FaultTreeNode) []string {
 func toIssuePayload(issues []ftaConstraintIssue) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(issues))
 	for _, issue := range issues {
+		suggestion := suggestionForConstraintIssueCode(issue.Code)
 		out = append(out, map[string]interface{}{
-			"nodeId":  issue.NodeID,
-			"level":   issue.Level,
-			"code":    issue.Code,
-			"message": issue.Message,
+			"nodeId":     issue.NodeID,
+			"level":      issue.Level,
+			"code":       issue.Code,
+			"message":    issue.Message,
+			"suggestion": suggestion,
 		})
 	}
 	return out
+}
+
+func collectIssueCodesFromIssues(issues []ftaConstraintIssue) []string {
+	if len(issues) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(issues))
+	out := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		code := strings.TrimSpace(issue.Code)
+		if code == "" {
+			continue
+		}
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		out = append(out, code)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return out
+}
+
+func collectAffectedNodeIDsFromIssues(issues []ftaConstraintIssue) []string {
+	if len(issues) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(issues))
+	out := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		nodeID := strings.TrimSpace(issue.NodeID)
+		if nodeID == "" {
+			continue
+		}
+		if _, ok := seen[nodeID]; ok {
+			continue
+		}
+		seen[nodeID] = struct{}{}
+		out = append(out, nodeID)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return out
+}
+
+func suggestionForConstraintIssueCode(code string) string {
+	switch strings.ToUpper(strings.TrimSpace(code)) {
+	case "BASIC_EVENT_AS_PARENT":
+		return "basicEvent 不应作为父节点。可将其子节点 move_node 到合适 gate/midEvent，或在其上方 add_gate 重构。"
+	case "BASIC_EVENT_HAS_CHILDREN":
+		return "basicEvent 不应有子节点。可通过 move_node 迁移子节点。"
+	case "GATE_CHILD_COUNT_TOO_LOW":
+		return "AND/OR gate 子节点不足。可 add_node 增加子节点，或 update_gate 调整门类型。"
+	case "NOT_GATE_CHILD_COUNT_TOO_HIGH":
+		return "NOT gate 只能保留 1 个子节点。请 move_node 迁移多余子节点。"
+	case "TOP_EVENT_AS_CHILD":
+		return "Top Event 不应作为子节点。请重组父子关系使其成为根节点。"
+	case "TOP_EVENT_NOT_ROOT":
+		return "Top Event 应保持入度为 0。请移除或重构其父连接。"
+	case "MULTIPLE_TOP_EVENTS":
+		return "应仅保留一个 Top Event。请将多余节点改为 midEvent 或删除。"
+	case "MISSING_TOP_EVENT":
+		return "缺少 Top Event。请补充根节点或将合适节点设为 topEvent。"
+	case "CYCLE_DETECTED":
+		return "检测到有向环。请通过 move_node/delete_node 打断循环路径。"
+	case "EDGE_SOURCE_NOT_FOUND", "EDGE_TARGET_NOT_FOUND", "EDGE_NODE_ID_EMPTY":
+		return "存在无效边。请删除无效连接或重建正确边关系。"
+	default:
+		return "请依据 issue code 选择最小必要的 mutation 工具进行修复。"
+	}
 }
 
 func isBlockingMutationIssue(issue ftaConstraintIssue) bool {

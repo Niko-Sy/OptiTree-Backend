@@ -49,6 +49,14 @@ type faultTreeRuntimeSnapshot struct {
 	revision int
 }
 
+type repairIssueEntry struct {
+	Code       string `json:"code"`
+	NodeID     string `json:"nodeId,omitempty"`
+	Level      string `json:"level,omitempty"`
+	Message    string `json:"message,omitempty"`
+	Suggestion string `json:"suggestion,omitempty"`
+}
+
 type roundExecutionState struct {
 	goal          string
 	knownFacts    []string
@@ -57,6 +65,9 @@ type roundExecutionState struct {
 	seenActions   map[string]struct{}
 	plan          *executionPlan
 	replanCount   int
+	repairGuide   []repairIssueEntry
+	readCount     int
+	mutationCount int
 }
 
 type AgentRunInput struct {
@@ -1098,7 +1109,6 @@ func (s *AgentService) executeRoundToolCalls(
 				}
 				followSummary = s.compactToolObservationText(followCall.Name, followStatus, followCall.Name+"(auto): "+followSummary, followOutcome.Patch, "")
 				summaries = append(summaries, followSummary)
-				toolResults = append(toolResults, buildToolResultHistoryMessage(followCall.ID, followCall.Name, followStatus, followSummary, followOutcome.Patch, ""))
 			}
 		}
 	}
@@ -1456,16 +1466,17 @@ type toolDispatchOutcome struct {
 }
 
 type ToolObservationSummary struct {
-	Tool            string         `json:"tool"`
-	Status          string         `json:"status"`
-	NodeCount       int            `json:"nodeCount,omitempty"`
-	EdgeCount       int            `json:"edgeCount,omitempty"`
-	IssueCount      int            `json:"issueCount,omitempty"`
-	IssueCodes      []string       `json:"issueCodes,omitempty"`
-	AffectedNodeIDs []string       `json:"affectedNodeIds,omitempty"`
-	ChangedCounts   map[string]int `json:"changedCounts,omitempty"`
-	Error           string         `json:"error,omitempty"`
-	Summary         string         `json:"summary,omitempty"`
+	Tool            string             `json:"tool"`
+	Status          string             `json:"status"`
+	NodeCount       int                `json:"nodeCount,omitempty"`
+	EdgeCount       int                `json:"edgeCount,omitempty"`
+	IssueCount      int                `json:"issueCount,omitempty"`
+	IssueCodes      []string           `json:"issueCodes,omitempty"`
+	Issues          []repairIssueEntry `json:"issues,omitempty"`
+	AffectedNodeIDs []string           `json:"affectedNodeIds,omitempty"`
+	ChangedCounts   map[string]int     `json:"changedCounts,omitempty"`
+	Error           string             `json:"error,omitempty"`
+	Summary         string             `json:"summary,omitempty"`
 }
 
 func normalizeToolFinalStatus(status string) string {
@@ -1698,7 +1709,20 @@ func buildToolObservationSummary(toolName, status, summary string, patch *graph_
 	if observation.IssueCount == 0 {
 		observation.IssueCount = lenFromAny(payload["issues"])
 	}
+	observation.Issues = repairIssuesFromAny(payload["issues"], 6)
+	if len(observation.Issues) > 0 && observation.IssueCount == 0 {
+		observation.IssueCount = len(observation.Issues)
+	}
 	observation.IssueCodes = issueCodesFromPayload(payload["issues"])
+	if len(observation.IssueCodes) == 0 && len(observation.Issues) > 0 {
+		codes := make([]string, 0, len(observation.Issues))
+		for _, issue := range observation.Issues {
+			if v := strings.TrimSpace(issue.Code); v != "" {
+				codes = append(codes, v)
+			}
+		}
+		observation.IssueCodes = limitStrings(uniqueStrings(codes), 12)
+	}
 	if observation.Summary == "" {
 		if v, ok := payload["summary"].(string); ok {
 			observation.Summary = summarizePlainText(v, 280)
@@ -1750,6 +1774,54 @@ func issueCodesFromPayload(v interface{}) []string {
 		}
 	}
 	return limitStrings(uniqueStrings(codes), 12)
+}
+
+func repairIssuesFromAny(v interface{}, maxCount int) []repairIssueEntry {
+	items, ok := v.([]interface{})
+	if !ok || len(items) == 0 {
+		return nil
+	}
+
+	out := make([]repairIssueEntry, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		obj, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		entry := repairIssueEntry{
+			Code:       strings.TrimSpace(localAnyToString(obj["code"])),
+			NodeID:     strings.TrimSpace(localAnyToString(obj["nodeId"])),
+			Level:      strings.TrimSpace(localAnyToString(obj["level"])),
+			Message:    strings.TrimSpace(localAnyToString(obj["message"])),
+			Suggestion: strings.TrimSpace(localAnyToString(obj["suggestion"])),
+		}
+		if entry.Code == "" {
+			continue
+		}
+		if entry.Suggestion == "" {
+			entry.Suggestion = repairSuggestionForCode(entry.Code)
+		}
+		if len([]rune(entry.Message)) > 120 {
+			entry.Message = string([]rune(entry.Message)[:120]) + "..."
+		}
+
+		key := entry.Code + "#" + entry.NodeID
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, entry)
+		if maxCount > 0 && len(out) >= maxCount {
+			break
+		}
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func affectedNodeIDsFromPayload(payload map[string]interface{}) []string {
@@ -2313,6 +2385,7 @@ func newRoundExecutionState(goal string) *roundExecutionState {
 		recentActions: make([]string, 0, 12),
 		seenFacts:     make(map[string]struct{}),
 		seenActions:   make(map[string]struct{}),
+		repairGuide:   make([]repairIssueEntry, 0, 12),
 	}
 }
 
@@ -2354,6 +2427,7 @@ func (s *roundExecutionState) RecordRound(summaries []string, toolCalls []ai.Too
 		if fact == "" {
 			continue
 		}
+		s.parseRepairGuideFromSummary(fact)
 		if _, exists := s.seenFacts[fact]; exists {
 			continue
 		}
@@ -2367,6 +2441,13 @@ func (s *roundExecutionState) RecordRound(summaries []string, toolCalls []ai.Too
 	}
 
 	for _, call := range toolCalls {
+		kind := classifyToolKind(call.Name)
+		switch kind {
+		case "read", "validate":
+			s.readCount++
+		case "mutation":
+			s.mutationCount++
+		}
 		action := summarizeToolCallAction(call)
 		if action == "" {
 			continue
@@ -2382,6 +2463,177 @@ func (s *roundExecutionState) RecordRound(summaries []string, toolCalls []ai.Too
 			delete(s.seenActions, drop)
 		}
 	}
+}
+
+func (s *roundExecutionState) HasExcessiveReadWithoutMutation() bool {
+	if s == nil {
+		return false
+	}
+	return s.readCount >= 3 && s.mutationCount == 0
+}
+
+func localAnyToString(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return strings.TrimSpace(t)
+	case nil:
+		return ""
+	case fmt.Stringer:
+		return strings.TrimSpace(t.String())
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return strings.Trim(strings.TrimSpace(string(b)), "\"")
+	}
+}
+
+func (s *roundExecutionState) parseRepairGuideFromSummary(summary string) {
+	if s == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(summary)
+	if trimmed == "" || !json.Valid([]byte(trimmed)) {
+		return
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
+		return
+	}
+
+	toolName := strings.ToLower(strings.TrimSpace(localAnyToString(payload["tool"])))
+	if toolName != "validate_fta_constraints" {
+		return
+	}
+
+	entries := repairIssuesFromAny(payload["issues"], 12)
+	if len(entries) == 0 {
+		issueCodes := stringSliceFromAny(payload["issueCodes"])
+		affectedIDs := stringSliceFromAny(payload["affectedNodeIds"])
+		fallback := make([]repairIssueEntry, 0, len(issueCodes))
+		for _, code := range issueCodes {
+			entry := repairIssueEntry{Code: strings.TrimSpace(code)}
+			if len(affectedIDs) > 0 {
+				entry.NodeID = strings.TrimSpace(affectedIDs[0])
+			}
+			entry.Suggestion = repairSuggestionForCode(entry.Code)
+			fallback = append(fallback, entry)
+		}
+		entries = fallback
+	}
+	s.appendRepairGuideEntries(entries)
+}
+
+func (s *roundExecutionState) appendRepairGuideEntries(entries []repairIssueEntry) {
+	if s == nil || len(entries) == 0 {
+		return
+	}
+
+	seen := make(map[string]struct{}, len(s.repairGuide)+len(entries))
+	for _, existing := range s.repairGuide {
+		key := strings.TrimSpace(existing.Code) + "#" + strings.TrimSpace(existing.NodeID)
+		if key == "#" {
+			continue
+		}
+		seen[key] = struct{}{}
+	}
+
+	for _, entry := range entries {
+		entry.Code = strings.TrimSpace(entry.Code)
+		entry.NodeID = strings.TrimSpace(entry.NodeID)
+		entry.Level = strings.TrimSpace(entry.Level)
+		entry.Message = strings.TrimSpace(entry.Message)
+		entry.Suggestion = strings.TrimSpace(entry.Suggestion)
+		if entry.Code == "" {
+			continue
+		}
+		if entry.Suggestion == "" {
+			entry.Suggestion = repairSuggestionForCode(entry.Code)
+		}
+
+		key := entry.Code + "#" + entry.NodeID
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		s.repairGuide = append(s.repairGuide, entry)
+	}
+
+	if len(s.repairGuide) > 12 {
+		s.repairGuide = s.repairGuide[len(s.repairGuide)-12:]
+	}
+}
+
+func repairSuggestionForCode(code string) string {
+	switch strings.ToUpper(strings.TrimSpace(code)) {
+	case "BASIC_EVENT_AS_PARENT":
+		return "basicEvent不应作为父节点。使用move_node将其子节点移到合适的gate/midEvent下，或在basicEvent上方插入gate节点（add_gate）"
+	case "BASIC_EVENT_HAS_CHILDREN":
+		return "basicEvent不应有子节点。使用move_node将子节点移到同层gate或midEvent下"
+	case "SINGLE_CHILD_GATE":
+		return "gate只有1个子节点。添加更多子节点（add_node），或改gate类型（update_gate），或move_node移走子节点后删除gate"
+	case "GATE_AND_MIN_2_CHILDREN":
+		return "AND gate需要≥2个子节点。添加子节点（add_node）或改OR gate（update_gate）"
+	case "GATE_NOT_EXACTLY_1_CHILD":
+		return "NOT gate需要恰好1个子节点。添加或移除子节点使数量为1"
+	case "GATE_CHILD_COUNT_TOO_LOW":
+		return "gate子节点数量不足。添加子节点或改gate类型"
+	case "NOT_GATE_CHILD_COUNT_TOO_HIGH":
+		return "NOT gate子节点过多，应恰好1个。move_node移除多余子节点"
+	case "CYCLE_DETECTED":
+		return "存在循环引用。使用move_node或delete_node消除循环"
+	case "TOP_EVENT_AS_CHILD":
+		return "topEvent不应作为子节点。检查结构是否需要重组"
+	case "MULTIPLE_TOP_EVENTS":
+		return "应只有1个topEvent。将多余的topEvent改为midEvent（update_node改nodeType）或删除"
+	case "MISSING_TOP_EVENT":
+		return "缺少topEvent根节点。需要添加topEvent或将现有节点改为topEvent"
+	case "TOP_EVENT_NOT_ROOT":
+		return "topEvent不应有父节点。移除topEvent的入边或将其父节点结构重组"
+	case "ORPHAN_NODE":
+		return "孤立节点无连接。使用delete_node删除或move_node连接到合适父节点"
+	case "EDGE_NODE_ID_EMPTY":
+		return "边的节点ID为空。删除无效边或重建正确连接"
+	case "EDGE_SOURCE_NOT_FOUND":
+		return "边的源节点不存在。删除无效边"
+	case "EDGE_TARGET_NOT_FOUND":
+		return "边的目标节点不存在。删除无效边"
+	default:
+		return "请根据问题描述选择合适的mutation工具修复"
+	}
+}
+
+func (s *roundExecutionState) FormatRepairGuide() string {
+	if s == nil || len(s.repairGuide) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("系统修复建议（基于 validate 发现的问题）：\n")
+	for i, entry := range s.repairGuide {
+		if i >= 6 {
+			b.WriteString(fmt.Sprintf("... 还有 %d 个问题\n", len(s.repairGuide)-6))
+			break
+		}
+		line := fmt.Sprintf("- %s", entry.Code)
+		if entry.NodeID != "" {
+			line += fmt.Sprintf("(节点%s)", entry.NodeID)
+		}
+		if entry.Message != "" {
+			msgRunes := []rune(entry.Message)
+			if len(msgRunes) > 80 {
+				entry.Message = string(msgRunes[:80]) + "..."
+			}
+			line += fmt.Sprintf(": %s", entry.Message)
+		}
+		if entry.Suggestion != "" {
+			line += fmt.Sprintf(" → %s", entry.Suggestion)
+		}
+		b.WriteString(line + "\n")
+	}
+	b.WriteString("请根据以上建议直接调用mutation工具修复，不要再次调用read工具确认。\n")
+	return b.String()
 }
 
 func summarizeToolCallAction(call ai.ToolCall) string {
@@ -2654,6 +2906,7 @@ func buildToolContinuationPrompt(originalMessage string, round int, summaries []
 		if goal := strings.TrimSpace(state.goal); goal != "" {
 			b.WriteString(fmt.Sprintf("执行目标：%s\n", goal))
 		}
+
 		if state.plan != nil && len(state.plan.Steps) > 0 {
 			b.WriteString("执行计划：\n")
 			for _, step := range state.plan.Steps {
@@ -2673,6 +2926,7 @@ func buildToolContinuationPrompt(originalMessage string, round int, summaries []
 				}
 				b.WriteString("\n")
 			}
+
 			if next := state.NextPendingPlanStep(); next != nil {
 				b.WriteString(fmt.Sprintf("当前待推进步骤：%d. %s\n", next.ID, strings.TrimSpace(next.Description)))
 				if len(next.FailedAttempts) > 0 {
@@ -2687,25 +2941,41 @@ func buildToolContinuationPrompt(originalMessage string, round int, summaries []
 					b.WriteString("请改变策略，尝试不同工具或参数。\n")
 				}
 			}
+
 			if reason := strings.TrimSpace(state.plan.BlockedReason); reason != "" {
 				b.WriteString(fmt.Sprintf("🚫 计划阻塞：%s\n", reason))
 				b.WriteString("请重新分析当前图结构，制定新修复策略。\n")
 			}
 		}
+
+		if repairGuide := state.FormatRepairGuide(); repairGuide != "" {
+			b.WriteString("\n")
+			b.WriteString(repairGuide)
+		}
+
+		if state.HasExcessiveReadWithoutMutation() {
+			b.WriteString(fmt.Sprintf("⚠ 你已经完成了足够的上下文读取（已调用 %d 次 read/validate 工具，0 次 mutation），现在必须进入修改阶段。\n", state.readCount))
+			b.WriteString("如果 validate 发现了问题，请直接调用 mutation 工具（update_node/update_gate/add_node/add_gate/move_node/delete_node/batch_operations）修复，不要再次调用 read 工具确认。\n")
+			b.WriteString("如果你不确定具体参数，请使用 batch_operations(repairMode=true) 执行结构修复。\n")
+		}
+
 		if len(state.recentActions) > 0 {
 			b.WriteString("已执行动作（已有结果，除非输入条件变化请勿重复）：\n")
 			for i, action := range state.recentActions {
 				b.WriteString(fmt.Sprintf("%d. %s\n", i+1, action))
 			}
 		}
+
 		if len(state.knownFacts) > 0 {
 			b.WriteString("已知关键事实：\n")
 			for i, fact := range state.knownFacts {
 				b.WriteString(fmt.Sprintf("%d. %s\n", i+1, fact))
 			}
 		}
+
 		b.WriteString("\n")
 	}
+
 	b.WriteString(fmt.Sprintf("原始用户目标：%s\n", originalMessage))
 	b.WriteString(fmt.Sprintf("当前是第 %d 轮工具执行后的结果：\n", round))
 	if len(summaries) == 0 {
@@ -2719,6 +2989,7 @@ func buildToolContinuationPrompt(originalMessage string, round int, summaries []
 			b.WriteString(fmt.Sprintf("%d. %s\n", i+1, item))
 		}
 	}
+
 	b.WriteString("请基于以上结果决定下一步：\n")
 	b.WriteString("1) 若仍需结构化图编辑，请推进到尚未完成的新步骤；\n")
 	b.WriteString("2) 若计划步骤均已完成或本轮无新增信息，请直接给出最终自然语言答复；\n")

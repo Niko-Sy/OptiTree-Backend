@@ -32,6 +32,12 @@ type ToolCallWarning struct {
 	Message string
 }
 
+const (
+	safetyHistoryWindow         = 16
+	maxLoopSoftWarningsPerKey   = 2
+	readValidateStreakThreshold = 4
+)
+
 // SafetyController enforces runtime limits for one agent session.
 type SafetyController struct {
 	cfg config.AgentConfig
@@ -130,13 +136,16 @@ func (c *SafetyController) CheckToolCallWithWarning(session *AgentSession, call 
 
 	history := c.historyCalls[sessionID]
 	history = append(history, fingerprint)
-	if len(history) > 8 {
-		history = history[len(history)-8:]
+	if len(history) > safetyHistoryWindow {
+		history = history[len(history)-safetyHistoryWindow:]
 	}
 	c.historyCalls[sessionID] = history
 
 	if c.cfg.EnableLoopSoftWarning {
 		if warning := c.buildEarlyDuplicateWarning(sessionID, call, history); warning != nil {
+			return warning, nil
+		}
+		if warning := c.buildReadValidateStreakWarning(sessionID, history); warning != nil {
 			return warning, nil
 		}
 	}
@@ -272,6 +281,40 @@ func (c *SafetyController) buildEarlyDuplicateWarning(sessionID string, call ai.
 	return &ToolCallWarning{Code: "loop_warning", Message: formatLoopWarningMessage(call.Name)}
 }
 
+func (c *SafetyController) buildReadValidateStreakWarning(sessionID string, history []callFingerprint) *ToolCallWarning {
+	if len(history) < readValidateStreakThreshold {
+		return nil
+	}
+
+	recent := history[len(history)-readValidateStreakThreshold:]
+	parts := make([]string, 0, len(recent))
+	unique := make(map[string]struct{}, len(recent))
+	for _, fp := range recent {
+		kind := classifyToolKind(fp.ToolName)
+		if kind != "read" && kind != "validate" {
+			return nil
+		}
+		key := callFingerprintKey(fp)
+		parts = append(parts, kind+":"+key)
+		unique[key] = struct{}{}
+	}
+
+	// Exact same-fingerprint repetition is handled by dedicated loop detection.
+	if len(unique) < 2 {
+		return nil
+	}
+
+	key := "read_streak:" + strings.Join(parts, "|")
+	if !c.consumeLoopWarningToken(sessionID, key) {
+		return nil
+	}
+
+	return &ToolCallWarning{
+		Code:    "read_streak_warning",
+		Message: formatReadValidateStreakWarningMessage(readValidateStreakThreshold),
+	}
+}
+
 func (c *SafetyController) consumeLoopWarningToken(sessionID, key string) bool {
 	sessionID = strings.TrimSpace(sessionID)
 	key = strings.TrimSpace(key)
@@ -283,7 +326,7 @@ func (c *SafetyController) consumeLoopWarningToken(sessionID, key string) bool {
 	}
 	used := c.loopWarnings[sessionID][key]
 	c.loopWarnings[sessionID][key] = used + 1
-	return used == 0
+	return used < maxLoopSoftWarningsPerKey
 }
 
 func loopWarningKeyForFingerprint(fp callFingerprint) string {
@@ -308,7 +351,21 @@ func formatLoopWarningMessage(toolName string) string {
 	if name == "" {
 		name = "unknown_tool"
 	}
-	return fmt.Sprintf("detected repetitive call pattern around %s; please switch strategy or proceed to the next unresolved step", name)
+	switch classifyToolKind(name) {
+	case "read", "validate":
+		return fmt.Sprintf("detected repetitive call pattern around %s; stop repeating read/validate and move to mutation or final answer", name)
+	case "mutation":
+		return fmt.Sprintf("detected repetitive mutation pattern around %s; change strategy or consolidate via batch_operations", name)
+	default:
+		return fmt.Sprintf("detected repetitive call pattern around %s; please switch strategy or proceed to the next unresolved step", name)
+	}
+}
+
+func formatReadValidateStreakWarningMessage(streak int) string {
+	if streak <= 0 {
+		streak = readValidateStreakThreshold
+	}
+	return fmt.Sprintf("detected %d consecutive read/validate calls without mutation; stop repeated reads and proceed with mutation tools or provide final answer", streak)
 }
 
 func classifyToolKind(toolName string) string {

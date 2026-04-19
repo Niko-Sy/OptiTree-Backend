@@ -168,10 +168,52 @@ func TestSafetyController_LoopSoftWarningThenHardStop(t *testing.T) {
 	}
 
 	warning, err = s.CheckToolCallWithWarning(session, call, 0)
+	if err != nil {
+		t.Fatalf("third identical call should still warn before hard stop, got err=%v", err)
+	}
+	if warning == nil {
+		t.Fatal("third identical call should return second loop warning")
+	}
+	if warning.Code != "loop_warning" {
+		t.Fatalf("unexpected warning code on third call: %+v", warning)
+	}
+
+	warning, err = s.CheckToolCallWithWarning(session, call, 0)
 	if warning != nil {
-		t.Fatalf("third identical call should hard stop without warning, got %+v", warning)
+		t.Fatalf("fourth identical call should hard stop without warning, got %+v", warning)
 	}
 	if !errors.Is(err, ErrAgentLoopDetected) {
-		t.Fatalf("third identical call should hard stop with ErrAgentLoopDetected, got %v", err)
+		t.Fatalf("fourth identical call should hard stop with ErrAgentLoopDetected, got %v", err)
+	}
+}
+
+func TestSafetyController_ReadValidateStreakWarning(t *testing.T) {
+	s := NewSafetyController(config.AgentConfig{MaxToolCalls: 20, EnableLoopSoftWarning: true})
+	session := NewAgentSession("sid-read-streak-warning", "c1", "p1", "u1", "faultTree", time.Minute)
+
+	first := ai.ToolCall{Name: "get_node_detail", Arguments: json.RawMessage(`{"nodeId":"n1"}`)}
+	second := ai.ToolCall{Name: "validate_fta_constraints", Arguments: json.RawMessage(`{}`)}
+	third := ai.ToolCall{Name: "get_node_detail", Arguments: json.RawMessage(`{"nodeId":"n2"}`)}
+	fourth := ai.ToolCall{Name: "validate_fta_constraints", Arguments: json.RawMessage(`{}`)}
+
+	for i, call := range []ai.ToolCall{first, second, third} {
+		warning, err := s.CheckToolCallWithWarning(session, call, 0)
+		if err != nil {
+			t.Fatalf("pre-streak call %d should pass, got err=%v", i+1, err)
+		}
+		if warning != nil {
+			t.Fatalf("pre-streak call %d should not warn, got %+v", i+1, warning)
+		}
+	}
+
+	warning, err := s.CheckToolCallWithWarning(session, fourth, 0)
+	if err != nil {
+		t.Fatalf("fourth consecutive read/validate call should return warning, got err=%v", err)
+	}
+	if warning == nil {
+		t.Fatal("expected read_streak_warning on fourth consecutive read/validate call")
+	}
+	if warning.Code != "read_streak_warning" {
+		t.Fatalf("unexpected warning code: %+v", warning)
 	}
 }

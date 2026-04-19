@@ -436,6 +436,8 @@ func BuildToolPromptGuide(defs []ToolDefinition) string {
 	lines = append(lines,
 		"Use only tools listed below; names and parameters are authoritative.",
 		"Contract order for graph edits: read_context -> validate -> mutate -> validate.",
+		"When validate finds issue codes, convert them to concrete mutation actions instead of repeating identical read calls.",
+		"Quick repair hints: BASIC_EVENT_AS_PARENT/BASIC_EVENT_HAS_CHILDREN -> move_node or add_gate; GATE_CHILD_COUNT_TOO_LOW -> add_node/update_gate; CYCLE_DETECTED -> move_node/delete_node.",
 	)
 
 	order := []ToolKind{ToolKindReadContext, ToolKindValidate, ToolKindMutate, ToolKindClientUI, ToolKindHybridPreview}
